@@ -118,6 +118,7 @@ TELEGRAM_SELL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_SELL_TOPIC_ID")
 TELEGRAM_BULL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BULL_TOPIC_ID")
 TELEGRAM_BEAR_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BEAR_TOPIC_ID")
 TELEGRAM_CHAT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
+TELEGRAM_REPORT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID")
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -782,7 +783,8 @@ def handle_incoming_message(msg: dict) -> None:
                 f"• Sell → `TELEGRAM_SELL_TOPIC_ID`\n"
                 f"• Tren naik → `TELEGRAM_BULL_TOPIC_ID`\n"
                 f"• Tren turun → `TELEGRAM_BEAR_TOPIC_ID`\n"
-                f"• Chat AI → `TELEGRAM_CHAT_TOPIC_ID`"
+                f"• Chat AI → `TELEGRAM_CHAT_TOPIC_ID`\n"
+                f"• Laporan → `TELEGRAM_REPORT_TOPIC_ID`"
             )
         else:
             reply_text = (
@@ -804,7 +806,8 @@ def handle_incoming_message(msg: dict) -> None:
             f"Sell       : `{TELEGRAM_SELL_TOPIC_ID or 'belum diset'}`\n"
             f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'belum diset'}`\n"
             f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'belum diset'}`\n"
-            f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'belum diset'}`"
+            f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'belum diset'}`\n"
+            f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'belum diset'}`"
         )
         send_telegram_message(
             "🤖 *Trading Bot AI*\n\n"
@@ -1072,6 +1075,7 @@ def _check_position_close(symbol: str, pos: dict) -> None:
             f"Entry  : `{entry_price}`\n"
             f"Exit   : `{exit_price}`\n"
             f"PnL    : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
         )
 
         with positions_lock:
@@ -1146,7 +1150,8 @@ def compute_daily_report(date_str: str) -> dict:
     }
 
 
-def send_daily_report(date_str: str, chat_id: Optional[int] = None, topic_id: Optional[int] = None) -> None:
+def send_daily_report(date_str: str, chat_id: Optional[int] = None,
+                       topic_id: Optional[int] = TELEGRAM_REPORT_TOPIC_ID) -> None:
     r = compute_daily_report(date_str)
     with positions_lock:
         n_open = len(open_positions)
@@ -1382,7 +1387,8 @@ def main_loop():
         f"Sell       : `{TELEGRAM_SELL_TOPIC_ID or 'general'}`\n"
         f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'general'}`\n"
         f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'general'}`\n"
-        f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'general'}`"
+        f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'general'}`\n"
+        f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'general'}`"
     )
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
