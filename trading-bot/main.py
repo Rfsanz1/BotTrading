@@ -132,6 +132,11 @@ callback_queue: queue.Queue = queue.Queue()
 active_pairs: list[str] = []
 pairs_lock = threading.Lock()
 
+# Filter LOT_SIZE / MIN_NOTIONAL per simbol (stepSize, minQty, minNotional) —
+# wajib dipatuhi Binance, kalau tidak order akan ditolak walau sudah dikonfirmasi.
+symbol_filters: dict[str, dict] = {}
+filters_lock = threading.Lock()
+
 # Kapan terakhir kali sebuah simbol memicu sinyal (untuk cooldown)
 last_signal_at: dict[str, float] = {}
 last_signal_lock = threading.Lock()
@@ -173,14 +178,30 @@ def run_flask():
 # ─── 0. DAFTAR PAIR (SEMUA USDT DI BINANCE) ─────────────────────────────────
 # ---------------------------------------------------------------------------
 
+def _extract_filters(s: dict) -> dict:
+    """Ambil stepSize/minQty (LOT_SIZE) dan minNotional (MIN_NOTIONAL/NOTIONAL) dari exchangeInfo."""
+    step_size = 1.0
+    min_qty = 0.0
+    min_notional = 0.0
+    for f in s.get("filters", []):
+        ftype = f.get("filterType")
+        if ftype == "LOT_SIZE":
+            step_size = float(f.get("stepSize", 1))
+            min_qty = float(f.get("minQty", 0))
+        elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
+            min_notional = float(f.get("minNotional") or f.get("notional") or 0)
+    return {"stepSize": step_size, "minQty": min_qty, "minNotional": min_notional}
+
+
 def fetch_usdt_pairs() -> list[str]:
-    """Ambil semua pair spot USDT yang sedang TRADING di Binance."""
+    """Ambil semua pair spot USDT yang sedang TRADING di Binance, plus filter LOT_SIZE/MIN_NOTIONAL."""
     url = "https://api.binance.com/api/v3/exchangeInfo"
     try:
         r = requests.get(url, timeout=15)
         r.raise_for_status()
         data = r.json()
         pairs = []
+        fresh_filters = {}
         for s in data.get("symbols", []):
             if s.get("status") != "TRADING":
                 continue
@@ -195,10 +216,27 @@ def fetch_usdt_pairs() -> list[str]:
             if base in _EXCLUDED_BASES:
                 continue
             pairs.append(symbol)
+            fresh_filters[symbol] = _extract_filters(s)
+        with filters_lock:
+            symbol_filters.update(fresh_filters)
         return sorted(pairs)
     except Exception as e:
         logger.error(f"Gagal ambil daftar pair Binance: {e}")
         return []
+
+
+def _round_step(qty: float, step: float) -> float:
+    """Bulatkan ke bawah sesuai stepSize Binance (LOT_SIZE), hindari error 'invalid quantity precision'."""
+    if step <= 0:
+        return qty
+    precision = max(0, -int(round(__import__("math").log10(step))))
+    steps = int(qty / step)
+    return round(steps * step, precision)
+
+
+def get_symbol_filters(symbol: str) -> dict:
+    with filters_lock:
+        return symbol_filters.get(symbol, {"stepSize": 0.00001, "minQty": 0.00001, "minNotional": 5.0})
 
 
 def refresh_pairs() -> None:
@@ -817,11 +855,27 @@ def log_trade(symbol, side, qty, price, confidence, reason, result,
 # ---------------------------------------------------------------------------
 
 def calc_quantity(current_price: float, atr: float,
-                  equity: float = 10_000.0) -> float:
+                  equity: float = 10_000.0, symbol: str = "") -> float:
     max_loss  = equity * MAX_EXPOSURE_PCT
     stop_dist = atr if atr > 0 else current_price * 0.01
-    qty       = round(max_loss / stop_dist, 5)
-    return max(qty, 0.00001)
+    raw_qty   = max(max_loss / stop_dist, 0.0)
+
+    if symbol:
+        f = get_symbol_filters(symbol)
+        raw_qty = _round_step(raw_qty, f["stepSize"])
+        raw_qty = max(raw_qty, f["minQty"])
+
+    return raw_qty
+
+
+def qty_is_tradable(symbol: str, qty: float, price: float) -> bool:
+    """Cek qty final memenuhi LOT_SIZE minQty & MIN_NOTIONAL Binance untuk simbol ini."""
+    f = get_symbol_filters(symbol)
+    if qty < f["minQty"]:
+        return False
+    if f["minNotional"] and (qty * price) < f["minNotional"]:
+        return False
+    return True
 
 
 def check_daily_loss(equity_now: float) -> bool:
@@ -859,7 +913,24 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
     reason     = signal["reason"]
 
     equity = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 10_000.0
-    qty    = calc_quantity(current_price, atr, equity)
+    qty    = calc_quantity(current_price, atr, equity, symbol=symbol)
+
+    if LIVE_MODE and not qty_is_tradable(symbol, qty, current_price):
+        f = get_symbol_filters(symbol)
+        reason_skip = (
+            f"Saldo USDT ({equity:.4f}) kekecilan buat order {symbol} "
+            f"(butuh min notional ~{f['minNotional']}, min qty {f['minQty']})."
+        )
+        logger.warning(f"⏭️ Lewati sinyal {symbol}: {reason_skip}")
+        log_trade(symbol, decision, qty, current_price, confidence, reason, "SKIPPED_TOO_SMALL")
+        send_telegram_message(
+            f"⏭️ *Sinyal {symbol} dilewati*\n\n"
+            f"AI bilang {'BUY' if decision=='BUY' else 'SELL'} \\({confidence}%\\), "
+            f"tapi saldo USDT kamu kekecilan buat order ini \\(butuh notional min "
+            f"~{f['minNotional']}\\)\\. Gak jadi kirim tombol konfirmasi\\.",
+            topic_id=_signal_topic(decision),
+        )
+        return
 
     if not LIVE_MODE:
         logger.info(f"[SIM] {decision} {qty} {symbol} @ ~{current_price}")
