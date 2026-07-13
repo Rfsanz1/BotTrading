@@ -69,6 +69,10 @@ INTER_SYMBOL_DELAY_SEC: float = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "0.12"
 TP_PCT: float = float(os.getenv("TP_PCT", "2"))
 SL_PCT: float = float(os.getenv("SL_PCT", "1"))
 
+# Jam (UTC) kapan laporan profit/loss harian otomatis dikirim ke Telegram.
+# Default 17 UTC = 00:00 WIB (baru ganti hari di Indonesia).
+DAILY_REPORT_HOUR_UTC: int = int(os.getenv("DAILY_REPORT_HOUR_UTC", "17"))
+
 # Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 
@@ -149,6 +153,16 @@ last_signal_lock = threading.Lock()
 
 # Membatasi berapa banyak konfirmasi live yang boleh berjalan bersamaan
 confirmation_slots = threading.Semaphore(MAX_CONCURRENT_CONFIRMATIONS)
+
+# Posisi BUY yang sedang menunggu OCO TP/SL close — dipantau berkala oleh
+# position_monitor_loop() supaya kita tahu kapan posisi ditutup TP atau SL,
+# dan bisa hitung profit/loss harian.
+open_positions: dict[str, dict] = {}
+positions_lock = threading.Lock()
+
+# Tanggal (UTC, format YYYY-MM-DD) terakhir laporan harian dikirim — supaya
+# tidak double-kirim di hari yang sama.
+daily_report_sent_date: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # ─── FLASK KEEP-ALIVE ───────────────────────────────────────────────────────
@@ -719,7 +733,8 @@ def handle_incoming_message(msg: dict) -> None:
             "*Perintah:*\n"
             "`/pairs`   — jumlah pair yang dipindai\n"
             "`/history` — cek memory AI\n"
-            "`/reset`   — hapus memory AI"
+            "`/reset`   — hapus memory AI\n"
+            "`/laporan` — laporan profit/loss hari ini"
             + topics_info,
             topic_id=thread_id,
             chat_id=chat_id,
@@ -753,6 +768,11 @@ def handle_incoming_message(msg: dict) -> None:
             topic_id=thread_id,
             chat_id=chat_id,
         )
+        return
+
+    if cmd in ("/laporan", "/report", "/pnl"):
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        send_daily_report(today_str, chat_id=chat_id, topic_id=thread_id)
         return
 
     logger.info(f"💬 Chat dari {user_name}: {text[:60]}")
@@ -887,12 +907,162 @@ def place_oco_sell(symbol: str, qty: float, entry_price: float,
                 f"🎯 OCO TP/SL terpasang {symbol}: qty={qty} TP={tp_price} "
                 f"SL_trigger={sl_stop} SL_limit={sl_limit}"
             )
+            reports = oco.get("orderReports", [])
+            tp_id = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
+            sl_id = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+            oco["_tp_order_id"] = tp_id
+            oco["_sl_order_id"] = sl_id
+            oco["_tp_price"] = tp_price
+            oco["_sl_price"] = sl_stop
             return oco
         except Exception as e:
             logger.error(f"OCO order error {symbol} (attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)
     logger.error(f"⚠️ Gagal pasang OCO TP/SL untuk {symbol} setelah 3 kali coba — posisi tetap terbuka tanpa target otomatis")
     return None
+
+
+def register_open_position(symbol: str, qty: float, entry_price: float, oco: dict) -> None:
+    with positions_lock:
+        open_positions[symbol] = {
+            "qty": qty,
+            "entry_price": entry_price,
+            "tp_order_id": oco.get("_tp_order_id"),
+            "sl_order_id": oco.get("_sl_order_id"),
+            "tp_price": oco.get("_tp_price"),
+            "sl_price": oco.get("_sl_price"),
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _check_position_close(symbol: str, pos: dict) -> None:
+    """Cek apakah OCO leg (TP/SL) sudah FILLED. Kalau ya, catat pnl & kirim notifikasi."""
+    from binance.client import Client
+    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    entry_price = pos["entry_price"]
+    qty = pos["qty"]
+
+    for leg, order_id, label in (
+        ("tp", pos.get("tp_order_id"), "TP"),
+        ("sl", pos.get("sl_order_id"), "SL"),
+    ):
+        if not order_id:
+            continue
+        try:
+            order = client.get_order(symbol=symbol, orderId=order_id)
+        except Exception as e:
+            logger.warning(f"Gagal cek status order {label} {symbol}: {e}")
+            continue
+
+        if order.get("status") != "FILLED":
+            continue
+
+        exec_qty = float(order.get("executedQty", qty)) or qty
+        quote_qty = float(order.get("cummulativeQuoteQty", 0))
+        exit_price = (quote_qty / exec_qty) if exec_qty else float(order.get("price", entry_price))
+        pnl = (exit_price - entry_price) * exec_qty
+        pnl_pct = ((exit_price / entry_price) - 1) * 100 if entry_price else 0.0
+        result = "CLOSED_TP" if label == "TP" else "CLOSED_SL"
+
+        log_trade(symbol, "SELL", exec_qty, exit_price, 0, f"OCO {label} tereksekusi",
+                  result, str(order_id), extra={"pnl": round(pnl, 4), "pnl_pct": round(pnl_pct, 3)})
+
+        icon = "✅" if pnl >= 0 else "🔴"
+        send_telegram_message(
+            f"{icon} *Posisi `{symbol}` ditutup \\({label}\\)*\n\n"
+            f"Entry  : `{entry_price}`\n"
+            f"Exit   : `{exit_price}`\n"
+            f"PnL    : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)",
+        )
+
+        with positions_lock:
+            open_positions.pop(symbol, None)
+        return
+
+
+def position_monitor_loop() -> None:
+    """Cek berkala apakah ada posisi yang ditutup lewat TP/SL, dan kirim laporan
+    profit/loss harian otomatis di jam yang ditentukan (DAILY_REPORT_HOUR_UTC)."""
+    global daily_report_sent_date
+    while True:
+        try:
+            with positions_lock:
+                snapshot = dict(open_positions)
+            for symbol, pos in snapshot.items():
+                _check_position_close(symbol, pos)
+
+            now = datetime.now(timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+            if now.hour == DAILY_REPORT_HOUR_UTC and daily_report_sent_date != today_str:
+                send_daily_report(today_str)
+                daily_report_sent_date = today_str
+        except Exception as e:
+            logger.error(f"position_monitor_loop error: {e}")
+        time.sleep(30)
+
+
+def compute_daily_report(date_str: str) -> dict:
+    """Baca trades.log dan hitung ringkasan profit/loss untuk tanggal (UTC) tertentu."""
+    total_pnl = 0.0
+    wins = 0
+    losses = 0
+    trades_opened = 0
+    skipped_too_small = 0
+
+    if os.path.exists(TRADES_LOG):
+        with open(TRADES_LOG, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                ts = rec.get("timestamp", "")
+                if not ts.startswith(date_str):
+                    continue
+                result = rec.get("result", "")
+                if result == "CLOSED_TP":
+                    wins += 1
+                    total_pnl += float(rec.get("pnl", 0))
+                elif result == "CLOSED_SL":
+                    losses += 1
+                    total_pnl += float(rec.get("pnl", 0))
+                elif result == "EXECUTED":
+                    trades_opened += 1
+                elif result == "SKIPPED_TOO_SMALL":
+                    skipped_too_small += 1
+
+    closed = wins + losses
+    win_rate = (wins / closed * 100) if closed else 0.0
+    return {
+        "date": date_str,
+        "total_pnl": round(total_pnl, 4),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(win_rate, 1),
+        "trades_opened": trades_opened,
+        "skipped_too_small": skipped_too_small,
+    }
+
+
+def send_daily_report(date_str: str, chat_id: Optional[int] = None, topic_id: Optional[int] = None) -> None:
+    r = compute_daily_report(date_str)
+    with positions_lock:
+        n_open = len(open_positions)
+    icon = "📈" if r["total_pnl"] >= 0 else "📉"
+    text = (
+        f"{icon} *Laporan Profit/Loss — {r['date']}*\n\n"
+        f"Total PnL     : `{r['total_pnl']:+.4f} USDT`\n"
+        f"Posisi profit \\(TP\\) : `{r['wins']}`\n"
+        f"Posisi rugi \\(SL\\)   : `{r['losses']}`\n"
+        f"Win rate      : `{r['win_rate']}%`\n"
+        f"Order dieksekusi hari ini : `{r['trades_opened']}`\n"
+        f"Sinyal dilewati \\(saldo kecil\\) : `{r['skipped_too_small']}`\n"
+        f"Posisi masih terbuka sekarang : `{n_open}`"
+    )
+    send_telegram_message(text, chat_id=chat_id, topic_id=topic_id)
 
 # ---------------------------------------------------------------------------
 # ─── 6. LOGGING TRADE ───────────────────────────────────────────────────────
@@ -1072,8 +1242,9 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
         if not errors and decision == "BUY" and filled_qty > 0:
             oco = place_oco_sell(symbol, filled_qty, fill_price)
             if oco:
-                tp_price = _round_price(fill_price * (1 + TP_PCT / 100), get_symbol_filters(symbol)["tickSize"])
-                sl_price = _round_price(fill_price * (1 - SL_PCT / 100), get_symbol_filters(symbol)["tickSize"])
+                tp_price = oco.get("_tp_price", fill_price * (1 + TP_PCT / 100))
+                sl_price = oco.get("_sl_price", fill_price * (1 - SL_PCT / 100))
+                register_open_position(symbol, filled_qty, fill_price, oco)
                 log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, confidence,
                           f"TP={tp_price} SL={sl_price}", "PLACED",
                           str(oco.get("orderListId", "")))
@@ -1229,6 +1400,9 @@ if __name__ == "__main__":
 
     # Background Telegram poller (handle chat + callback)
     threading.Thread(target=update_poller, daemon=True).start()
+
+    # Pantau posisi terbuka (deteksi TP/SL close) + laporan profit/loss harian
+    threading.Thread(target=position_monitor_loop, daemon=True).start()
 
     # Main trading loop
     main_loop()
