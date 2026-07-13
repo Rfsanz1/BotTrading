@@ -73,6 +73,15 @@ SL_PCT: float = float(os.getenv("SL_PCT", "1"))
 # Default 17 UTC = 00:00 WIB (baru ganti hari di Indonesia).
 DAILY_REPORT_HOUR_UTC: int = int(os.getenv("DAILY_REPORT_HOUR_UTC", "17"))
 
+# Sumber berita crypto/market (RSS resmi, gratis, tanpa API key) yang dipantau
+# buat kasih AI konteks kondisi pasar terkini, bukan cuma indikator teknikal.
+NEWS_FEEDS: list[str] = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+]
+NEWS_REFRESH_SEC: int = int(os.getenv("NEWS_REFRESH_SEC", "900"))  # 15 menit
+
 # Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 
@@ -164,6 +173,11 @@ positions_lock = threading.Lock()
 # tidak double-kirim di hari yang sama.
 daily_report_sent_date: Optional[str] = None
 
+# Cache berita crypto/market terbaru (di-refresh berkala oleh news_refresher_loop)
+# — dipakai sebagai konteks tambahan buat AI & command /berita.
+latest_news: list[dict] = []
+news_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # ─── FLASK KEEP-ALIVE ───────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -197,6 +211,65 @@ def run_flask():
 # ---------------------------------------------------------------------------
 # ─── 0. DAFTAR PAIR (SEMUA USDT DI BINANCE) ─────────────────────────────────
 # ---------------------------------------------------------------------------
+
+def fetch_crypto_news() -> list[dict]:
+    """Ambil headline terbaru dari RSS feed media crypto (CoinDesk, Cointelegraph,
+    Decrypt) — gratis, tanpa API key. Dipakai buat kasih AI & user konteks kondisi
+    pasar/berita terkini, bukan cuma indikator teknikal."""
+    import feedparser
+    items = []
+    for url in NEWS_FEEDS:
+        try:
+            feed = feedparser.parse(url)
+            source = feed.feed.get("title", url)
+            for entry in feed.entries[:10]:
+                items.append({
+                    "title": entry.get("title", "").strip(),
+                    "link": entry.get("link", ""),
+                    "source": source,
+                    "published": entry.get("published", ""),
+                })
+        except Exception as e:
+            logger.warning(f"Gagal ambil RSS {url}: {e}")
+    return items
+
+
+def news_refresher_loop() -> None:
+    """Refresh cache berita tiap NEWS_REFRESH_SEC detik di background."""
+    global latest_news
+    while True:
+        try:
+            items = fetch_crypto_news()
+            if items:
+                with news_lock:
+                    latest_news = items
+                logger.info(f"📰 Berita ter-update: {len(items)} headline dari {len(NEWS_FEEDS)} sumber")
+        except Exception as e:
+            logger.error(f"news_refresher_loop error: {e}")
+        time.sleep(NEWS_REFRESH_SEC)
+
+
+def get_relevant_news(symbol: str = "", max_items: int = 4) -> list[dict]:
+    """Ambil headline yang menyebut base asset simbol ini (misal 'Bitcoin' buat
+    BTCUSDT); kalau nggak ada yang relevan, kembalikan headline umum terbaru."""
+    with news_lock:
+        pool = list(latest_news)
+    if not pool:
+        return []
+
+    base = symbol.replace("USDT", "") if symbol else ""
+    aliases = {
+        "BTC": ["bitcoin", "btc"], "ETH": ["ethereum", "eth"],
+        "BNB": ["bnb", "binance coin"], "SOL": ["solana", "sol"],
+        "XRP": ["xrp", "ripple"], "DOGE": ["dogecoin", "doge"],
+    }
+    keywords = aliases.get(base, [base.lower()]) if base else []
+
+    relevant = [n for n in pool if keywords and any(k in n["title"].lower() for k in keywords)]
+    if relevant:
+        return relevant[:max_items]
+    return pool[:max_items]
+
 
 def _extract_filters(s: dict) -> dict:
     """Ambil stepSize/minQty (LOT_SIZE), minNotional (MIN_NOTIONAL/NOTIONAL) dan
@@ -406,7 +479,10 @@ def is_interesting(df: pd.DataFrame) -> bool:
 SYSTEM_PROMPT_TRADING = (
     "Kamu adalah asisten trading yang ramah dan pintar. Kamu memantau banyak pair "
     "kripto sekaligus di Binance dan ingat analisis-analisis sebelumnya dalam "
-    "percakapan ini untuk melihat pola pasar dari waktu ke waktu.\n\n"
+    "percakapan ini untuk melihat pola pasar dari waktu ke waktu. Kalau ada blok "
+    "'Berita/kondisi pasar terkini' di data yang dikirim, pertimbangkan sentimen "
+    "berita itu juga (misal berita regulasi/adopsi/hack bisa mengalahkan sinyal "
+    "teknikal semata) — bukan cuma indikator RSI/MACD.\n\n"
     "Kalau diminta analisis data market, balas HANYA dengan JSON valid, tanpa teks lain:\n"
     '{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<1-2 kalimat bahasa santai>", "confidence": <0-100> }\n\n'
     "Kalau ditanya pertanyaan umum (bukan analisis data), jawab dengan santai dan natural "
@@ -441,10 +517,17 @@ def ask_ai(symbol: str, df: pd.DataFrame) -> dict:
             f"SMA20={row.get('sma20',0):.0f} RSI={row.get('rsi14',0):.1f} "
             f"MACD={row.get('macd',0):.2f} ATR={row.get('atr14',0):.2f}"
         )
+    news_items = get_relevant_news(symbol)
+    news_block = ""
+    if news_items:
+        headlines = "\n".join(f"- {n['title']} ({n['source']})" for n in news_items)
+        news_block = f"\n\nBerita/kondisi pasar terkini:\n{headlines}"
+
     user_msg = (
         f"{symbol} {CANDLE_INTERVAL} "
         f"[{datetime.now(timezone.utc).strftime('%H:%M UTC')}]\n"
         + "\n".join(rows)
+        + news_block
     )
 
     raw = ""
@@ -734,7 +817,8 @@ def handle_incoming_message(msg: dict) -> None:
             "`/pairs`   — jumlah pair yang dipindai\n"
             "`/history` — cek memory AI\n"
             "`/reset`   — hapus memory AI\n"
-            "`/laporan` — laporan profit/loss hari ini"
+            "`/laporan` — laporan profit/loss hari ini\n"
+            "`/berita`  — headline crypto/market terbaru"
             + topics_info,
             topic_id=thread_id,
             chat_id=chat_id,
@@ -773,6 +857,21 @@ def handle_incoming_message(msg: dict) -> None:
     if cmd in ("/laporan", "/report", "/pnl"):
         today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         send_daily_report(today_str, chat_id=chat_id, topic_id=thread_id)
+        return
+
+    if cmd in ("/berita", "/news"):
+        items = get_relevant_news(max_items=6)
+        if not items:
+            send_telegram_message(
+                "📰 Belum ada berita tersimpan, coba lagi sebentar\\.",
+                topic_id=thread_id, chat_id=chat_id,
+            )
+            return
+        lines = [f"• [{n['title']}]({n['link']}) \\- _{n['source']}_" for n in items]
+        send_telegram_message(
+            "📰 *Berita crypto/market terbaru:*\n\n" + "\n\n".join(lines),
+            topic_id=thread_id, chat_id=chat_id,
+        )
         return
 
     logger.info(f"💬 Chat dari {user_name}: {text[:60]}")
@@ -1403,6 +1502,9 @@ if __name__ == "__main__":
 
     # Pantau posisi terbuka (deteksi TP/SL close) + laporan profit/loss harian
     threading.Thread(target=position_monitor_loop, daemon=True).start()
+
+    # Ambil berita crypto/market pertama kali sebelum mulai, lalu refresh berkala
+    threading.Thread(target=news_refresher_loop, daemon=True).start()
 
     # Main trading loop
     main_loop()

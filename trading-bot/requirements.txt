@@ -3,3 +3,4 @@ pandas
 flask
 groq
 python-binance
+feedparser
