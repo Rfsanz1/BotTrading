@@ -48,3 +48,4 @@ packages = ["glibcLocales"]
 
 [userenv.shared]
 TELEGRAM_REPORT_TOPIC_ID = "8"
+TELEGRAM_NEWS_TOPIC_ID = "9"

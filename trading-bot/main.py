@@ -11,6 +11,7 @@ Eksekusi      : Binance Spot market order
 """
 
 import os
+import re
 import json
 import time
 import queue
@@ -119,6 +120,7 @@ TELEGRAM_BULL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BULL_TOPIC_ID")
 TELEGRAM_BEAR_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BEAR_TOPIC_ID")
 TELEGRAM_CHAT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
 TELEGRAM_REPORT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID")
+TELEGRAM_NEWS_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -179,6 +181,11 @@ daily_report_sent_date: Optional[str] = None
 latest_news: list[dict] = []
 news_lock = threading.Lock()
 
+# Link berita yang sudah pernah diposting ke topic berita — supaya tidak
+# posting ulang headline yang sama tiap kali refresh.
+seen_news_links: set[str] = set()
+MAX_NEW_NEWS_PER_CYCLE = 6  # batasi spam kalau tiba-tiba banyak headline baru
+
 # ---------------------------------------------------------------------------
 # ─── FLASK KEEP-ALIVE ───────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -213,10 +220,18 @@ def run_flask():
 # ─── 0. DAFTAR PAIR (SEMUA USDT DI BINANCE) ─────────────────────────────────
 # ---------------------------------------------------------------------------
 
+_HTML_TAG_RE = re.compile(r"<[^<]+?>")
+
+def _clean_html(text: str, max_len: int = 220) -> str:
+    text = _HTML_TAG_RE.sub("", text or "").strip()
+    text = " ".join(text.split())
+    return text[:max_len].rstrip() + ("…" if len(text) > max_len else "")
+
+
 def fetch_crypto_news() -> list[dict]:
-    """Ambil headline terbaru dari RSS feed media crypto (CoinDesk, Cointelegraph,
-    Decrypt) — gratis, tanpa API key. Dipakai buat kasih AI & user konteks kondisi
-    pasar/berita terkini, bukan cuma indikator teknikal."""
+    """Ambil headline + ringkasan terbaru dari RSS feed media crypto (CoinDesk,
+    Cointelegraph, Decrypt) — gratis, tanpa API key. Dipakai buat kasih AI & user
+    konteks kondisi pasar/berita terkini, bukan cuma indikator teknikal."""
     import feedparser
     items = []
     for url in NEWS_FEEDS:
@@ -226,6 +241,7 @@ def fetch_crypto_news() -> list[dict]:
             for entry in feed.entries[:10]:
                 items.append({
                     "title": entry.get("title", "").strip(),
+                    "summary": _clean_html(entry.get("summary", "")),
                     "link": entry.get("link", ""),
                     "source": source,
                     "published": entry.get("published", ""),
@@ -235,16 +251,42 @@ def fetch_crypto_news() -> list[dict]:
     return items
 
 
+def _post_news_item(n: dict) -> None:
+    """Posting satu headline ke topic berita, gaya feed real-time — judul,
+    sumber, ringkasan singkat, dan link ke artikel aslinya."""
+    text = f"📰 *{n['source']}*\n\n*{n['title']}*"
+    if n.get("summary"):
+        text += f"\n\n{n['summary']}"
+    if n.get("link"):
+        text += f"\n\n🔗 {n['link']}"
+    send_telegram_message(text, topic_id=TELEGRAM_NEWS_TOPIC_ID)
+
+
 def news_refresher_loop() -> None:
-    """Refresh cache berita tiap NEWS_REFRESH_SEC detik di background."""
+    """Refresh cache berita tiap NEWS_REFRESH_SEC detik di background, dan posting
+    headline baru (belum pernah tampil) ke topic berita secara real-time."""
     global latest_news
+    first_run = True
     while True:
         try:
             items = fetch_crypto_news()
             if items:
                 with news_lock:
                     latest_news = items
-                logger.info(f"📰 Berita ter-update: {len(items)} headline dari {len(NEWS_FEEDS)} sumber")
+
+                new_items = [n for n in items if n["link"] and n["link"] not in seen_news_links]
+                for n in items:
+                    if n["link"]:
+                        seen_news_links.add(n["link"])
+
+                if TELEGRAM_NEWS_TOPIC_ID and new_items and not first_run:
+                    # urutkan lama → baru biar kebaca seperti feed kronologis
+                    for n in list(reversed(new_items))[-MAX_NEW_NEWS_PER_CYCLE:]:
+                        _post_news_item(n)
+                        time.sleep(1.5)  # hindari rate-limit Telegram
+
+                logger.info(f"📰 Berita ter-update: {len(items)} headline dari {len(NEWS_FEEDS)} sumber, {len(new_items)} baru")
+                first_run = False
         except Exception as e:
             logger.error(f"news_refresher_loop error: {e}")
         time.sleep(NEWS_REFRESH_SEC)
@@ -784,7 +826,8 @@ def handle_incoming_message(msg: dict) -> None:
                 f"• Tren naik → `TELEGRAM_BULL_TOPIC_ID`\n"
                 f"• Tren turun → `TELEGRAM_BEAR_TOPIC_ID`\n"
                 f"• Chat AI → `TELEGRAM_CHAT_TOPIC_ID`\n"
-                f"• Laporan → `TELEGRAM_REPORT_TOPIC_ID`"
+                f"• Laporan → `TELEGRAM_REPORT_TOPIC_ID`\n"
+                f"• Berita → `TELEGRAM_NEWS_TOPIC_ID`"
             )
         else:
             reply_text = (
@@ -807,7 +850,8 @@ def handle_incoming_message(msg: dict) -> None:
             f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'belum diset'}`\n"
             f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'belum diset'}`\n"
             f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'belum diset'}`\n"
-            f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'belum diset'}`"
+            f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'belum diset'}`\n"
+            f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID or 'belum diset'}`"
         )
         send_telegram_message(
             "🤖 *Trading Bot AI*\n\n"
@@ -872,7 +916,8 @@ def handle_incoming_message(msg: dict) -> None:
             return
         lines = [f"• [{n['title']}]({n['link']}) \\- _{n['source']}_" for n in items]
         send_telegram_message(
-            "📰 *Berita crypto/market terbaru:*\n\n" + "\n\n".join(lines),
+            "📰 *Berita crypto/market terbaru:*\n\n" + "\n\n".join(lines)
+            + (f"\n\nFeed real\\-time ada di topic `{TELEGRAM_NEWS_TOPIC_ID}`" if TELEGRAM_NEWS_TOPIC_ID else ""),
             topic_id=thread_id, chat_id=chat_id,
         )
         return
@@ -1388,7 +1433,8 @@ def main_loop():
         f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'general'}`\n"
         f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'general'}`\n"
         f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'general'}`\n"
-        f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'general'}`"
+        f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'general'}`\n"
+        f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID or 'general'}`"
     )
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
