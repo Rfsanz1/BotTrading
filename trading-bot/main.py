@@ -63,6 +63,12 @@ SYMBOL_COOLDOWN_SEC: int = int(os.getenv("SYMBOL_COOLDOWN_SEC", "600"))
 # memindai ratusan pair dalam satu siklus.
 INTER_SYMBOL_DELAY_SEC: float = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "0.12"))
 
+# Take Profit / Stop Loss otomatis (persen dari harga entry) — dipasang lewat
+# OCO sell order begitu order BUY tereksekusi, supaya posisi tidak dibiarkan
+# tanpa target keluar.
+TP_PCT: float = float(os.getenv("TP_PCT", "2"))
+SL_PCT: float = float(os.getenv("SL_PCT", "1"))
+
 # Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 
@@ -179,10 +185,12 @@ def run_flask():
 # ---------------------------------------------------------------------------
 
 def _extract_filters(s: dict) -> dict:
-    """Ambil stepSize/minQty (LOT_SIZE) dan minNotional (MIN_NOTIONAL/NOTIONAL) dari exchangeInfo."""
+    """Ambil stepSize/minQty (LOT_SIZE), minNotional (MIN_NOTIONAL/NOTIONAL) dan
+    tickSize (PRICE_FILTER) dari exchangeInfo — tickSize dipakai buat pasang OCO TP/SL."""
     step_size = 1.0
     min_qty = 0.0
     min_notional = 0.0
+    tick_size = 0.00000001
     for f in s.get("filters", []):
         ftype = f.get("filterType")
         if ftype == "LOT_SIZE":
@@ -190,7 +198,14 @@ def _extract_filters(s: dict) -> dict:
             min_qty = float(f.get("minQty", 0))
         elif ftype in ("MIN_NOTIONAL", "NOTIONAL"):
             min_notional = float(f.get("minNotional") or f.get("notional") or 0)
-    return {"stepSize": step_size, "minQty": min_qty, "minNotional": min_notional}
+        elif ftype == "PRICE_FILTER":
+            tick_size = float(f.get("tickSize", tick_size))
+    return {
+        "stepSize": step_size,
+        "minQty": min_qty,
+        "minNotional": min_notional,
+        "tickSize": tick_size,
+    }
 
 
 def fetch_usdt_pairs() -> list[str]:
@@ -236,7 +251,19 @@ def _round_step(qty: float, step: float) -> float:
 
 def get_symbol_filters(symbol: str) -> dict:
     with filters_lock:
-        return symbol_filters.get(symbol, {"stepSize": 0.00001, "minQty": 0.00001, "minNotional": 5.0})
+        return symbol_filters.get(symbol, {
+            "stepSize": 0.00001, "minQty": 0.00001, "minNotional": 5.0,
+            "tickSize": 0.00000001,
+        })
+
+
+def _round_price(price: float, tick: float) -> float:
+    """Bulatkan harga ke bawah sesuai tickSize Binance (PRICE_FILTER)."""
+    if tick <= 0:
+        return price
+    precision = max(0, -int(round(__import__("math").log10(tick))))
+    steps = int(round(price / tick))
+    return round(steps * tick, precision)
 
 
 def refresh_pairs() -> None:
@@ -824,6 +851,49 @@ def execute_binance(symbol: str, side: str, qty: float) -> dict:
             time.sleep(2 ** attempt)
     raise RuntimeError("Binance order gagal setelah 3 kali coba")
 
+
+def place_oco_sell(symbol: str, qty: float, entry_price: float,
+                    tp_pct: float = TP_PCT, sl_pct: float = SL_PCT) -> Optional[dict]:
+    """Pasang OCO sell (Take Profit + Stop Loss) langsung di Binance begitu posisi
+    BUY tereksekusi, supaya posisi tidak dibiarkan terbuka tanpa target keluar.
+    TP = limit sell di atas entry_price. SL = stop-limit sell di bawah entry_price."""
+    from binance.client import Client
+    f = get_symbol_filters(symbol)
+    tick = f.get("tickSize", 0.00000001)
+    step = f.get("stepSize", 0.00001)
+
+    qty = _round_step(qty, step)
+    if qty <= 0:
+        logger.warning(f"⏭️ Lewati OCO {symbol}: qty setelah rounding jadi 0")
+        return None
+
+    tp_price   = _round_price(entry_price * (1 + tp_pct / 100), tick)
+    sl_stop    = _round_price(entry_price * (1 - sl_pct / 100), tick)
+    sl_limit   = _round_price(sl_stop * 0.999, tick)
+
+    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    for attempt in range(3):
+        try:
+            oco = client.create_oco_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=qty,
+                price=str(tp_price),
+                stopPrice=str(sl_stop),
+                stopLimitPrice=str(sl_limit),
+                stopLimitTimeInForce="GTC",
+            )
+            logger.info(
+                f"🎯 OCO TP/SL terpasang {symbol}: qty={qty} TP={tp_price} "
+                f"SL_trigger={sl_stop} SL_limit={sl_limit}"
+            )
+            return oco
+        except Exception as e:
+            logger.error(f"OCO order error {symbol} (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    logger.error(f"⚠️ Gagal pasang OCO TP/SL untuk {symbol} setelah 3 kali coba — posisi tetap terbuka tanpa target otomatis")
+    return None
+
 # ---------------------------------------------------------------------------
 # ─── 6. LOGGING TRADE ───────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -979,6 +1049,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
         fill_price = float(
             binance_result.get("fills", [{}])[0].get("price", current_price)
         ) if binance_result.get("fills") else current_price
+        filled_qty = float(binance_result.get("executedQty", qty)) if binance_result else qty
         order_id   = str(binance_result.get("orderId", "ERR"))
         status_str = "EXECUTED" if not errors else f"ERROR: {'; '.join(errors)}"
 
@@ -995,6 +1066,29 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
             f"Status  : {'Berhasil ✅' if not errors else '⚠️ Ada masalah: ' + '; '.join(errors)}",
             topic_id=_signal_topic(decision),
         )
+
+        # Setelah BUY tereksekusi, pasang OCO TP/SL otomatis biar posisi nggak
+        # dibiarkan terbuka tanpa target keluar.
+        if not errors and decision == "BUY" and filled_qty > 0:
+            oco = place_oco_sell(symbol, filled_qty, fill_price)
+            if oco:
+                tp_price = _round_price(fill_price * (1 + TP_PCT / 100), get_symbol_filters(symbol)["tickSize"])
+                sl_price = _round_price(fill_price * (1 - SL_PCT / 100), get_symbol_filters(symbol)["tickSize"])
+                log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, confidence,
+                          f"TP={tp_price} SL={sl_price}", "PLACED",
+                          str(oco.get("orderListId", "")))
+                send_telegram_message(
+                    f"🎯 *TP/SL otomatis terpasang* `{symbol}`\n\n"
+                    f"Take Profit : `{tp_price}` \\(\\+{TP_PCT}%\\)\n"
+                    f"Stop Loss   : `{sl_price}` \\(\\-{SL_PCT}%\\)",
+                    topic_id=_signal_topic(decision),
+                )
+            else:
+                send_telegram_message(
+                    f"⚠️ *TP/SL gagal dipasang* untuk `{symbol}`\\. Posisi tetap terbuka "
+                    f"— pantau manual atau jual sendiri kalau perlu\\.",
+                    topic_id=_signal_topic(decision),
+                )
     finally:
         confirmation_slots.release()
 
