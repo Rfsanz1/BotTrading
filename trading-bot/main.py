@@ -90,8 +90,9 @@ MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 # ─── ENVIRONMENT VARIABLES ──────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY       = os.getenv("GROQ_API_KEY", "")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
+OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 
 _raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "0").strip()
 try:
@@ -658,6 +659,102 @@ def ask_ai(symbol: str, df: pd.DataFrame) -> dict:
             time.sleep(2 ** attempt)
 
     return {"decision": "HOLD", "reason": "Analisis AI gagal", "confidence": 0}
+
+
+# ---------------------------------------------------------------------------
+# ─── 3b. VALIDATOR AI (OpenRouter – Claude Sonnet 5) ────────────────────────
+# ---------------------------------------------------------------------------
+
+SYSTEM_PROMPT_VALIDATOR = (
+    "Kamu adalah validator sinyal trading kripto yang independen dan kritis. "
+    "Kamu menerima data market dan sinyal dari AI lain, lalu memverifikasi apakah "
+    "sinyal itu valid berdasarkan analisismu sendiri. Jangan terpengaruh sinyal sebelumnya — "
+    "analisis datanya secara objektif.\n\n"
+    "Balas HANYA dengan JSON valid, tanpa teks lain:\n"
+    '{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<1-2 kalimat bahasa santai>", "confidence": <0-100> }'
+)
+
+def ask_ai_openrouter(symbol: str, df: pd.DataFrame, groq_signal: dict) -> dict:
+    """
+    Validator kedua menggunakan Claude Sonnet 5 via OpenRouter.
+    Menerima data market + sinyal Groq sebagai konteks, lalu memverifikasi
+    secara independen. Return: { decision, reason, confidence }
+    """
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY belum diisi — validator dilewati")
+        return groq_signal  # fallback: percaya Groq saja
+
+    last = df.tail(5).copy()
+    for col in last.select_dtypes(include="float64").columns:
+        last[col] = last[col].round(2)
+
+    rows = []
+    for ts, row in last.iterrows():
+        rows.append(
+            f"{ts.strftime('%H:%M')} O={row['open']} H={row['high']} L={row['low']} "
+            f"C={row['close']} V={row['volume']:.0f} "
+            f"SMA20={row.get('sma20',0):.0f} RSI={row.get('rsi14',0):.1f} "
+            f"MACD={row.get('macd',0):.2f} ATR={row.get('atr14',0):.2f}"
+        )
+
+    news_items = get_relevant_news(symbol)
+    news_block = ""
+    if news_items:
+        headlines = "\n".join(f"- {n['title']} ({n['source']})" for n in news_items)
+        news_block = f"\n\nBerita/kondisi pasar terkini:\n{headlines}"
+
+    user_msg = (
+        f"Data {symbol} {CANDLE_INTERVAL} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}]:\n"
+        + "\n".join(rows)
+        + news_block
+        + f"\n\nAI pertama (Groq) bilang: {groq_signal['decision']} "
+        f"dengan keyakinan {groq_signal['confidence']}% — alasan: {groq_signal['reason']}\n\n"
+        f"Verifikasi dengan analisismu sendiri. Setuju atau tidak?"
+    )
+
+    raw = ""
+    for attempt in range(3):
+        try:
+            resp = requests.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://replit.com",
+                    "X-Title": "Trading Bot Validator",
+                },
+                json={
+                    "model": "anthropic/claude-sonnet-5",
+                    "messages": [
+                        {"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
+                        {"role": "user",   "content": user_msg},
+                    ],
+                    "max_tokens": 250,
+                    "temperature": 0.2,
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            raw = resp.json()["choices"][0]["message"]["content"].strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1].lstrip("json").strip()
+
+            result = json.loads(raw)
+            result["confidence"] = int(result.get("confidence", 0))
+            result["decision"]   = result.get("decision", "HOLD").upper()
+            logger.info(
+                f"Claude validator → {symbol} {result['decision']} "
+                f"({result['confidence']}%) | {result['reason']}"
+            )
+            return result
+
+        except json.JSONDecodeError:
+            logger.warning(f"OpenRouter response bukan JSON ({symbol}, attempt {attempt+1}): {raw}")
+        except Exception as e:
+            logger.error(f"OpenRouter error ({symbol}, attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+
+    return {"decision": "HOLD", "reason": "Validator AI gagal", "confidence": 0}
 
 
 def ask_ai_chat(user_text: str, user_name: str = "User") -> str:
@@ -1342,8 +1439,18 @@ def _mark_signal(symbol: str) -> None:
 # ─── 8. PROSES SATU SINYAL (dipanggil per-pair, bisa berjalan di thread) ────
 # ---------------------------------------------------------------------------
 
-def process_signal(symbol: str, signal: dict, current_price: float, atr: float) -> None:
-    """Tangani satu sinyal BUY/SELL yang lolos confidence threshold untuk sebuah pair."""
+def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
+                   df: pd.DataFrame) -> None:
+    """
+    Auto-trading dengan dual-AI consensus (Groq + Claude Sonnet 5 via OpenRouter).
+
+    Alur:
+    1. Groq sudah analisis (parameter signal)
+    2. Claude Sonnet 5 via OpenRouter memverifikasi secara independen
+    3. Kalau keduanya sepakat arah (BUY/SELL) → eksekusi OTOMATIS tanpa tombol
+    4. Kalau beda pendapat → skip, kirim info ke Telegram
+    5. Setelah eksekusi → notifikasi hasil dikirim ke Telegram
+    """
     decision   = signal["decision"]
     confidence = signal["confidence"]
     reason     = signal["reason"]
@@ -1353,30 +1460,57 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
 
     if LIVE_MODE and not qty_is_tradable(symbol, qty, current_price):
         f = get_symbol_filters(symbol)
-        reason_skip = (
-            f"Saldo USDT ({equity:.4f}) kekecilan buat order {symbol} "
-            f"(butuh min notional ~{f['minNotional']}, min qty {f['minQty']})."
-        )
-        logger.warning(f"⏭️ Lewati sinyal {symbol}: {reason_skip}")
+        logger.warning(f"⏭️ Lewati sinyal {symbol}: saldo kekecilan")
         log_trade(symbol, decision, qty, current_price, confidence, reason, "SKIPPED_TOO_SMALL")
         send_telegram_message(
             f"⏭️ *Sinyal {symbol} dilewati*\n\n"
-            f"AI bilang {'BUY' if decision=='BUY' else 'SELL'} \\({confidence}%\\), "
-            f"tapi saldo USDT kamu kekecilan buat order ini \\(butuh notional min "
-            f"~{f['minNotional']}\\)\\. Gak jadi kirim tombol konfirmasi\\.",
+            f"Groq bilang {decision} \\({confidence}%\\) tapi saldo USDT kekecilan "
+            f"\\(butuh min notional ~{f['minNotional']}\\)\\.",
             topic_id=_signal_topic(decision),
         )
         return
 
-    if not LIVE_MODE:
-        logger.info(f"[SIM] {decision} {qty} {symbol} @ ~{current_price}")
-        log_trade(symbol, decision, qty, current_price, confidence, reason, "SIMULATED")
+    # ── Step 2: Validator Claude Sonnet 5 via OpenRouter ────────────────────
+    send_telegram_message(
+        f"🔍 *Menganalisis {symbol}…*\n\n"
+        f"Groq: *{decision}* \\({confidence}%\\)\n"
+        f"💬 _{reason}_\n\n"
+        f"⏳ Menunggu validasi Claude Sonnet 5…",
+        topic_id=_signal_topic(decision),
+    )
+
+    claude_signal = ask_ai_openrouter(symbol, df, signal)
+    claude_decision   = claude_signal["decision"]
+    claude_confidence = claude_signal["confidence"]
+    claude_reason     = claude_signal["reason"]
+
+    # ── Step 3: Cek consensus ────────────────────────────────────────────────
+    both_agree = (decision == claude_decision and decision != "HOLD")
+    avg_confidence = (confidence + claude_confidence) // 2
+
+    if not both_agree:
+        log_trade(symbol, decision, 0, current_price, confidence, reason, "CONSENSUS_FAIL")
         send_telegram_message(
-            f"🔵 *\\[SIMULASI\\]* {'Beli' if decision=='BUY' else 'Jual'} `{symbol}`\n\n"
+            f"🤔 *Dua AI beda pendapat — {symbol} dilewati*\n\n"
+            f"Groq   : *{decision}* \\({confidence}%\\) — _{reason}_\n"
+            f"Claude : *{claude_decision}* \\({claude_confidence}%\\) — _{claude_reason}_\n\n"
+            f"⏸ _Tidak ada order — tunggu sinyal lebih jelas_",
+            topic_id=_signal_topic(decision),
+        )
+        return
+
+    # ── Step 4: Keduanya sepakat → eksekusi otomatis ─────────────────────────
+    if not LIVE_MODE:
+        logger.info(f"[SIM] CONSENSUS {decision} {qty} {symbol} @ ~{current_price}")
+        log_trade(symbol, decision, qty, current_price, avg_confidence, reason, "SIMULATED")
+        send_telegram_message(
+            f"🔵 *\\[SIMULASI\\] Konsensus 2 AI\\!*\n\n"
+            f"Koin    : `{symbol}`\n"
+            f"Aksi    : *{'Beli' if decision=='BUY' else 'Jual'}*\n"
             f"Volume  : `{qty}`\n"
-            f"Harga   : `{current_price}`\n"
-            f"Yakin   : `{confidence}%`\n\n"
-            f"💬 _{reason}_",
+            f"Harga   : `~{current_price}`\n"
+            f"Groq    : `{confidence}%` — _{reason}_\n"
+            f"Claude  : `{claude_confidence}%` — _{claude_reason}_",
             topic_id=_signal_topic(decision),
         )
         return
@@ -1384,80 +1518,67 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float) 
     if not check_daily_loss(equity):
         return
 
-    acquired = confirmation_slots.acquire(blocking=False)
-    if not acquired:
-        logger.info(f"Slot konfirmasi penuh — lewati sinyal {symbol} kali ini")
-        return
+    # Kirim notif "sedang eksekusi" sebelum order masuk
+    send_telegram_message(
+        f"⚡ *Eksekusi otomatis {symbol}\\!*\n\n"
+        f"Groq + Claude sepakat → *{'BELI' if decision=='BUY' else 'JUAL'}*\n"
+        f"Keyakinan rata\\-rata: `{avg_confidence}%`\n\n"
+        f"🔄 _Mengirim order ke Binance…_",
+        topic_id=_signal_topic(decision),
+    )
 
+    binance_result, errors = {}, []
     try:
-        msg_id = send_telegram_confirm(symbol, signal, qty)
-        if msg_id is None:
-            logger.error(f"Gagal kirim konfirmasi Telegram untuk {symbol}")
-            return
+        binance_result = execute_binance(symbol, decision, qty)
+    except Exception as e:
+        errors.append(f"Binance: {e}")
 
-        reply = wait_for_reply(msg_id)
-        if not reply or reply == "cancel":
-            log_trade(symbol, decision, qty, current_price, confidence, reason, "CANCELLED")
+    fill_price = float(
+        binance_result.get("fills", [{}])[0].get("price", current_price)
+    ) if binance_result.get("fills") else current_price
+    filled_qty = float(binance_result.get("executedQty", qty)) if binance_result else qty
+    order_id   = str(binance_result.get("orderId", "ERR"))
+    status_str = "EXECUTED" if not errors else f"ERROR: {'; '.join(errors)}"
+
+    log_trade(symbol, decision, qty, fill_price, avg_confidence,
+              f"[Groq] {reason} | [Claude] {claude_reason}", status_str, order_id)
+
+    icon = "✅" if not errors else "⚠️"
+    send_telegram_message(
+        f"{icon} *Order masuk ke Binance\\!*\n\n"
+        f"Koin    : `{symbol}`\n"
+        f"Aksi    : *{'Beli' if decision=='BUY' else 'Jual'}*\n"
+        f"Volume  : `{qty}`\n"
+        f"Harga   : `{fill_price}`\n"
+        f"ID Order: `{order_id}`\n"
+        f"Groq    : `{confidence}%` — _{reason}_\n"
+        f"Claude  : `{claude_confidence}%` — _{claude_reason}_\n"
+        f"Status  : {'Eksekusi otomatis ✅' if not errors else '⚠️ ' + '; '.join(errors)}",
+        topic_id=_signal_topic(decision),
+    )
+
+    # Pasang OCO TP/SL otomatis setelah BUY tereksekusi
+    if not errors and decision == "BUY" and filled_qty > 0:
+        oco = place_oco_sell(symbol, filled_qty, fill_price)
+        if oco:
+            tp_price = oco.get("_tp_price", fill_price * (1 + TP_PCT / 100))
+            sl_price = oco.get("_sl_price", fill_price * (1 - SL_PCT / 100))
+            register_open_position(symbol, filled_qty, fill_price, oco)
+            log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, avg_confidence,
+                      f"TP={tp_price} SL={sl_price}", "PLACED",
+                      str(oco.get("orderListId", "")))
             send_telegram_message(
-                f"❌ *Gajadi deh\\!*\n\n"
-                f"Order `{symbol}` {'beli' if decision=='BUY' else 'jual'} dibatalkan "
-                f"— gada yang konfirmasi atau timeout",
+                f"🎯 *TP/SL otomatis terpasang* `{symbol}`\n\n"
+                f"Take Profit : `{tp_price}` \\(\\+{TP_PCT}%\\)\n"
+                f"Stop Loss   : `{sl_price}` \\(\\-{SL_PCT}%\\)",
                 topic_id=_signal_topic(decision),
             )
-            return
-
-        binance_result, errors = {}, []
-        try:
-            binance_result = execute_binance(symbol, decision, qty)
-        except Exception as e:
-            errors.append(f"Binance: {e}")
-
-        fill_price = float(
-            binance_result.get("fills", [{}])[0].get("price", current_price)
-        ) if binance_result.get("fills") else current_price
-        filled_qty = float(binance_result.get("executedQty", qty)) if binance_result else qty
-        order_id   = str(binance_result.get("orderId", "ERR"))
-        status_str = "EXECUTED" if not errors else f"ERROR: {'; '.join(errors)}"
-
-        log_trade(symbol, decision, qty, fill_price, confidence, reason, status_str, order_id)
-
-        icon = "✅" if not errors else "⚠️"
-        send_telegram_message(
-            f"{icon} *Order masuk ke Binance\\!*\n\n"
-            f"Koin    : `{symbol}`\n"
-            f"Aksi    : *{'Beli' if decision=='BUY' else 'Jual'}*\n"
-            f"Volume  : `{qty}`\n"
-            f"Harga   : `{fill_price}`\n"
-            f"ID Order: `{order_id}`\n"
-            f"Status  : {'Berhasil ✅' if not errors else '⚠️ Ada masalah: ' + '; '.join(errors)}",
-            topic_id=_signal_topic(decision),
-        )
-
-        # Setelah BUY tereksekusi, pasang OCO TP/SL otomatis biar posisi nggak
-        # dibiarkan terbuka tanpa target keluar.
-        if not errors and decision == "BUY" and filled_qty > 0:
-            oco = place_oco_sell(symbol, filled_qty, fill_price)
-            if oco:
-                tp_price = oco.get("_tp_price", fill_price * (1 + TP_PCT / 100))
-                sl_price = oco.get("_sl_price", fill_price * (1 - SL_PCT / 100))
-                register_open_position(symbol, filled_qty, fill_price, oco)
-                log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, confidence,
-                          f"TP={tp_price} SL={sl_price}", "PLACED",
-                          str(oco.get("orderListId", "")))
-                send_telegram_message(
-                    f"🎯 *TP/SL otomatis terpasang* `{symbol}`\n\n"
-                    f"Take Profit : `{tp_price}` \\(\\+{TP_PCT}%\\)\n"
-                    f"Stop Loss   : `{sl_price}` \\(\\-{SL_PCT}%\\)",
-                    topic_id=_signal_topic(decision),
-                )
-            else:
-                send_telegram_message(
-                    f"⚠️ *TP/SL gagal dipasang* untuk `{symbol}`\\. Posisi tetap terbuka "
-                    f"— pantau manual atau jual sendiri kalau perlu\\.",
-                    topic_id=_signal_topic(decision),
-                )
-    finally:
-        confirmation_slots.release()
+        else:
+            send_telegram_message(
+                f"⚠️ *TP/SL gagal dipasang* untuk `{symbol}`\\. "
+                f"Posisi terbuka — pantau manual\\.",
+                topic_id=_signal_topic(decision),
+            )
 
 # ---------------------------------------------------------------------------
 # ─── 9. MAIN LOOP ───────────────────────────────────────────────────────────
@@ -1550,7 +1671,7 @@ def main_loop():
                     _mark_signal(symbol)
                     threading.Thread(
                         target=process_signal,
-                        args=(symbol, signal, current_price, atr),
+                        args=(symbol, signal, current_price, atr, df),
                         daemon=True,
                     ).start()
 
