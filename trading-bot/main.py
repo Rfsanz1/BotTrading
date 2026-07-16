@@ -39,7 +39,7 @@ TRADING_PAIRS_ENV: str = os.getenv("TRADING_PAIRS", "ALL").strip()
 CANDLE_INTERVAL: str = "1m"
 CANDLE_LIMIT: int = 100
 
-CONFIDENCE_THRESHOLD: int = 70
+CONFIDENCE_THRESHOLD: int = 80
 MAX_EXPOSURE_PCT: float = 0.02
 DAILY_LOSS_LIMIT_PCT: float = 0.05
 LOOP_SLEEP: int = 60
@@ -67,7 +67,7 @@ INTER_SYMBOL_DELAY_SEC: float = float(os.getenv("INTER_SYMBOL_DELAY_SEC", "0.12"
 # Take Profit / Stop Loss otomatis (persen dari harga entry) — dipasang lewat
 # OCO sell order begitu order BUY tereksekusi, supaya posisi tidak dibiarkan
 # tanpa target keluar.
-TP_PCT: float = float(os.getenv("TP_PCT", "2"))
+TP_PCT: float = float(os.getenv("TP_PCT", "3"))
 SL_PCT: float = float(os.getenv("SL_PCT", "1"))
 
 # Jam (UTC) kapan laporan profit/loss harian otomatis dikirim ke Telegram.
@@ -514,6 +514,53 @@ def is_interesting(df: pd.DataFrame) -> bool:
     macd_cross = (prev_hist <= 0 < hist) or (prev_hist >= 0 > hist)
 
     return bool(rsi_extreme or macd_cross)
+
+
+# Minimum ATR sebagai persen dari harga — pasar yang terlalu "diam" dilewati
+# supaya tidak masuk di kondisi sideways yang rawan false signal.
+MIN_ATR_PCT: float = float(os.getenv("MIN_ATR_PCT", "0.4"))
+
+def is_trending(df: pd.DataFrame) -> bool:
+    """
+    Filter anti-sideways: kembalikan True hanya jika pasar sedang bergerak
+    (trending), bukan ranging/stagnan.
+
+    Tiga syarat — semua harus terpenuhi:
+    1. ATR ≥ MIN_ATR_PCT dari harga close  → ada volatilitas minimal
+    2. SMA20 dan SMA50 divergen (selisih ≥ 0.2% dari harga)  → ada tren
+    3. RSI tidak terjebak di zona netral 42–58  → momentum jelas
+
+    Kalau pasar sideways sinyal BUY/SELL sering false positif dan
+    risikonya tidak sebanding. Lebih baik skip dan tunggu tren jelas.
+    """
+    last   = df.iloc[-1]
+    close  = float(last["close"])
+    if close <= 0:
+        return False
+
+    atr   = last.get("atr14")
+    sma20 = last.get("sma20")
+    sma50 = last.get("sma50")
+    rsi   = last.get("rsi14")
+
+    if pd.isna(atr) or pd.isna(sma20) or pd.isna(sma50) or pd.isna(rsi):
+        return False
+
+    # 1. Volatilitas cukup?
+    atr_pct = (atr / close) * 100
+    if atr_pct < MIN_ATR_PCT:
+        return False
+
+    # 2. Tren jelas? SMA harus divergen setidaknya 0.2% dari harga
+    sma_gap_pct = abs(sma20 - sma50) / close * 100
+    if sma_gap_pct < 0.2:
+        return False
+
+    # 3. Momentum tidak netral (RSI harus keluar dari zona 42–58)
+    if 42 <= rsi <= 58:
+        return False
+
+    return True
 
 # ---------------------------------------------------------------------------
 # ─── 3. ANALISIS AI (GROQ – conversational, ingat history) ──────────────────
@@ -1466,6 +1513,11 @@ def main_loop():
 
                     df = compute_indicators(df)
                     if not is_interesting(df):
+                        continue
+
+                    # Filter sideways: skip pair yang pasar lagi ranging/stagnan
+                    # supaya tidak masuk di kondisi false signal yang rawan rugi
+                    if not is_trending(df):
                         continue
 
                     if ai_calls_this_cycle >= MAX_AI_CALLS_PER_CYCLE:
