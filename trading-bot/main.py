@@ -41,6 +41,12 @@ CANDLE_LIMIT: int = 100
 
 CONFIDENCE_THRESHOLD: int = 80
 MAX_EXPOSURE_PCT: float = 0.02
+
+# Berapa persen dari total saldo Binance yang boleh dipakai untuk trading.
+# Sisanya "dikunci" dan tidak akan disentuh bot sama sekali.
+# Contoh: 0.5 = pakai 50% saldo, sisanya aman.
+# Override lewat env var: CAPITAL_ALLOCATION_PCT=0.5
+CAPITAL_ALLOCATION_PCT: float = max(0.01, min(1.0, float(os.getenv("CAPITAL_ALLOCATION_PCT", "0.5"))))
 DAILY_LOSS_LIMIT_PCT: float = 0.05
 LOOP_SLEEP: int = 60
 CONFIRM_TIMEOUT: int = 120
@@ -1927,8 +1933,9 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     atr_sl = atr * SL_ATR_MULT  # jarak Stop Loss dari entry
     atr_tp = atr * TP_ATR_MULT  # jarak Take Profit dari entry
 
-    equity = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 10_000.0
-    qty    = calc_quantity(current_price, atr_sl if atr_sl > 0 else atr, equity, symbol=symbol)
+    raw_equity    = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 10_000.0
+    equity        = raw_equity * CAPITAL_ALLOCATION_PCT   # hanya pakai sebagian saldo
+    qty           = calc_quantity(current_price, atr_sl if atr_sl > 0 else atr, equity, symbol=symbol)
 
     if LIVE_MODE and not qty_is_tradable(symbol, qty, current_price):
         f = get_symbol_filters(symbol)
@@ -2001,7 +2008,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         )
         return
 
-    if not check_daily_loss(equity):
+    if not check_daily_loss(raw_equity):
         return
 
     # Kirim notif "sedang eksekusi" sebelum order masuk
@@ -2102,6 +2109,7 @@ def main_loop():
         f"AI      : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
         f"Filter  : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
         f"TP/SL   : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
+        f"Modal   : `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari saldo \\(sisanya tidak disentuh\\)\n"
         f"Min keyakinan: `{CONFIDENCE_THRESHOLD}%`"
         + topic_info,
         topic_id=None,
