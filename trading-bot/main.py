@@ -140,9 +140,10 @@ TELEGRAM_BUY_TOPIC_ID:  Optional[int] = _parse_topic("TELEGRAM_BUY_TOPIC_ID")
 TELEGRAM_SELL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_SELL_TOPIC_ID")
 TELEGRAM_BULL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BULL_TOPIC_ID")
 TELEGRAM_BEAR_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BEAR_TOPIC_ID")
-TELEGRAM_CHAT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
+TELEGRAM_CHAT_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
 TELEGRAM_REPORT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID")
-TELEGRAM_NEWS_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
+TELEGRAM_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
+TELEGRAM_HOLD_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_HOLD_TOPIC_ID")
 
 BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
 BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
@@ -1107,6 +1108,8 @@ def send_trend_message(text: str, decision: str = "HOLD") -> None:
         topic = TELEGRAM_BULL_TOPIC_ID
     elif decision == "SELL":
         topic = TELEGRAM_BEAR_TOPIC_ID
+    elif decision == "HOLD":
+        topic = TELEGRAM_HOLD_TOPIC_ID
     else:
         sentiment = _detect_sentiment(text)
         topic = TELEGRAM_BULL_TOPIC_ID if sentiment == "bull" else TELEGRAM_BEAR_TOPIC_ID
@@ -2101,13 +2104,14 @@ def main_loop():
 
     topic_info = (
         f"\n\n📌 *Topics:*\n"
-        f"Buy        : `{TELEGRAM_BUY_TOPIC_ID  or 'general'}`\n"
-        f"Sell       : `{TELEGRAM_SELL_TOPIC_ID or 'general'}`\n"
-        f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'general'}`\n"
-        f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'general'}`\n"
-        f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'general'}`\n"
+        f"Buy        : `{TELEGRAM_BUY_TOPIC_ID    or 'general'}`\n"
+        f"Sell       : `{TELEGRAM_SELL_TOPIC_ID   or 'general'}`\n"
+        f"Hold/update: `{TELEGRAM_HOLD_TOPIC_ID   or 'general'}`\n"
+        f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID   or 'general'}`\n"
+        f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID   or 'general'}`\n"
         f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'general'}`\n"
-        f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID or 'general'}`"
+        f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID   or 'general'}`\n"
+        f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID   or 'general'}`"
     )
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
