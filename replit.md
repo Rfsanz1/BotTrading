@@ -24,8 +24,11 @@ An automated trading bot that watches every USDT trading pair on Binance, uses G
 ## Architecture decisions
 
 - The bot scans **all** Binance USDT spot pairs (~440+) every cycle instead of a single hardcoded symbol, per user request. Sending every pair to Groq every minute would blow through API rate limits, so a cheap technical pre-filter (RSI extremes or MACD zero-crossings) shortlists candidates first, and only those go to the AI (capped via `MAX_AI_CALLS_PER_CYCLE`, default 8).
-- Live trades still require a human tap on the Telegram ✅ button — the AI/pre-filter only decides what to *propose*, never executes unattended.
-- Each flagged pair's confirmation runs in its own background thread so one pair waiting on a Telegram reply doesn't block scanning the rest; concurrent confirmations are capped (`MAX_CONCURRENT_CONFIRMATIONS`, default 5) and a per-symbol cooldown (`SYMBOL_COOLDOWN_SEC`, default 600s) avoids re-flagging the same pair every cycle.
+- **Multi-timeframe confluence (1m + 5m + 15m)**: the pre-filter runs on 1m candles; when a pair passes, the bot also fetches 5m and 15m candles and passes all three timeframes to both AI models. 15m sets trend direction, 5m confirms momentum, 1m provides entry precision.
+- **Funding Rate + Open Interest from Binance Futures API** (public, no key needed): funding rate signals crowded positioning (extreme positive = crowded longs, risk of reversal; extreme negative = crowded shorts, squeeze risk). OI trend confirms whether price moves are backed by new money or just liquidations/profit-taking.
+- **ATR-based dynamic TP/SL (R:R 1:4)**: instead of fixed %, Take Profit is set at `TP_ATR_MULT × ATR` (default 4×) above entry and Stop Loss at `SL_ATR_MULT × ATR` (default 1×) below. Override via `TP_ATR_MULT` and `SL_ATR_MULT` env vars.
+- **Dual-AI consensus**: Groq (Llama 3.1) analyzes first; Claude Sonnet 5 via OpenRouter validates independently. Both see the full multi-TF + futures data context. Only when both agree on direction (BUY or SELL) does the bot execute automatically. Disagreement = skip and notify Telegram.
+- Each execution thread runs independently so one pair's validation/execution doesn't block the scan loop. Per-symbol cooldown (`SYMBOL_COOLDOWN_SEC`, default 600s) prevents re-flagging the same pair every cycle.
 - `TRADING_PAIRS` env var can override the "scan everything" default with an explicit comma-separated list (e.g. `BTCUSDT,ETHUSDT`).
 
 ## Product

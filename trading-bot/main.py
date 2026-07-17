@@ -86,6 +86,17 @@ NEWS_REFRESH_SEC: int = int(os.getenv("NEWS_REFRESH_SEC", "900"))  # 15 menit
 # Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 
+# ATR-based dynamic TP/SL — R:R 1:4
+# Stop Loss  = SL_ATR_MULT × ATR di bawah entry (default 1.0×)
+# Take Profit = TP_ATR_MULT × ATR di atas entry (default 4.0×)
+# Override via env var kalau ingin rasio berbeda.
+SL_ATR_MULT: float = float(os.getenv("SL_ATR_MULT", "1.0"))
+TP_ATR_MULT: float = float(os.getenv("TP_ATR_MULT", "4.0"))
+
+# Multi-timeframe — interval yang dianalisis bersama (1m sebagai primary)
+MTF_INTERVALS: list[str] = ["1m", "5m", "15m"]
+MTF_LIMIT: int = 100  # jumlah candle per interval
+
 # ---------------------------------------------------------------------------
 # ─── ENVIRONMENT VARIABLES ──────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -313,6 +324,95 @@ def get_relevant_news(symbol: str = "", max_items: int = 4) -> list[dict]:
     if relevant:
         return relevant[:max_items]
     return pool[:max_items]
+
+
+# ---------------------------------------------------------------------------
+# ─── 0b. BINANCE FUTURES — FUNDING RATE & OPEN INTEREST (public, no key) ────
+# ---------------------------------------------------------------------------
+
+def fetch_funding_rate(symbol: str) -> Optional[dict]:
+    """Ambil funding rate terkini + mark price dari Binance Futures (fapi).
+    Funding rate positif → long membayar short (pasar terlalu bullish / crowded longs).
+    Funding rate negatif → short membayar long (pasar oversold / crowded shorts).
+    Return None kalau pair tidak ada di Futures."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/premiumIndex",
+            params={"symbol": symbol},
+            timeout=5,
+        )
+        if r.status_code in (400, 404):
+            return None
+        r.raise_for_status()
+        d = r.json()
+        rate = float(d.get("lastFundingRate", 0)) * 100  # konversi ke %
+        return {
+            "funding_rate_pct": round(rate, 4),
+            "mark_price":       round(float(d.get("markPrice", 0)), 8),
+            "index_price":      round(float(d.get("indexPrice", 0)), 8),
+            "sentiment":        (
+                "sangat bullish (crowded long, hati-hati reversal)" if rate > 0.05
+                else "bullish ringan" if rate > 0.01
+                else "netral" if abs(rate) <= 0.01
+                else "bearish ringan" if rate > -0.05
+                else "sangat bearish (crowded short, potensi short squeeze)"
+            ),
+        }
+    except Exception as e:
+        logger.debug(f"Funding rate {symbol} tidak tersedia: {e}")
+        return None
+
+
+def fetch_open_interest(symbol: str) -> Optional[dict]:
+    """Ambil open interest saat ini dari Binance Futures.
+    OI naik + harga naik → tren bullish kuat (uang baru masuk mengikuti trend).
+    OI naik + harga turun → distribusi/shorting agresif.
+    OI turun + harga naik → short squeeze atau profit-taking.
+    OI turun + harga turun → capitulation / likuidasi massal."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/fapi/v1/openInterest",
+            params={"symbol": symbol},
+            timeout=5,
+        )
+        if r.status_code in (400, 404):
+            return None
+        r.raise_for_status()
+        d = r.json()
+        return {
+            "open_interest":       round(float(d.get("openInterest", 0)), 2),
+            "open_interest_value": round(float(d.get("openInterest", 0)) * float(d.get("openInterest", 0)), 2),
+        }
+    except Exception as e:
+        logger.debug(f"Open interest {symbol} tidak tersedia: {e}")
+        return None
+
+
+def fetch_oi_change(symbol: str) -> Optional[dict]:
+    """Ambil histori open interest 5 periode (5m bucket) untuk lihat tren OI naik/turun."""
+    try:
+        r = requests.get(
+            "https://fapi.binance.com/futures/data/openInterestHist",
+            params={"symbol": symbol, "period": "5m", "limit": 5},
+            timeout=5,
+        )
+        if r.status_code in (400, 404):
+            return None
+        r.raise_for_status()
+        data = r.json()
+        if not data or len(data) < 2:
+            return None
+        oldest = float(data[0].get("sumOpenInterest", 0))
+        newest = float(data[-1].get("sumOpenInterest", 0))
+        change_pct = ((newest - oldest) / oldest * 100) if oldest else 0.0
+        return {
+            "oi_now":       round(newest, 2),
+            "oi_change_pct": round(change_pct, 3),
+            "trend":        "naik" if change_pct > 0.5 else "turun" if change_pct < -0.5 else "sideways",
+        }
+    except Exception as e:
+        logger.debug(f"OI hist {symbol} tidak tersedia: {e}")
+        return None
 
 
 def _extract_filters(s: dict) -> dict:
@@ -567,18 +667,61 @@ def is_trending(df: pd.DataFrame) -> bool:
 # ─── 3. ANALISIS AI (GROQ – conversational, ingat history) ──────────────────
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_TRADING = (
-    "Kamu adalah asisten trading yang ramah dan pintar. Kamu memantau banyak pair "
-    "kripto sekaligus di Binance dan ingat analisis-analisis sebelumnya dalam "
-    "percakapan ini untuk melihat pola pasar dari waktu ke waktu. Kalau ada blok "
-    "'Berita/kondisi pasar terkini' di data yang dikirim, pertimbangkan sentimen "
-    "berita itu juga (misal berita regulasi/adopsi/hack bisa mengalahkan sinyal "
-    "teknikal semata) — bukan cuma indikator RSI/MACD.\n\n"
-    "Kalau diminta analisis data market, balas HANYA dengan JSON valid, tanpa teks lain:\n"
-    '{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<1-2 kalimat bahasa santai>", "confidence": <0-100> }\n\n'
-    "Kalau ditanya pertanyaan umum (bukan analisis data), jawab dengan santai dan natural "
-    "pakai bahasa sehari-hari Indonesia. Jangan kaku, ngobrol aja seperti teman."
-)
+SYSTEM_PROMPT_TRADING = """Kamu adalah analis trading kripto profesional yang cerdas dan teliti. \
+Kamu menganalisis data multi-timeframe (1m, 5m, 15m) + data Futures Binance (funding rate, open interest) \
++ berita pasar untuk menghasilkan keputusan trading berkualitas tinggi.
+
+=== CARA ANALISIS (WAJIB DIIKUTI) ===
+
+1. MULTI-TIMEFRAME CONFLUENCE
+   - 15m → arah tren utama (trend direction). Ini yang paling penting.
+   - 5m  → konfirmasi momentum dan entry timing.
+   - 1m  → presisi entry, lihat apakah ada momentum jangka sangat pendek.
+   - Sinyal BUY/SELL kuat = minimal 2 dari 3 TF sepakat arahnya.
+   - Kalau 15m berlawanan dengan 1m/5m → HOLD atau kurangi confidence signifikan.
+
+2. INDIKATOR TEKNIKAL
+   - RSI: oversold (<30) → potensi BUY, overbought (>70) → potensi SELL.
+     RSI 30-70 = zona netral, tidak ada sinyal kuat dari RSI saja.
+   - MACD histogram crossing zero: bullish cross (neg→pos) = BUY signal,
+     bearish cross (pos→neg) = SELL signal.
+   - SMA20 vs SMA50: SMA20 di atas SMA50 = uptrend, di bawah = downtrend.
+   - ATR14: ukuran volatilitas. ATR tinggi = momentum kuat, ATR rendah = sideways.
+
+3. FUNDING RATE (dari Binance Futures)
+   - Funding positif tinggi (>0.05%) = pasar terlalu bullish, crowded longs.
+     → Risiko reversal ke bawah, hati-hati BUY, bisa SELL/HOLD.
+   - Funding negatif dalam (<-0.05%) = crowded shorts, potensi short squeeze.
+     → Tambah confidence untuk BUY.
+   - Funding netral (-0.01% s.d. +0.01%) = tidak ada tekanan arah dari futures.
+
+4. OPEN INTEREST (OI)
+   - OI naik + harga naik = tren bullish dikonfirmasi, uang baru masuk long.
+   - OI naik + harga turun = tekanan short agresif, tren bearish kuat.
+   - OI turun + harga naik = short squeeze / profit-taking, tren mungkin lemah.
+   - OI turun + harga turun = likuidasi/capitulation, potensi reversal dekat.
+
+5. SENTIMEN BERITA
+   - Berita regulasi negatif, hack, atau crash bisa override sinyal teknikal bullish.
+   - Berita adopsi, ETF, atau listing besar → tambah confidence BUY.
+   - Kalau tidak ada berita relevan, murni andalkan teknikal + futures data.
+
+6. RISK-REWARD
+   - Bot menggunakan TP = 4×ATR dan SL = 1×ATR (R:R 1:4).
+   - Jangan BUY/SELL kalau potensi profit tidak sepadan dengan risiko.
+   - Lebih baik HOLD daripada masuk di kondisi ragu-ragu.
+
+=== FORMAT JAWABAN ===
+Kalau diminta analisis data market, balas HANYA dengan JSON valid berikut, tanpa teks lain:
+{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<2-3 kalimat ringkas dalam bahasa Indonesia santai, sebutkan faktor utama yang mendorong keputusan>", "confidence": <0-100> }
+
+Confidence guide:
+- 90-100: semua TF + indikator + futures data sepakat, berita mendukung
+- 75-89: mayoritas sinyal sepakat, ada 1-2 yang netral
+- 60-74: ada konflik minor tapi arah cukup jelas
+- <60: sinyal campur, lebih aman HOLD
+
+Kalau ditanya pertanyaan umum (bukan analisis data), jawab santai dan natural pakai bahasa sehari-hari Indonesia. Jangan kaku, ngobrol aja seperti teman yang paham trading."""
 
 def _trim_history():
     """Pertahankan hanya MAX_HISTORY_EXCHANGES exchange terakhir."""
@@ -588,37 +731,98 @@ def _trim_history():
         conversation_history = conversation_history[-max_msgs:]
 
 
-def ask_ai(symbol: str, df: pd.DataFrame) -> dict:
+def _build_tf_block(label: str, df: Optional[pd.DataFrame], n_rows: int = 5) -> str:
+    """Bangun blok teks ringkas satu timeframe untuk dikirim ke AI."""
+    if df is None or len(df) < 2:
+        return f"\n[{label}] Data tidak tersedia"
+    last = df.tail(n_rows).copy()
+    for col in last.select_dtypes(include="float64").columns:
+        last[col] = last[col].round(4)
+    rows = []
+    for ts, row in last.iterrows():
+        rows.append(
+            f"  {ts.strftime('%H:%M')} O={row['open']} H={row['high']} L={row['low']} "
+            f"C={row['close']} V={row['volume']:.0f} | "
+            f"SMA20={row.get('sma20',0):.2f} SMA50={row.get('sma50',0):.2f} "
+            f"RSI={row.get('rsi14',0):.1f} MACD_hist={row.get('macd_hist',0):.4f} "
+            f"ATR={row.get('atr14',0):.4f}"
+        )
+    last_row = df.iloc[-1]
+    sma20 = last_row.get("sma20", 0) or 0
+    sma50 = last_row.get("sma50", 0) or 0
+    rsi   = last_row.get("rsi14", 50) or 50
+    hist  = last_row.get("macd_hist", 0) or 0
+    prev_hist = df.iloc[-2].get("macd_hist", 0) or 0
+    summary = (
+        f"  → Tren SMA: {'uptrend (SMA20>SMA50)' if sma20 > sma50 else 'downtrend (SMA20<SMA50)'} | "
+        f"RSI={rsi:.1f} ({'oversold' if rsi < 30 else 'overbought' if rsi > 70 else 'netral'}) | "
+        f"MACD hist: {'bullish cross ✅' if prev_hist <= 0 < hist else 'bearish cross 🔴' if prev_hist >= 0 > hist else ('positif' if hist > 0 else 'negatif')}"
+    )
+    return f"\n[{label}]\n" + "\n".join(rows) + "\n" + summary
+
+
+def ask_ai(symbol: str, df_1m: pd.DataFrame,
+           df_5m: Optional[pd.DataFrame] = None,
+           df_15m: Optional[pd.DataFrame] = None,
+           funding: Optional[dict] = None,
+           oi_change: Optional[dict] = None) -> dict:
     """
-    Kirim data + indikator satu pair ke Groq dengan conversation history.
+    Kirim data multi-TF + futures data + berita ke Groq dengan conversation history.
     Return: { "decision": "BUY"|"SELL"|"HOLD", "reason": str, "confidence": int }
     """
     global conversation_history
     client = Groq(api_key=GROQ_API_KEY)
 
-    last = df.tail(5).copy()
-    for col in last.select_dtypes(include="float64").columns:
-        last[col] = last[col].round(2)
+    # ── Blok multi-timeframe ────────────────────────────────────────────────
+    tf_blocks = (
+        _build_tf_block("1m — Primary Entry", df_1m, 5)
+        + _build_tf_block("5m — Momentum Confirmation", df_5m, 3)
+        + _build_tf_block("15m — Trend Direction", df_15m, 3)
+    )
 
-    rows = []
-    for ts, row in last.iterrows():
-        rows.append(
-            f"{ts.strftime('%H:%M')} O={row['open']} H={row['high']} L={row['low']} "
-            f"C={row['close']} V={row['volume']:.0f} "
-            f"SMA20={row.get('sma20',0):.0f} RSI={row.get('rsi14',0):.1f} "
-            f"MACD={row.get('macd',0):.2f} ATR={row.get('atr14',0):.2f}"
+    # ── ATR saat ini (dari 1m) untuk info R:R ──────────────────────────────
+    atr_now = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+    price_now = float(df_1m.iloc[-1]["close"])
+    atr_pct = (atr_now / price_now * 100) if price_now else 0
+    rr_block = (
+        f"\nR:R Setup (ATR-based):\n"
+        f"  ATR14(1m)  = {atr_now:.6f} ({atr_pct:.3f}% dari harga)\n"
+        f"  SL target  = {price_now - SL_ATR_MULT * atr_now:.6f} (entry − {SL_ATR_MULT}×ATR)\n"
+        f"  TP target  = {price_now + TP_ATR_MULT * atr_now:.6f} (entry + {TP_ATR_MULT}×ATR)\n"
+        f"  R:R ratio  = 1:{int(TP_ATR_MULT / SL_ATR_MULT)}"
+    )
+
+    # ── Funding Rate + OI ───────────────────────────────────────────────────
+    futures_block = ""
+    if funding:
+        futures_block += (
+            f"\nFutures Data (Binance):\n"
+            f"  Funding Rate : {funding['funding_rate_pct']:+.4f}% → {funding['sentiment']}\n"
+            f"  Mark Price   : {funding['mark_price']}\n"
+            f"  Index Price  : {funding['index_price']}"
         )
+    if oi_change:
+        futures_block += (
+            f"\n  OI (5m hist) : {oi_change['oi_now']:,.2f} kontrak | "
+            f"perubahan {oi_change['oi_change_pct']:+.3f}% → OI {oi_change['trend']}"
+        )
+    if not futures_block:
+        futures_block = "\nFutures Data: tidak tersedia untuk pair ini (spot-only)"
+
+    # ── Berita ──────────────────────────────────────────────────────────────
     news_items = get_relevant_news(symbol)
     news_block = ""
     if news_items:
-        headlines = "\n".join(f"- {n['title']} ({n['source']})" for n in news_items)
-        news_block = f"\n\nBerita/kondisi pasar terkini:\n{headlines}"
+        headlines = "\n".join(f"  - {n['title']} ({n['source']})" for n in news_items)
+        news_block = f"\nBerita/sentimen pasar terkini:\n{headlines}"
 
     user_msg = (
-        f"{symbol} {CANDLE_INTERVAL} "
-        f"[{datetime.now(timezone.utc).strftime('%H:%M UTC')}]\n"
-        + "\n".join(rows)
-        + news_block
+        f"=== ANALISIS {symbol} [{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}] ===\n"
+        f"\n— MULTI-TIMEFRAME OHLCV + INDIKATOR —{tf_blocks}"
+        f"\n\n— RISK-REWARD SETUP —{rr_block}"
+        f"\n\n— FUTURES DATA —{futures_block}"
+        + (f"\n\n— BERITA —{news_block}" if news_block else "")
+        + "\n\nBerikan analisis lengkap dan keputusan trading (JSON)."
     )
 
     raw = ""
@@ -633,7 +837,7 @@ def ask_ai(symbol: str, df: pd.DataFrame) -> dict:
 
             response = client.chat.completions.create(
                 model="llama-3.1-8b-instant",
-                max_tokens=250,
+                max_tokens=350,
                 temperature=0.2,
                 messages=messages,
             )
@@ -665,51 +869,87 @@ def ask_ai(symbol: str, df: pd.DataFrame) -> dict:
 # ─── 3b. VALIDATOR AI (OpenRouter – Claude Sonnet 5) ────────────────────────
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT_VALIDATOR = (
-    "Kamu adalah validator sinyal trading kripto yang independen dan kritis. "
-    "Kamu menerima data market dan sinyal dari AI lain, lalu memverifikasi apakah "
-    "sinyal itu valid berdasarkan analisismu sendiri. Jangan terpengaruh sinyal sebelumnya — "
-    "analisis datanya secara objektif.\n\n"
-    "Balas HANYA dengan JSON valid, tanpa teks lain:\n"
-    '{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<1-2 kalimat bahasa santai>", "confidence": <0-100> }'
-)
+SYSTEM_PROMPT_VALIDATOR = """Kamu adalah validator sinyal trading kripto yang independen, kritis, dan sangat teliti. \
+Kamu menerima data market lengkap (multi-timeframe, funding rate, open interest, berita) \
+beserta sinyal dari AI pertama, lalu memverifikasi secara independen.
 
-def ask_ai_openrouter(symbol: str, df: pd.DataFrame, groq_signal: dict) -> dict:
+TUGASMU:
+- Analisis data multi-timeframe (1m/5m/15m) secara objektif. Jangan ikut-ikutan sinyal AI pertama.
+- Pertimbangkan funding rate: crowded position = risiko reversal.
+- Pertimbangkan open interest trend: konfirmasi atau contradict sinyal harga?
+- Apakah risk-reward (TP 4×ATR vs SL 1×ATR) masuk akal di kondisi saat ini?
+- Kalau sinyal AI pertama masuk akal secara teknikal → setujui. Kalau ada red flag yang dilewatkan → koreksi.
+
+PENTING: Lebih baik HOLD daripada setuju dengan sinyal yang meragukan. \
+Bot ini mengeksekusi order NYATA di Binance — akurasi lebih penting dari kuantitas sinyal.
+
+Balas HANYA dengan JSON valid, tanpa teks lain:
+{ "decision": "BUY"|"SELL"|"HOLD", "reason": "<2-3 kalimat ringkas bahasa Indonesia, sebutkan apakah kamu setuju/tidak dan alasannya>", "confidence": <0-100> }"""
+
+def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+                       df_5m: Optional[pd.DataFrame] = None,
+                       df_15m: Optional[pd.DataFrame] = None,
+                       funding: Optional[dict] = None,
+                       oi_change: Optional[dict] = None) -> dict:
     """
     Validator kedua menggunakan Claude Sonnet 5 via OpenRouter.
-    Menerima data market + sinyal Groq sebagai konteks, lalu memverifikasi
+    Menerima data market multi-TF + futures data + sinyal Groq, lalu memverifikasi
     secara independen. Return: { decision, reason, confidence }
     """
     if not OPENROUTER_API_KEY:
         logger.warning("OPENROUTER_API_KEY belum diisi — validator dilewati")
         return groq_signal  # fallback: percaya Groq saja
 
-    last = df.tail(5).copy()
-    for col in last.select_dtypes(include="float64").columns:
-        last[col] = last[col].round(2)
+    # ── Blok multi-timeframe ────────────────────────────────────────────────
+    tf_blocks = (
+        _build_tf_block("1m — Primary Entry", df_1m, 5)
+        + _build_tf_block("5m — Momentum Confirmation", df_5m, 3)
+        + _build_tf_block("15m — Trend Direction", df_15m, 3)
+    )
 
-    rows = []
-    for ts, row in last.iterrows():
-        rows.append(
-            f"{ts.strftime('%H:%M')} O={row['open']} H={row['high']} L={row['low']} "
-            f"C={row['close']} V={row['volume']:.0f} "
-            f"SMA20={row.get('sma20',0):.0f} RSI={row.get('rsi14',0):.1f} "
-            f"MACD={row.get('macd',0):.2f} ATR={row.get('atr14',0):.2f}"
+    # ── ATR + R:R info ──────────────────────────────────────────────────────
+    atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+    price_now = float(df_1m.iloc[-1]["close"])
+    rr_block  = (
+        f"\nR:R Setup (ATR-based):\n"
+        f"  ATR14(1m) = {atr_now:.6f}\n"
+        f"  SL target = {price_now - SL_ATR_MULT * atr_now:.6f} (entry − {SL_ATR_MULT}×ATR)\n"
+        f"  TP target = {price_now + TP_ATR_MULT * atr_now:.6f} (entry + {TP_ATR_MULT}×ATR)\n"
+        f"  R:R ratio = 1:{int(TP_ATR_MULT / SL_ATR_MULT)}"
+    )
+
+    # ── Futures data ────────────────────────────────────────────────────────
+    futures_block = ""
+    if funding:
+        futures_block += (
+            f"\nFutures Data:\n"
+            f"  Funding Rate : {funding['funding_rate_pct']:+.4f}% → {funding['sentiment']}\n"
+            f"  Mark Price   : {funding['mark_price']}"
         )
+    if oi_change:
+        futures_block += (
+            f"\n  OI trend     : {oi_change['oi_change_pct']:+.3f}% ({oi_change['trend']})"
+        )
+    if not futures_block:
+        futures_block = "\nFutures Data: tidak tersedia (spot-only pair)"
 
+    # ── Berita ──────────────────────────────────────────────────────────────
     news_items = get_relevant_news(symbol)
     news_block = ""
     if news_items:
-        headlines = "\n".join(f"- {n['title']} ({n['source']})" for n in news_items)
-        news_block = f"\n\nBerita/kondisi pasar terkini:\n{headlines}"
+        headlines = "\n".join(f"  - {n['title']} ({n['source']})" for n in news_items)
+        news_block = f"\nBerita:\n{headlines}"
 
     user_msg = (
-        f"Data {symbol} {CANDLE_INTERVAL} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}]:\n"
-        + "\n".join(rows)
-        + news_block
-        + f"\n\nAI pertama (Groq) bilang: {groq_signal['decision']} "
-        f"dengan keyakinan {groq_signal['confidence']}% — alasan: {groq_signal['reason']}\n\n"
-        f"Verifikasi dengan analisismu sendiri. Setuju atau tidak?"
+        f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
+        f"\n— MULTI-TIMEFRAME —{tf_blocks}"
+        f"\n\n— RISK-REWARD —{rr_block}"
+        f"\n\n— FUTURES DATA —{futures_block}"
+        + (f"\n\n— BERITA —{news_block}" if news_block else "")
+        + f"\n\n— SINYAL AI PERTAMA (Groq) —\n"
+        f"  Keputusan : {groq_signal['decision']} ({groq_signal['confidence']}%)\n"
+        f"  Alasan    : {groq_signal['reason']}\n\n"
+        f"Verifikasi secara independen. Apakah kamu setuju? Berikan analisismu (JSON)."
     )
 
     raw = ""
@@ -1164,10 +1404,11 @@ def execute_binance(symbol: str, side: str, qty: float) -> dict:
 
 
 def place_oco_sell(symbol: str, qty: float, entry_price: float,
-                    tp_pct: float = TP_PCT, sl_pct: float = SL_PCT) -> Optional[dict]:
-    """Pasang OCO sell (Take Profit + Stop Loss) langsung di Binance begitu posisi
-    BUY tereksekusi, supaya posisi tidak dibiarkan terbuka tanpa target keluar.
-    TP = limit sell di atas entry_price. SL = stop-limit sell di bawah entry_price."""
+                    atr: float = 0.0) -> Optional[dict]:
+    """Pasang OCO sell dengan ATR-based dynamic TP/SL (R:R 1:4).
+    TP = entry + TP_ATR_MULT × ATR  (default 4×ATR di atas entry)
+    SL = entry − SL_ATR_MULT × ATR  (default 1×ATR di bawah entry)
+    Kalau ATR = 0, fallback ke fixed pct (TP_PCT / SL_PCT) untuk keamanan."""
     from binance.client import Client
     f = get_symbol_filters(symbol)
     tick = f.get("tickSize", 0.00000001)
@@ -1178,9 +1419,22 @@ def place_oco_sell(symbol: str, qty: float, entry_price: float,
         logger.warning(f"⏭️ Lewati OCO {symbol}: qty setelah rounding jadi 0")
         return None
 
-    tp_price   = _round_price(entry_price * (1 + tp_pct / 100), tick)
-    sl_stop    = _round_price(entry_price * (1 - sl_pct / 100), tick)
-    sl_limit   = _round_price(sl_stop * 0.999, tick)
+    if atr > 0:
+        # ATR-based dynamic levels — R:R 1:4
+        tp_price = _round_price(entry_price + TP_ATR_MULT * atr, tick)
+        sl_stop  = _round_price(entry_price - SL_ATR_MULT * atr, tick)
+        logger.info(
+            f"🎯 OCO ATR-based {symbol}: ATR={atr:.6f} "
+            f"TP=entry+{TP_ATR_MULT}×ATR={tp_price} SL=entry-{SL_ATR_MULT}×ATR={sl_stop} "
+            f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}"
+        )
+    else:
+        # Fallback ke fixed pct
+        tp_price = _round_price(entry_price * (1 + TP_PCT / 100), tick)
+        sl_stop  = _round_price(entry_price * (1 - SL_PCT / 100), tick)
+        logger.warning(f"⚠️ OCO {symbol}: ATR=0, fallback ke fixed pct TP={TP_PCT}% SL={SL_PCT}%")
+
+    sl_limit = _round_price(sl_stop * 0.999, tick)
 
     client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
     for attempt in range(3):
@@ -1440,23 +1694,32 @@ def _mark_signal(symbol: str) -> None:
 # ---------------------------------------------------------------------------
 
 def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
-                   df: pd.DataFrame) -> None:
+                   df_1m: pd.DataFrame,
+                   df_5m: Optional[pd.DataFrame] = None,
+                   df_15m: Optional[pd.DataFrame] = None,
+                   funding: Optional[dict] = None,
+                   oi_change: Optional[dict] = None) -> None:
     """
     Auto-trading dengan dual-AI consensus (Groq + Claude Sonnet 5 via OpenRouter).
+    Menggunakan ATR-based dynamic TP/SL (R:R 1:4) dan data multi-TF + Futures.
 
     Alur:
     1. Groq sudah analisis (parameter signal)
     2. Claude Sonnet 5 via OpenRouter memverifikasi secara independen
     3. Kalau keduanya sepakat arah (BUY/SELL) → eksekusi OTOMATIS tanpa tombol
     4. Kalau beda pendapat → skip, kirim info ke Telegram
-    5. Setelah eksekusi → notifikasi hasil dikirim ke Telegram
+    5. Setelah eksekusi → pasang OCO ATR-based TP/SL, kirim notifikasi
     """
     decision   = signal["decision"]
     confidence = signal["confidence"]
     reason     = signal["reason"]
 
+    # ATR untuk sizing + OCO levels
+    atr_sl = atr * SL_ATR_MULT  # jarak Stop Loss dari entry
+    atr_tp = atr * TP_ATR_MULT  # jarak Take Profit dari entry
+
     equity = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 10_000.0
-    qty    = calc_quantity(current_price, atr, equity, symbol=symbol)
+    qty    = calc_quantity(current_price, atr_sl if atr_sl > 0 else atr, equity, symbol=symbol)
 
     if LIVE_MODE and not qty_is_tradable(symbol, qty, current_price):
         f = get_symbol_filters(symbol)
@@ -1470,16 +1733,27 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         )
         return
 
+    # Hitung TP/SL levels untuk preview di Telegram
+    sl_preview = round(current_price - atr_sl, 8) if atr > 0 else round(current_price * (1 - SL_PCT / 100), 8)
+    tp_preview = round(current_price + atr_tp, 8) if atr > 0 else round(current_price * (1 + TP_PCT / 100), 8)
+    atr_pct    = (atr / current_price * 100) if current_price else 0
+
     # ── Step 2: Validator Claude Sonnet 5 via OpenRouter ────────────────────
     send_telegram_message(
         f"🔍 *Menganalisis {symbol}…*\n\n"
         f"Groq: *{decision}* \\({confidence}%\\)\n"
         f"💬 _{reason}_\n\n"
+        f"📐 ATR={atr:.6f} \\({atr_pct:.3f}%\\) → SL=`{sl_preview}` TP=`{tp_preview}`\n"
+        f"📊 Multi\\-TF: 1m\\+5m\\+15m dianalisis\n\n"
         f"⏳ Menunggu validasi Claude Sonnet 5…",
         topic_id=_signal_topic(decision),
     )
 
-    claude_signal = ask_ai_openrouter(symbol, df, signal)
+    claude_signal = ask_ai_openrouter(
+        symbol, df_1m, signal,
+        df_5m=df_5m, df_15m=df_15m,
+        funding=funding, oi_change=oi_change,
+    )
     claude_decision   = claude_signal["decision"]
     claude_confidence = claude_signal["confidence"]
     claude_reason     = claude_signal["reason"]
@@ -1510,7 +1784,10 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
             f"Volume  : `{qty}`\n"
             f"Harga   : `~{current_price}`\n"
             f"Groq    : `{confidence}%` — _{reason}_\n"
-            f"Claude  : `{claude_confidence}%` — _{claude_reason}_",
+            f"Claude  : `{claude_confidence}%` — _{claude_reason}_\n\n"
+            f"🎯 *R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)} \\(ATR\\-based\\)*\n"
+            f"TP preview : `{tp_preview}`\n"
+            f"SL preview : `{sl_preview}`",
             topic_id=_signal_topic(decision),
         )
         return
@@ -1557,20 +1834,24 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         topic_id=_signal_topic(decision),
     )
 
-    # Pasang OCO TP/SL otomatis setelah BUY tereksekusi
+    # Pasang OCO ATR-based TP/SL otomatis setelah BUY tereksekusi
     if not errors and decision == "BUY" and filled_qty > 0:
-        oco = place_oco_sell(symbol, filled_qty, fill_price)
+        oco = place_oco_sell(symbol, filled_qty, fill_price, atr=atr)
         if oco:
-            tp_price = oco.get("_tp_price", fill_price * (1 + TP_PCT / 100))
-            sl_price = oco.get("_sl_price", fill_price * (1 - SL_PCT / 100))
+            tp_price = oco.get("_tp_price", fill_price + atr_tp)
+            sl_price = oco.get("_sl_price", fill_price - atr_sl)
+            tp_pct_actual = ((tp_price / fill_price) - 1) * 100
+            sl_pct_actual = (1 - (sl_price / fill_price)) * 100
             register_open_position(symbol, filled_qty, fill_price, oco)
             log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, avg_confidence,
-                      f"TP={tp_price} SL={sl_price}", "PLACED",
-                      str(oco.get("orderListId", "")))
+                      f"ATR={atr:.6f} TP={tp_price} SL={sl_price} R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}",
+                      "PLACED", str(oco.get("orderListId", "")))
             send_telegram_message(
-                f"🎯 *TP/SL otomatis terpasang* `{symbol}`\n\n"
-                f"Take Profit : `{tp_price}` \\(\\+{TP_PCT}%\\)\n"
-                f"Stop Loss   : `{sl_price}` \\(\\-{SL_PCT}%\\)",
+                f"🎯 *TP/SL ATR\\-based terpasang* `{symbol}`\n\n"
+                f"ATR14      : `{atr:.6f}`\n"
+                f"Take Profit: `{tp_price}` \\(\\+{tp_pct_actual:.2f}% = {TP_ATR_MULT}×ATR\\)\n"
+                f"Stop Loss  : `{sl_price}` \\(\\-{sl_pct_actual:.2f}% = {SL_ATR_MULT}×ATR\\)\n"
+                f"R:R ratio  : `1:{int(TP_ATR_MULT/SL_ATR_MULT)}`",
                 topic_id=_signal_topic(decision),
             )
         else:
@@ -1606,11 +1887,13 @@ def main_loop():
     )
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
-        f"Broker  : Binance\n"
+        f"Broker  : Binance Spot\n"
         f"Mode    : {'🔴 LIVE \\(uang beneran\\)' if LIVE_MODE else '🔵 Simulasi'}\n"
         f"Pair    : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
-        f"AI      : Groq Llama 3\\.1\n"
-        f"Minimal keyakinan: `{CONFIDENCE_THRESHOLD}%`"
+        f"AI      : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
+        f"Filter  : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
+        f"TP/SL   : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
+        f"Min keyakinan: `{CONFIDENCE_THRESHOLD}%`"
         + topic_info,
         topic_id=None,
     )
@@ -1628,33 +1911,69 @@ def main_loop():
                     if _in_cooldown(symbol):
                         continue
 
-                    df = fetch_market(symbol)
-                    if df is None or len(df) < 30:
+                    # ── Primary timeframe (1m) — pre-filter ─────────────────
+                    df_1m = fetch_market(symbol, "1m", MTF_LIMIT)
+                    if df_1m is None or len(df_1m) < 30:
                         continue
 
-                    df = compute_indicators(df)
-                    if not is_interesting(df):
+                    df_1m = compute_indicators(df_1m)
+                    if not is_interesting(df_1m):
                         continue
 
                     # Filter sideways: skip pair yang pasar lagi ranging/stagnan
-                    # supaya tidak masuk di kondisi false signal yang rawan rugi
-                    if not is_trending(df):
+                    if not is_trending(df_1m):
                         continue
 
                     if ai_calls_this_cycle >= MAX_AI_CALLS_PER_CYCLE:
-                        # Sudah cukup kandidat dianalisis AI siklus ini
                         continue
 
-                    last = df.iloc[-1]
+                    # ── Multi-timeframe (5m + 15m) setelah lolos pre-filter ─
+                    df_5m  = fetch_market(symbol, "5m",  MTF_LIMIT)
+                    df_15m = fetch_market(symbol, "15m", MTF_LIMIT)
+                    if df_5m  is not None and len(df_5m)  >= 30:
+                        df_5m  = compute_indicators(df_5m)
+                    else:
+                        df_5m = None
+                    if df_15m is not None and len(df_15m) >= 30:
+                        df_15m = compute_indicators(df_15m)
+                    else:
+                        df_15m = None
+
+                    # ── Futures data (funding rate + OI) ────────────────────
+                    funding   = fetch_funding_rate(symbol)
+                    oi_change = fetch_oi_change(symbol)
+
+                    if funding:
+                        logger.debug(
+                            f"Futures {symbol}: FR={funding['funding_rate_pct']:+.4f}% "
+                            f"({funding['sentiment']})"
+                        )
+                    if oi_change:
+                        logger.debug(
+                            f"OI {symbol}: {oi_change['oi_change_pct']:+.3f}% "
+                            f"({oi_change['trend']})"
+                        )
+
+                    last = df_1m.iloc[-1]
                     current_price = float(last["close"])
                     atr = float(last["atr14"]) if not pd.isna(last["atr14"]) else 0.0
 
-                    signal = ask_ai(symbol, df)
+                    signal = ask_ai(
+                        symbol, df_1m,
+                        df_5m=df_5m, df_15m=df_15m,
+                        funding=funding, oi_change=oi_change,
+                    )
                     ai_calls_this_cycle += 1
                     decision   = signal["decision"]
                     confidence = signal["confidence"]
                     reason     = signal["reason"]
-                    logger.info(f"AI → {symbol} {decision} ({confidence}%) | {reason}")
+
+                    # Ringkasan futures untuk log
+                    fr_str = f" FR={funding['funding_rate_pct']:+.4f}%" if funding else ""
+                    oi_str = f" OI={oi_change['trend']}" if oi_change else ""
+                    logger.info(
+                        f"AI → {symbol} {decision} ({confidence}%){fr_str}{oi_str} | {reason}"
+                    )
 
                     if confidence < CONFIDENCE_THRESHOLD:
                         log_trade(symbol, decision, 0, current_price, confidence, reason, "HOLD")
@@ -1671,7 +1990,11 @@ def main_loop():
                     _mark_signal(symbol)
                     threading.Thread(
                         target=process_signal,
-                        args=(symbol, signal, current_price, atr, df),
+                        args=(symbol, signal, current_price, atr, df_1m),
+                        kwargs=dict(
+                            df_5m=df_5m, df_15m=df_15m,
+                            funding=funding, oi_change=oi_change,
+                        ),
                         daemon=True,
                     ).start()
 
