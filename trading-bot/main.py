@@ -1398,6 +1398,7 @@ def make_binance_client():
 
 
 def get_binance_equity() -> float:
+    """Ambil saldo USDT (free + locked). Dipakai untuk kalkulasi qty order."""
     try:
         client = make_binance_client()
         account = client.get_account()
@@ -1407,6 +1408,89 @@ def get_binance_equity() -> float:
     except Exception as e:
         logger.warning(f"Tidak bisa ambil equity Binance: {e}")
     return 0.0
+
+
+def get_binance_portfolio() -> dict:
+    """
+    Ambil semua aset non-nol dari akun Binance (berguna di testnet yang
+    punya BTC/ETH/BNB/USDT dari awal).
+    Return: {
+        "usdt_free": float,
+        "usdt_locked": float,
+        "total_usdt": float,          # USDT + estimasi nilai aset lain
+        "assets": [{"asset", "free", "locked", "usdt_value"}],
+        "error": str | None,
+    }
+    """
+    try:
+        client = make_binance_client()
+        account = client.get_account()
+        balances = account.get("balances", [])
+
+        # Ambil harga ticker sekaligus untuk konversi ke USDT
+        ticker_map: dict[str, float] = {}
+        try:
+            prices = client.get_all_tickers()
+            ticker_map = {p["symbol"]: float(p["price"]) for p in prices}
+        except Exception:
+            pass  # kalau gagal, nilai non-USDT dihitung 0
+
+        assets = []
+        usdt_free = usdt_locked = 0.0
+        total_usdt = 0.0
+
+        for b in balances:
+            asset = b["asset"]
+            free   = float(b["free"])
+            locked = float(b["locked"])
+            total  = free + locked
+            if total < 1e-9:
+                continue
+
+            if asset == "USDT":
+                usdt_free   = free
+                usdt_locked = locked
+                usdt_val    = total
+            else:
+                # Coba konversi lewat pasangan xUSDT
+                usdt_val = ticker_map.get(f"{asset}USDT", 0.0) * total
+
+            total_usdt += usdt_val
+            assets.append({
+                "asset":      asset,
+                "free":       free,
+                "locked":     locked,
+                "usdt_value": round(usdt_val, 4),
+            })
+
+        assets.sort(key=lambda x: x["usdt_value"], reverse=True)
+        return {
+            "usdt_free":   usdt_free,
+            "usdt_locked": usdt_locked,
+            "total_usdt":  round(total_usdt, 4),
+            "assets":      assets,
+            "error":       None,
+        }
+    except Exception as e:
+        logger.warning(f"get_binance_portfolio error: {e}")
+        return {"usdt_free": 0.0, "usdt_locked": 0.0, "total_usdt": 0.0,
+                "assets": [], "error": str(e)}
+
+
+def format_portfolio_text(portfolio: dict, max_assets: int = 8) -> str:
+    """Format portfolio untuk dikirim ke Telegram (MarkdownV2-safe)."""
+    if portfolio.get("error"):
+        return f"⚠️ Tidak bisa ambil saldo: {portfolio['error']}"
+
+    lines = [f"💰 *Saldo Akun {'TESTNET' if BINANCE_TESTNET else 'LIVE'}*\n"]
+    for a in portfolio["assets"][:max_assets]:
+        locked_str = f" \\(+{a['locked']:.4f} locked\\)" if a["locked"] > 0 else ""
+        usdt_str   = f" ≈ `{a['usdt_value']:.2f} USDT`" if a["asset"] != "USDT" else ""
+        lines.append(
+            f"• `{a['asset']}`: `{a['free']:.6f}`{locked_str}{usdt_str}"
+        )
+    lines.append(f"\n📊 *Total estimasi*: `{portfolio['total_usdt']:.2f} USDT`")
+    return "\n".join(lines)
 
 
 def execute_binance(symbol: str, side: str, qty: float) -> dict:
@@ -1652,13 +1736,34 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
               "EARLY_EXIT", str(fill_info.get("orderId", "")),
               extra={"pnl": round(pnl, 4), "pnl_pct": round(pnl_pct, 3)})
 
+    # Durasi posisi
+    opened_at_str = pos.get("opened_at", "")
+    try:
+        opened_dt = datetime.fromisoformat(opened_at_str)
+        duration_sec = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+        duration_str = (f"{int(duration_sec//60)}m {int(duration_sec%60)}s"
+                        if duration_sec < 3600
+                        else f"{int(duration_sec//3600)}j {int((duration_sec%3600)//60)}m")
+    except Exception:
+        duration_str = "?"
+
+    today_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily_r    = compute_daily_report(today_str)
+    cum_pnl    = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
+    saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+
     icon = "🟡" if pnl >= 0 else "🟠"
     send_telegram_message(
-        f"{icon} *Posisi `{symbol}` ditutup lebih awal*\n\n"
-        f"Entry  : `{entry_price}`\n"
-        f"Exit   : `{exit_price:.8f}`\n"
-        f"PnL    : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)\n\n"
-        f"💡 _Keluar sebelum SL/MC kena — reversal terdeteksi_",
+        f"{icon} *Early Exit — `{symbol}`*\n\n"
+        f"Sebab     : _reversal terdeteksi sebelum SL kena_\n"
+        f"Sinyal    : {reason}\n\n"
+        f"Entry     : `{entry_price}`\n"
+        f"Exit      : `{exit_price:.8f}`\n"
+        f"Durasi    : `{duration_str}`\n\n"
+        f"PnL trade   : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)\n"
+        f"PnL hari ini: `{cum_pnl:+.4f} USDT`\n"
+        f"Saldo USDT  : `{saldo_after:.4f}`\n\n"
+        f"💡 _Keluar lebih awal — jaga modal dari kerugian lebih besar_",
         topic_id=TELEGRAM_REPORT_TOPIC_ID,
     )
 
@@ -1697,12 +1802,39 @@ def _check_position_close(symbol: str, pos: dict) -> None:
         log_trade(symbol, "SELL", exec_qty, exit_price, 0, f"OCO {label} tereksekusi",
                   result, str(order_id), extra={"pnl": round(pnl, 4), "pnl_pct": round(pnl_pct, 3)})
 
+        # Hitung durasi posisi terbuka
+        opened_at_str = pos.get("opened_at", "")
+        try:
+            opened_dt = datetime.fromisoformat(opened_at_str)
+            duration_sec = (datetime.now(timezone.utc) - opened_dt).total_seconds()
+            if duration_sec < 3600:
+                duration_str = f"{int(duration_sec//60)}m {int(duration_sec%60)}s"
+            else:
+                duration_str = f"{int(duration_sec//3600)}j {int((duration_sec%3600)//60)}m"
+        except Exception:
+            duration_str = "?"
+
+        # Cumulative P&L hari ini dari trades.log
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        daily_r  = compute_daily_report(today_str)
+        cum_pnl  = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
+
+        # Saldo setelah close
+        saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+
         icon = "✅" if pnl >= 0 else "🔴"
+        result_label = "Take Profit 🎯" if label == "TP" else "Stop Loss 🛡"
         send_telegram_message(
-            f"{icon} *Posisi `{symbol}` ditutup \\({label}\\)*\n\n"
-            f"Entry  : `{entry_price}`\n"
-            f"Exit   : `{exit_price}`\n"
-            f"PnL    : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)",
+            f"{icon} *Posisi ditutup — `{symbol}`*\n\n"
+            f"Hasil     : *{result_label}*\n"
+            f"Entry     : `{entry_price}`\n"
+            f"Exit      : `{exit_price}`\n"
+            f"Qty       : `{exec_qty}`\n"
+            f"Durasi    : `{duration_str}`\n\n"
+            f"PnL trade : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)\n"
+            f"PnL hari ini: `{cum_pnl:+.4f} USDT`\n"
+            f"Saldo USDT  : `{saldo_after:.4f}`\n\n"
+            f"✅ Win: `{daily_r['wins']}` \\| ❌ Loss: `{daily_r['losses']}` \\| WR: `{daily_r['win_rate']}%`",
             topic_id=TELEGRAM_REPORT_TOPIC_ID,
         )
 
@@ -1795,12 +1927,14 @@ def compute_daily_report(date_str: str) -> dict:
                 if not ts.startswith(date_str):
                     continue
                 result = rec.get("result", "")
-                if result == "CLOSED_TP":
-                    wins += 1
-                    total_pnl += float(rec.get("pnl", 0))
-                elif result == "CLOSED_SL":
-                    losses += 1
-                    total_pnl += float(rec.get("pnl", 0))
+                # Semua jalur penutupan posisi: TP, SL, dan early exit
+                if result in ("CLOSED_TP", "CLOSED_SL", "EARLY_EXIT"):
+                    pnl_val = float(rec.get("pnl", 0))
+                    total_pnl += pnl_val
+                    if result == "CLOSED_TP" or (result == "EARLY_EXIT" and pnl_val >= 0):
+                        wins += 1
+                    else:
+                        losses += 1
                 elif result == "EXECUTED":
                     trades_opened += 1
                 elif result == "SKIPPED_TOO_SMALL":
@@ -1824,16 +1958,30 @@ def send_daily_report(date_str: str, chat_id: Optional[int] = None,
     r = compute_daily_report(date_str)
     with positions_lock:
         n_open = len(open_positions)
+
+    # Ambil saldo sekarang untuk bandingkan dengan modal awal hari ini
+    saldo_now = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    net_change = round(saldo_now - daily_start_equity, 4) if daily_start_equity > 0 else 0.0
+    net_pct    = round((net_change / daily_start_equity * 100), 2) if daily_start_equity > 0 else 0.0
+
     icon = "📈" if r["total_pnl"] >= 0 else "📉"
+    saldo_icon = "🟢" if net_change >= 0 else "🔴"
+
     text = (
-        f"{icon} *Laporan Profit/Loss — {r['date']}*\n\n"
-        f"Total PnL     : `{r['total_pnl']:+.4f} USDT`\n"
-        f"Posisi profit \\(TP\\) : `{r['wins']}`\n"
-        f"Posisi rugi \\(SL\\)   : `{r['losses']}`\n"
-        f"Win rate      : `{r['win_rate']}%`\n"
-        f"Order dieksekusi hari ini : `{r['trades_opened']}`\n"
-        f"Sinyal dilewati \\(saldo kecil\\) : `{r['skipped_too_small']}`\n"
-        f"Posisi masih terbuka sekarang : `{n_open}`"
+        f"{icon} *Laporan Harian — {r['date']}*\n\n"
+        f"💰 *Pergerakan Saldo*\n"
+        f"Awal hari  : `{daily_start_equity:.4f} USDT`\n"
+        f"Sekarang   : `{saldo_now:.4f} USDT`\n"
+        f"Perubahan  : {saldo_icon} `{net_change:+.4f} USDT` \\(`{net_pct:+.2f}%`\\)\n\n"
+        f"📊 *Ringkasan Trading*\n"
+        f"Total PnL closed : `{r['total_pnl']:+.4f} USDT`\n"
+        f"Profit \\(TP kena\\): `{r['wins']}` trade ✅\n"
+        f"Rugi \\(SL kena\\)  : `{r['losses']}` trade ❌\n"
+        f"Win rate         : `{r['win_rate']}%`\n\n"
+        f"📋 *Detail*\n"
+        f"Order eksekusi   : `{r['trades_opened']}`\n"
+        f"Sinyal dilewati  : `{r['skipped_too_small']}` \\(saldo kurang\\)\n"
+        f"Posisi terbuka   : `{n_open}`"
     )
     send_telegram_message(text, chat_id=chat_id, topic_id=topic_id)
 
@@ -1965,14 +2113,26 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     tp_preview = round(current_price + atr_tp, 8) if atr > 0 else round(current_price * (1 + TP_PCT / 100), 8)
     atr_pct    = (atr / current_price * 100) if current_price else 0
 
+    # Hitung estimasi biaya & potensi profit/loss dalam USDT
+    estimated_cost    = round(qty * current_price, 4)
+    potential_profit  = round(qty * (tp_preview - current_price), 4) if decision == "BUY" else 0.0
+    potential_loss    = round(qty * (current_price - sl_preview), 4) if decision == "BUY" else 0.0
+
+    from datetime import timedelta
+    now_wib = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%H:%M WIB")
+
     # ── Step 2: Validator Claude Sonnet 5 via OpenRouter ────────────────────
     send_telegram_message(
-        f"🔍 *Menganalisis {symbol}…*\n\n"
-        f"Groq: *{decision}* \\({confidence}%\\)\n"
+        f"🔍 *Sinyal {decision} terdeteksi — {symbol}*\n\n"
+        f"⏰ `{now_wib}` \\| Harga: `{current_price}`\n\n"
+        f"🤖 *Groq*: *{decision}* \\({confidence}%\\)\n"
         f"💬 _{reason}_\n\n"
-        f"📐 ATR={atr:.6f} \\({atr_pct:.3f}%\\) → SL=`{sl_preview}` TP=`{tp_preview}`\n"
-        f"📊 Multi\\-TF: 1m\\+5m\\+15m dianalisis\n\n"
-        f"⏳ Menunggu validasi Claude Sonnet 5…",
+        f"📐 ATR14: `{atr:.6f}` \\({atr_pct:.3f}%\\)\n"
+        f"🎯 TP: `{tp_preview}` \\(+`{potential_profit:.4f}` USDT\\)\n"
+        f"🛡 SL: `{sl_preview}` \\(-`{potential_loss:.4f}` USDT\\)\n"
+        f"💵 Est\\. modal: `{estimated_cost:.4f}` USDT\n"
+        f"📊 Saldo terpakai: `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari akun\n\n"
+        f"⏳ _Meminta validasi Claude Sonnet 5\\.\\.\\._",
         topic_id=_signal_topic(decision),
     )
 
@@ -2023,11 +2183,15 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         return
 
     # Kirim notif "sedang eksekusi" sebelum order masuk
+    arah_label = "BELI 🟢" if decision == "BUY" else "JUAL 🔴"
     send_telegram_message(
-        f"⚡ *Eksekusi otomatis {symbol}\\!*\n\n"
-        f"Groq + Claude sepakat → *{'BELI' if decision=='BUY' else 'JUAL'}*\n"
-        f"Keyakinan rata\\-rata: `{avg_confidence}%`\n\n"
-        f"🔄 _Mengirim order ke Binance…_",
+        f"⚡ *Konsensus 2 AI — Eksekusi {symbol}\\!*\n\n"
+        f"Arah          : *{arah_label}*\n"
+        f"Harga masuk   : `~{current_price}`\n"
+        f"Qty           : `{qty}`\n"
+        f"Est\\. biaya   : `{estimated_cost:.4f} USDT`\n"
+        f"Keyakinan     : Groq `{confidence}%` \\| Claude `{claude_confidence}%` → avg `{avg_confidence}%`\n\n"
+        f"🔄 _Mengirim order ke Binance\\.\\.\\._",
         topic_id=_signal_topic(decision),
     )
 
@@ -2047,17 +2211,20 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     log_trade(symbol, decision, qty, fill_price, avg_confidence,
               f"[Groq] {reason} | [Claude] {claude_reason}", status_str, order_id)
 
+    total_spent    = round(filled_qty * fill_price, 4)
+    saldo_sekarang = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
     icon = "✅" if not errors else "⚠️"
     send_telegram_message(
-        f"{icon} *Order masuk ke Binance\\!*\n\n"
-        f"Koin    : `{symbol}`\n"
-        f"Aksi    : *{'Beli' if decision=='BUY' else 'Jual'}*\n"
-        f"Volume  : `{qty}`\n"
-        f"Harga   : `{fill_price}`\n"
-        f"ID Order: `{order_id}`\n"
-        f"Groq    : `{confidence}%` — _{reason}_\n"
-        f"Claude  : `{claude_confidence}%` — _{claude_reason}_\n"
-        f"Status  : {'Eksekusi otomatis ✅' if not errors else '⚠️ ' + '; '.join(errors)}",
+        f"{icon} *Order {'masuk' if not errors else 'GAGAL'} — `{symbol}`*\n\n"
+        f"Aksi         : *{'🟢 BELI' if decision=='BUY' else '🔴 JUAL'}*\n"
+        f"Harga fill   : `{fill_price}`\n"
+        f"Qty          : `{filled_qty}`\n"
+        f"Total biaya  : `{total_spent:.4f} USDT`\n"
+        f"Saldo USDT   : `{saldo_sekarang:.4f}`\n"
+        f"ID Order     : `{order_id}`\n\n"
+        f"🤖 Groq `{confidence}%`: _{reason}_\n"
+        f"🤖 Claude `{claude_confidence}%`: _{claude_reason}_\n\n"
+        f"{'✅ Tereksekusi otomatis' if not errors else '⚠️ Error: ' + '; '.join(errors)}",
         topic_id=_signal_topic(decision),
     )
 
@@ -2073,12 +2240,16 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
             log_trade(symbol, "OCO_TP_SL", filled_qty, fill_price, avg_confidence,
                       f"ATR={atr:.6f} TP={tp_price} SL={sl_price} R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}",
                       "PLACED", str(oco.get("orderListId", "")))
+            usdt_tp_gain = round(filled_qty * (tp_price - fill_price), 4)
+            usdt_sl_loss = round(filled_qty * (fill_price - sl_price), 4)
             send_telegram_message(
-                f"🎯 *TP/SL ATR\\-based terpasang* `{symbol}`\n\n"
-                f"ATR14      : `{atr:.6f}`\n"
-                f"Take Profit: `{tp_price}` \\(\\+{tp_pct_actual:.2f}% = {TP_ATR_MULT}×ATR\\)\n"
-                f"Stop Loss  : `{sl_price}` \\(\\-{sl_pct_actual:.2f}% = {SL_ATR_MULT}×ATR\\)\n"
-                f"R:R ratio  : `1:{int(TP_ATR_MULT/SL_ATR_MULT)}`",
+                f"🎯 *TP/SL terpasang — `{symbol}`*\n\n"
+                f"Entry      : `{fill_price}`\n"
+                f"Take Profit: `{tp_price}` \\(\\+{tp_pct_actual:.2f}% \\| \\+`{usdt_tp_gain:.4f}` USDT\\)\n"
+                f"Stop Loss  : `{sl_price}` \\(\\-{sl_pct_actual:.2f}% \\| \\-`{usdt_sl_loss:.4f}` USDT\\)\n"
+                f"R:R        : `1:{int(TP_ATR_MULT/SL_ATR_MULT)}` \\(ATR14={atr:.6f}\\)\n"
+                f"Qty        : `{filled_qty}` \\| Modal: `{total_spent:.4f}` USDT\n\n"
+                f"⏳ _Menunggu harga menyentuh TP atau SL\\.\\.\\._",
                 topic_id=_signal_topic(decision),
             )
         else:
@@ -2113,16 +2284,31 @@ def main_loop():
         f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID   or 'general'}`\n"
         f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID   or 'general'}`"
     )
+    # Ambil portfolio untuk ditampilkan di startup (hanya informasional)
+    # daily_start_equity sudah di-set dari get_binance_equity() (USDT-only) di atas
+    portfolio = get_binance_portfolio() if LIVE_MODE and BINANCE_API_KEY else {}
+    if portfolio and not portfolio.get("error"):
+        portfolio_text = "\n\n" + format_portfolio_text(portfolio)
+    elif portfolio.get("error"):
+        portfolio_text = f"\n\n⚠️ Gagal ambil saldo: {portfolio['error']}"
+    else:
+        portfolio_text = ""
+
+    mode_label = (
+        "🟡 TESTNET \\(uang virtual\\)" if BINANCE_TESTNET
+        else ("🔴 LIVE \\(uang beneran\\)" if LIVE_MODE else "🔵 Simulasi")
+    )
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
         f"Broker  : Binance Spot\n"
-        f"Mode    : {'🟡 TESTNET \\(uang virtual\\)' if BINANCE_TESTNET else ('🔴 LIVE \\(uang beneran\\)' if LIVE_MODE else '🔵 Simulasi')}\n"
+        f"Mode    : {mode_label}\n"
         f"Pair    : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
         f"AI      : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
         f"Filter  : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
         f"TP/SL   : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
         f"Modal   : `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari saldo \\(sisanya tidak disentuh\\)\n"
         f"Min keyakinan: `{CONFIDENCE_THRESHOLD}%`"
+        + portfolio_text
         + topic_info,
         topic_id=None,
     )
