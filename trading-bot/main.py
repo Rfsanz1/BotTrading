@@ -34,6 +34,10 @@ LIVE_MODE: bool = True
 # Kosongkan / set "ALL" di TRADING_PAIRS env var untuk memindai SEMUA pair
 # spot USDT yang ada di Binance. Atau isi daftar spesifik, contoh:
 # TRADING_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT
+# Mode testnet Binance — pakai API key dari testnet.binance.vision (uang virtual)
+# Set BINANCE_TESTNET=true di Replit Secrets untuk aktifkan
+BINANCE_TESTNET: bool = os.getenv("BINANCE_TESTNET", "false").strip().lower() in ("1", "true", "yes")
+
 TRADING_PAIRS_ENV: str = os.getenv("TRADING_PAIRS", "ALL").strip()
 
 CANDLE_INTERVAL: str = "1m"
@@ -1382,10 +1386,17 @@ def update_poller():
 # ─── 5. EKSEKUSI ORDER BINANCE ───────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
+def make_binance_client():
+    """Buat Binance Client — otomatis arahkan ke testnet kalau BINANCE_TESTNET=true."""
+    from binance.client import Client
+    if BINANCE_TESTNET:
+        return Client(BINANCE_API_KEY, BINANCE_API_SECRET, testnet=True)
+    return Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+
+
 def get_binance_equity() -> float:
     try:
-        from binance.client import Client
-        client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+        client = make_binance_client()
         account = client.get_account()
         for b in account.get("balances", []):
             if b["asset"] == "USDT":
@@ -1396,8 +1407,7 @@ def get_binance_equity() -> float:
 
 
 def execute_binance(symbol: str, side: str, qty: float) -> dict:
-    from binance.client import Client
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    client = make_binance_client()
     for attempt in range(3):
         try:
             order = client.order_market(symbol=symbol, side=side, quantity=qty)
@@ -1442,7 +1452,7 @@ def place_oco_sell(symbol: str, qty: float, entry_price: float,
 
     sl_limit = _round_price(sl_stop * 0.999, tick)
 
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    client = make_binance_client()
     for attempt in range(3):
         try:
             oco = client.create_oco_order(
@@ -1490,8 +1500,7 @@ def register_open_position(symbol: str, qty: float, entry_price: float, oco: dic
 
 def cancel_oco_orders(symbol: str, pos: dict) -> bool:
     """Cancel OCO order list posisi terbuka. Return True kalau berhasil atau sudah tidak ada."""
-    from binance.client import Client
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    client = make_binance_client()
     order_list_id = pos.get("order_list_id")
 
     if order_list_id:
@@ -1656,8 +1665,7 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
 
 def _check_position_close(symbol: str, pos: dict) -> None:
     """Cek apakah OCO leg (TP/SL) sudah FILLED. Kalau ya, catat pnl & kirim notifikasi."""
-    from binance.client import Client
-    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    client = make_binance_client()
     entry_price = pos["entry_price"]
     qty = pos["qty"]
 
@@ -2104,7 +2112,7 @@ def main_loop():
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*\n\n"
         f"Broker  : Binance Spot\n"
-        f"Mode    : {'🔴 LIVE \\(uang beneran\\)' if LIVE_MODE else '🔵 Simulasi'}\n"
+        f"Mode    : {'🟡 TESTNET \\(uang virtual\\)' if BINANCE_TESTNET else ('🔴 LIVE \\(uang beneran\\)' if LIVE_MODE else '🔵 Simulasi')}\n"
         f"Pair    : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
         f"AI      : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
         f"Filter  : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
