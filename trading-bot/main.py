@@ -1470,14 +1470,182 @@ def place_oco_sell(symbol: str, qty: float, entry_price: float,
 def register_open_position(symbol: str, qty: float, entry_price: float, oco: dict) -> None:
     with positions_lock:
         open_positions[symbol] = {
-            "qty": qty,
-            "entry_price": entry_price,
-            "tp_order_id": oco.get("_tp_order_id"),
-            "sl_order_id": oco.get("_sl_order_id"),
-            "tp_price": oco.get("_tp_price"),
-            "sl_price": oco.get("_sl_price"),
-            "opened_at": datetime.now(timezone.utc).isoformat(),
+            "qty":           qty,
+            "entry_price":   entry_price,
+            "tp_order_id":   oco.get("_tp_order_id"),
+            "sl_order_id":   oco.get("_sl_order_id"),
+            "tp_price":      oco.get("_tp_price"),
+            "sl_price":      oco.get("_sl_price"),
+            "order_list_id": oco.get("orderListId"),   # untuk cancel OCO sekaligus
+            "opened_at":     datetime.now(timezone.utc).isoformat(),
+            "reversal_exits_attempted": 0,             # guard agar tidak loop
         }
+
+
+def cancel_oco_orders(symbol: str, pos: dict) -> bool:
+    """Cancel OCO order list posisi terbuka. Return True kalau berhasil atau sudah tidak ada."""
+    from binance.client import Client
+    client = Client(BINANCE_API_KEY, BINANCE_API_SECRET)
+    order_list_id = pos.get("order_list_id")
+
+    if order_list_id:
+        try:
+            client.cancel_order_list(symbol=symbol, orderListId=order_list_id)
+            logger.info(f"✅ OCO orderList {order_list_id} {symbol} dicancel")
+            return True
+        except Exception as e:
+            err = str(e)
+            if "Unknown order" in err or "Order list does not exist" in err or "-2011" in err:
+                logger.info(f"OCO {symbol} sudah tidak aktif (sudah fill/cancel sebelumnya)")
+                return True
+            logger.warning(f"Gagal cancel OCO via orderListId {symbol}: {e}")
+
+    # Fallback: cancel satu per satu
+    for oid in filter(None, [pos.get("tp_order_id"), pos.get("sl_order_id")]):
+        try:
+            client.cancel_order(symbol=symbol, orderId=oid)
+        except Exception as e:
+            if "Unknown order" not in str(e) and "-2011" not in str(e):
+                logger.warning(f"Gagal cancel order {oid} {symbol}: {e}")
+    return True
+
+
+def detect_reversal(df: pd.DataFrame) -> tuple[bool, str]:
+    """
+    Deteksi sinyal pembalikan arah (reversal) atau breakdown dari indikator teknikal.
+    Tidak pakai AI — cepat dan tidak buang token.
+
+    Logika: minimal 2 dari 4 sinyal berikut harus aktif sekaligus:
+      1. MACD histogram flip dari positif ke negatif (momentum bearish muncul)
+      2. RSI turun ke bawah 50 dari atas 50 (atau sudah < 45)
+      3. Harga close di bawah SMA20
+      4. Dua candle bearish berturut-turut dengan body masing-masing > 0.3%
+
+    Return: (True, alasan) atau (False, "")
+    """
+    if df is None or len(df) < 5:
+        return False, ""
+
+    signals: list[str] = []
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    close = float(last["close"])
+
+    # 1. MACD histogram flip negatif
+    hist      = float(last.get("macd_hist", 0) or 0)
+    prev_hist = float(prev.get("macd_hist", 0) or 0)
+    prev2_hist = float(prev2.get("macd_hist", 0) or 0)
+    if prev_hist > 0 and hist < 0:
+        signals.append("MACD hist cross negatif")
+    elif hist < 0 and prev2_hist > 0:
+        signals.append("MACD hist negatif 2 candle")
+
+    # 2. RSI cross bawah 50 atau sudah sangat lemah
+    rsi      = float(last.get("rsi14", 50) or 50)
+    prev_rsi = float(prev.get("rsi14", 50) or 50)
+    if prev_rsi >= 50 and rsi < 50:
+        signals.append(f"RSI cross bawah 50 ({rsi:.1f})")
+    elif rsi < 45:
+        signals.append(f"RSI lemah ({rsi:.1f})")
+
+    # 3. Close di bawah SMA20
+    sma20 = float(last.get("sma20", 0) or 0)
+    if sma20 > 0 and close < sma20:
+        signals.append(f"Close {close:.6f} < SMA20 {sma20:.6f}")
+
+    # 4. Dua candle bearish berturut-turut, body > 0.3%
+    o1 = float(last.get("open", close) or close)
+    o2 = float(prev.get("open", 0) or 0)
+    c2 = float(prev.get("close", 0) or 0)
+    body1 = (o1 - close) / o1 if o1 > 0 else 0
+    body2 = (o2 - c2) / o2 if o2 > 0 else 0
+    if close < o1 and c2 < o2 and body1 > 0.003 and body2 > 0.003:
+        signals.append("2 candle bearish berturut-turut")
+
+    if len(signals) >= 2:
+        return True, " | ".join(signals)
+    return False, ""
+
+
+def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
+    """
+    Tutup posisi BUY lebih awal karena sinyal reversal:
+      1. Cancel OCO (TP+SL) yang masih aktif
+      2. Market sell seluruh qty
+      3. Log + kirim notif Telegram
+    """
+    qty         = pos.get("qty", 0.0)
+    entry_price = pos.get("entry_price", 0.0)
+
+    if qty <= 0:
+        logger.warning(f"⚠️ emergency_close {symbol}: qty=0, dilewati")
+        return
+
+    logger.info(f"🚨 Early exit {symbol} — {reason}")
+
+    send_telegram_message(
+        f"🚨 *Early Exit — `{symbol}`*\n\n"
+        f"Sinyal reversal terdeteksi sebelum SL kena\\!\n\n"
+        f"📊 _{reason}_\n\n"
+        f"🔄 Membatalkan OCO & menutup posisi\\.\\.\\.",
+        topic_id=TELEGRAM_REPORT_TOPIC_ID,
+    )
+
+    # Step 1: cancel OCO
+    cancel_oco_orders(symbol, pos)
+    time.sleep(0.5)
+
+    # Step 2: market sell
+    f_info   = get_symbol_filters(symbol)
+    sell_qty = _round_step(qty, f_info.get("stepSize", 0.00001))
+    if sell_qty <= 0:
+        logger.error(f"❌ emergency_close {symbol}: sell_qty=0 setelah rounding")
+        return
+
+    exit_price = entry_price
+    fill_info: dict = {}
+    try:
+        fill_info = execute_binance(symbol, "SELL", sell_qty)
+        fills = fill_info.get("fills", [])
+        if fills:
+            total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+            total_qty   = sum(float(f["qty"]) for f in fills)
+            exit_price  = total_quote / total_qty if total_qty else entry_price
+        else:
+            exit_price = float(fill_info.get("price", entry_price) or entry_price)
+    except Exception as e:
+        logger.error(f"❌ Market sell gagal (emergency_close {symbol}): {e}")
+        send_telegram_message(
+            f"⛔ *Emergency sell GAGAL — `{symbol}`*\n\n"
+            f"Error: `{e}`\n"
+            f"⚠️ Pantau posisi secara manual\\!",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
+        )
+        return
+
+    # Step 3: log + notif
+    pnl     = (exit_price - entry_price) * sell_qty
+    pnl_pct = ((exit_price / entry_price) - 1) * 100 if entry_price else 0.0
+
+    log_trade(symbol, "SELL", sell_qty, exit_price, 0,
+              f"Early exit reversal: {reason}",
+              "EARLY_EXIT", str(fill_info.get("orderId", "")),
+              extra={"pnl": round(pnl, 4), "pnl_pct": round(pnl_pct, 3)})
+
+    icon = "🟡" if pnl >= 0 else "🟠"
+    send_telegram_message(
+        f"{icon} *Posisi `{symbol}` ditutup lebih awal*\n\n"
+        f"Entry  : `{entry_price}`\n"
+        f"Exit   : `{exit_price:.8f}`\n"
+        f"PnL    : `{pnl:+.4f} USDT` \\(`{pnl_pct:+.2f}%`\\)\n\n"
+        f"💡 _Keluar sebelum SL/MC kena — reversal terdeteksi_",
+        topic_id=TELEGRAM_REPORT_TOPIC_ID,
+    )
+
+    with positions_lock:
+        open_positions.pop(symbol, None)
 
 
 def _check_position_close(symbol: str, pos: dict) -> None:
@@ -1527,21 +1695,62 @@ def _check_position_close(symbol: str, pos: dict) -> None:
 
 
 def position_monitor_loop() -> None:
-    """Cek berkala apakah ada posisi yang ditutup lewat TP/SL, dan kirim laporan
-    profit/loss harian otomatis di jam yang ditentukan (DAILY_REPORT_HOUR_UTC)."""
+    """Cek berkala apakah ada posisi yang ditutup lewat TP/SL, dan:
+    - Deteksi sinyal reversal → early exit sebelum SL kena
+    - Kirim laporan profit/loss harian otomatis (DAILY_REPORT_HOUR_UTC)."""
     global daily_report_sent_date
     while True:
         try:
             with positions_lock:
                 snapshot = dict(open_positions)
+
             for symbol, pos in snapshot.items():
+                # ── 1. Cek apakah OCO (TP/SL) sudah FILLED ──────────────────
                 _check_position_close(symbol, pos)
 
+                # Kalau posisi sudah tutup oleh TP/SL di atas, skip reversal
+                with positions_lock:
+                    if symbol not in open_positions:
+                        continue
+
+                # ── 2. Guard: jangan coba early exit lebih dari 1 kali ──────
+                if pos.get("reversal_exits_attempted", 0) >= 1:
+                    continue
+
+                # ── 3. Ambil candle segar & cek reversal ────────────────────
+                if not (LIVE_MODE and BINANCE_API_KEY):
+                    continue  # reversal exit hanya di mode LIVE
+
+                try:
+                    df_fresh = fetch_market(symbol, "1m", 30)
+                    if df_fresh is None or len(df_fresh) < 10:
+                        continue
+                    df_fresh = compute_indicators(df_fresh)
+
+                    is_rev, rev_reason = detect_reversal(df_fresh)
+                    if is_rev:
+                        # Tandai dulu agar thread lain tidak ikut masuk
+                        with positions_lock:
+                            if symbol in open_positions:
+                                open_positions[symbol]["reversal_exits_attempted"] = 1
+                            else:
+                                continue  # sudah ditutup thread lain
+
+                        logger.warning(
+                            f"🔄 Reversal terdeteksi pada posisi terbuka {symbol}: {rev_reason}"
+                        )
+                        emergency_close_position(symbol, pos, rev_reason)
+
+                except Exception as e:
+                    logger.warning(f"Reversal check error {symbol}: {e}")
+
+            # ── 4. Laporan harian ────────────────────────────────────────────
             now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
             if now.hour == DAILY_REPORT_HOUR_UTC and daily_report_sent_date != today_str:
                 send_daily_report(today_str)
                 daily_report_sent_date = today_str
+
         except Exception as e:
             logger.error(f"position_monitor_loop error: {e}")
         time.sleep(30)
