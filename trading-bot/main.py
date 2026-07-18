@@ -23,7 +23,13 @@ from typing import Optional
 
 import hashlib
 import hmac
+import math
+import shutil
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 import pandas as pd
+import psutil
 import requests
 from groq import Groq
 from flask import Flask, request as flask_request
@@ -121,6 +127,46 @@ NEWS_FEEDS: list[str] = [
     "https://decrypt.co/feed",
 ]
 NEWS_REFRESH_SEC: int = int(os.getenv("NEWS_REFRESH_SEC", "900"))  # 15 menit
+
+# ─── EMAIL NOTIFICATIONS ──────────────────────────────────────────────────────
+EMAIL_ENABLED: bool       = _cfg("EMAIL_ENABLED", "false").lower() in ("1", "true", "yes")
+EMAIL_SMTP_HOST: str      = _cfg("EMAIL_SMTP_HOST", "smtp.gmail.com")
+EMAIL_SMTP_PORT: int      = int(_cfg("EMAIL_SMTP_PORT", "587"))
+EMAIL_FROM: str           = _cfg("EMAIL_FROM", "")
+EMAIL_TO: str             = _cfg("EMAIL_TO", "")
+EMAIL_PASSWORD: str       = _cfg("EMAIL_PASSWORD", "")
+EMAIL_SUBJECT_PREFIX: str = _cfg("EMAIL_SUBJECT_PREFIX", "[TradingBot]")
+
+# ─── DCA AUTOMATION ──────────────────────────────────────────────────────────
+DCA_ENABLED: bool              = _cfg("DCA_ENABLED", "false").lower() in ("1", "true", "yes")
+DCA_DEFAULT_AMOUNT_USDT: float = float(_cfg("DCA_DEFAULT_AMOUNT_USDT", "10"))
+DCA_DEFAULT_INTERVAL_HOURS: int = int(_cfg("DCA_DEFAULT_INTERVAL_HOURS", "24"))
+
+# ─── VACATION MODE / SCHEDULED TRADING HOURS ─────────────────────────────────
+VACATION_MODE_INIT: bool = _cfg("VACATION_MODE", "false").lower() in ("1", "true", "yes")
+TRADING_START_HOUR_UTC: int = int(_cfg("TRADING_START_HOUR_UTC", "0"))
+TRADING_END_HOUR_UTC: int   = int(_cfg("TRADING_END_HOUR_UTC", "24"))
+
+# ─── DATABASE BACKUP ─────────────────────────────────────────────────────────
+DB_BACKUP_ENABLED: bool         = _cfg("DB_BACKUP_ENABLED", "false").lower() in ("1", "true", "yes")
+DB_BACKUP_INTERVAL_HOURS: int   = int(_cfg("DB_BACKUP_INTERVAL_HOURS", "6"))
+DB_BACKUP_DIR: str              = "backups"
+
+# Dashboard security ─────────────────────────────────────────────────────────
+# Mutating API endpoints (pause/resume/DCA/backup/etc.) require this key in
+# the X-Dashboard-Key header.  If left empty, all writes are blocked.
+DASHBOARD_API_KEY: str = _cfg("DASHBOARD_API_KEY", "")
+
+# CORS: only these origin prefixes may call the API.
+# Accepts a comma-separated list, e.g. "https://myapp.replit.dev,http://localhost:5173"
+# Defaults to the Replit dev-domain pattern so the dashboard works out of the box.
+_CORS_ALLOWED_ORIGINS_RAW: str = _cfg(
+    "CORS_ALLOWED_ORIGINS",
+    f"https://{os.getenv('REPLIT_DEV_DOMAIN', '')},http://localhost:5173,http://127.0.0.1:5173"
+)
+_CORS_ALLOWED_ORIGINS: list = [
+    o.strip().rstrip("/") for o in _CORS_ALLOWED_ORIGINS_RAW.split(",") if o.strip()
+]
 
 # Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
@@ -293,6 +339,41 @@ def init_db() -> None:
             """)
             conn.execute("""
                 CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(timestamp)
+            """)
+            # ── New tables ─────────────────────────────────────────────────
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT    NOT NULL,
+                    action    TEXT    NOT NULL,
+                    user      TEXT    DEFAULT 'bot',
+                    details   TEXT    DEFAULT ''
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_audit_ts ON audit_log(timestamp)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dca_positions (
+                    symbol          TEXT    PRIMARY KEY,
+                    amount_usdt     REAL    DEFAULT 10,
+                    interval_hours  INTEGER DEFAULT 24,
+                    enabled         INTEGER DEFAULT 1,
+                    total_invested  REAL    DEFAULT 0,
+                    total_qty       REAL    DEFAULT 0,
+                    buy_count       INTEGER DEFAULT 0,
+                    last_buy_at     TEXT    DEFAULT '',
+                    next_buy_at     TEXT    DEFAULT ''
+                )
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schedule_config (
+                    id                  INTEGER PRIMARY KEY,
+                    trading_start_hour  INTEGER DEFAULT 0,
+                    trading_end_hour    INTEGER DEFAULT 24,
+                    trading_days        TEXT    DEFAULT '0,1,2,3,4,5,6',
+                    enabled             INTEGER DEFAULT 0
+                )
             """)
             conn.commit()
     logger.info(f"✅ SQLite DB siap: {DB_FILE}")
@@ -564,7 +645,7 @@ def status():
         "daily_wins":        daily["wins"],
         "daily_losses":      daily["losses"],
         "daily_win_rate":    daily["win_rate"],
-    }), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+    }), 200, {"Content-Type": "application/json"}
 
 
 @flask_app.route("/api/positions")
@@ -593,7 +674,7 @@ def api_positions():
             "opened_at":        pos.get("opened_at", ""),
             "asset_group":      pos.get("asset_group", ""),
         })
-    return json.dumps(result), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+    return json.dumps(result), 200, {"Content-Type": "application/json"}
 
 
 @flask_app.route("/api/daily")
@@ -604,7 +685,7 @@ def api_daily():
     daily["current_equity"] = equity
     daily["start_equity"]   = daily_start_equity
     daily["net_change"]     = round(equity - daily_start_equity, 4) if daily_start_equity else 0
-    return json.dumps(daily), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+    return json.dumps(daily), 200, {"Content-Type": "application/json"}
 
 
 @flask_app.route("/api/history")
@@ -624,7 +705,7 @@ def api_history():
         "win_rate_7d":    win_rate_7d,
         "kelly_mult":     round(_kelly_multiplier(), 2),
         "kelly_wr":       round(wr_now * 100, 1),
-    }), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+    }), 200, {"Content-Type": "application/json"}
 
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -1167,6 +1248,8 @@ def api_config_get():
 @flask_app.route("/api/config/save", methods=["POST"])
 def api_config_save():
     """Simpan API keys ke config.json. Kolom kosong/tidak dikirim = tidak diubah."""
+    denied = _check_api_key()
+    if denied: return denied
     try:
         data = flask_request.get_json(force=True) or {}
         cfg = _load_bot_config()
@@ -1181,6 +1264,861 @@ def api_config_save():
         }), 200, {"Content-Type": "application/json"}
     except Exception as e:
         return json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type": "application/json"}
+
+
+# ---------------------------------------------------------------------------
+# ─── ANALYTICS ENGINE ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def compute_analytics(days: int = 30) -> dict:
+    """Comprehensive analytics: Sharpe, Sortino, Calmar, drawdown, attribution."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT timestamp, symbol, pnl, result
+                    FROM trades
+                    WHERE result IN ('CLOSED_TP','CLOSED_SL','EARLY_EXIT')
+                      AND timestamp >= datetime('now', ?)
+                    ORDER BY timestamp ASC
+                """, (f"-{days} days",)).fetchall()
+        trades = [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"Analytics DB: {e}")
+        trades = []
+
+    if not trades:
+        return {"days": days, "trades_count": 0, "win_rate": 0, "total_pnl": 0,
+                "avg_pnl": 0, "best_trade": 0, "worst_trade": 0, "gross_profit": 0,
+                "gross_loss": 0, "sharpe_ratio": 0, "sortino_ratio": 0,
+                "calmar_ratio": 0, "max_drawdown_pct": 0, "max_drawdown_usdt": 0,
+                "profit_factor": 0, "expectancy": 0, "consecutive_wins": 0,
+                "consecutive_losses": 0, "by_symbol": [], "by_result": {}}
+
+    pnls = [float(t.get("pnl") or 0) for t in trades]
+    wins_list = [p for p in pnls if p > 0]
+    loss_list  = [p for p in pnls if p < 0]
+    win_rate   = len(wins_list) / len(pnls) * 100 if pnls else 0
+    total_pnl  = sum(pnls)
+    avg_pnl    = total_pnl / len(pnls) if pnls else 0
+
+    # Sharpe (annualised, assumes each trade = 1 period)
+    if len(pnls) > 1:
+        mu = sum(pnls) / len(pnls)
+        variance = sum((p - mu) ** 2 for p in pnls) / (len(pnls) - 1)
+        std = math.sqrt(variance) if variance > 0 else 0
+        sharpe = (mu / std * math.sqrt(252)) if std > 0 else 0
+    else:
+        sharpe = 0
+
+    # Sortino (downside deviation only)
+    if loss_list:
+        down_var = sum(p ** 2 for p in loss_list) / len(loss_list)
+        down_std = math.sqrt(down_var) if down_var > 0 else 0
+        mu = sum(pnls) / len(pnls)
+        sortino = (mu / down_std * math.sqrt(252)) if down_std > 0 else 0
+    else:
+        sortino = 0
+
+    # Max drawdown from cumulative PnL curve
+    cum = []
+    running = 0.0
+    for p in pnls:
+        running += p
+        cum.append(running)
+    peak = cum[0] if cum else 0
+    max_dd = 0.0
+    for val in cum:
+        if val > peak:
+            peak = val
+        dd = peak - val
+        if dd > max_dd:
+            max_dd = dd
+    max_dd_pct = (max_dd / (peak + 1e-9)) * 100 if peak > 0 else 0
+
+    # Calmar = annualised return / max drawdown
+    ann_return = total_pnl * (365 / max(days, 1))
+    calmar = (ann_return / max_dd) if max_dd > 0 else 0
+
+    gross_profit = sum(wins_list) if wins_list else 0
+    gross_loss   = abs(sum(loss_list)) if loss_list else 0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else 999
+
+    avg_win = (gross_profit / len(wins_list)) if wins_list else 0
+    avg_loss = (gross_loss / len(loss_list)) if loss_list else 0
+    wr_dec   = win_rate / 100
+    expectancy = (wr_dec * avg_win) - ((1 - wr_dec) * avg_loss)
+
+    # By symbol
+    sym_map: dict = {}
+    for t in trades:
+        s = t.get("symbol", "?")
+        if s not in sym_map:
+            sym_map[s] = {"symbol": s, "trades": 0, "wins": 0, "pnl": 0.0}
+        p = float(t.get("pnl") or 0)
+        sym_map[s]["trades"] += 1
+        sym_map[s]["pnl"] += p
+        if p > 0:
+            sym_map[s]["wins"] += 1
+    for s in sym_map:
+        d = sym_map[s]
+        d["win_rate"] = round(d["wins"] / d["trades"] * 100, 1) if d["trades"] else 0
+        d["pnl"] = round(d["pnl"], 4)
+    by_symbol = sorted(sym_map.values(), key=lambda x: x["pnl"], reverse=True)[:20]
+
+    # By result type
+    by_result: dict = {}
+    for t in trades:
+        r = t.get("result", "?")
+        by_result[r] = by_result.get(r, 0) + 1
+
+    # Consecutive wins/losses
+    cw = cl = max_cw = max_cl = 0
+    for p in pnls:
+        if p > 0:
+            cw += 1; cl = 0; max_cw = max(max_cw, cw)
+        else:
+            cl += 1; cw = 0; max_cl = max(max_cl, cl)
+
+    return {
+        "days": days, "trades_count": len(trades),
+        "win_rate": round(win_rate, 1), "total_pnl": round(total_pnl, 4),
+        "avg_pnl": round(avg_pnl, 4), "best_trade": round(max(pnls), 4),
+        "worst_trade": round(min(pnls), 4), "gross_profit": round(gross_profit, 4),
+        "gross_loss": round(gross_loss, 4), "sharpe_ratio": round(sharpe, 3),
+        "sortino_ratio": round(sortino, 3), "calmar_ratio": round(calmar, 3),
+        "max_drawdown_pct": round(max_dd_pct, 2), "max_drawdown_usdt": round(max_dd, 4),
+        "profit_factor": round(profit_factor, 3), "expectancy": round(expectancy, 4),
+        "consecutive_wins": max_cw, "consecutive_losses": max_cl,
+        "by_symbol": by_symbol, "by_result": by_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ─── BACKTESTING ENGINE ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def run_backtest(symbol: str, days: int = 14, initial_capital: float = 1000.0,
+                 tp_pct: float = 3.0, sl_pct: float = 1.0,
+                 rsi_threshold: float = 35.0) -> dict:
+    """RSI-based backtest simulation on Binance 15m historical candles."""
+    try:
+        limit = min(days * 24 * 4, 1000)
+        base = ("https://testnet.binance.vision" if BINANCE_TESTNET
+                else "https://api.binance.com")
+        resp = requests.get(f"{base}/api/v3/klines",
+                            params={"symbol": symbol.upper(), "interval": "15m", "limit": limit},
+                            timeout=12)
+        if resp.status_code != 200:
+            return {"error": f"Binance API {resp.status_code}"}
+        raw = resp.json()
+        if len(raw) < 20:
+            return {"error": "Not enough data"}
+        df = pd.DataFrame(raw, columns=[
+            "open_time","open","high","low","close","volume",
+            "close_time","qvol","trades","tbb","tbq","ignore"
+        ])
+        df = df.astype({"open": float, "high": float, "low": float, "close": float})
+        delta = df["close"].diff()
+        gain = delta.clip(lower=0).rolling(14).mean()
+        loss = (-delta).clip(lower=0).rolling(14).mean()
+        df["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, 1e-9))
+
+        capital = initial_capital
+        position = None
+        bt_trades: list = []
+        equity_curve: list = [{"idx": 0, "equity": capital}]
+
+        for i in range(20, len(df)):
+            c = df.iloc[i]
+            price, rsi = c["close"], c["rsi"]
+            if position is None:
+                if rsi < rsi_threshold:
+                    qty = (capital * 0.02) / price
+                    position = {"entry": price, "qty": qty,
+                                "tp": price * (1 + tp_pct / 100),
+                                "sl": price * (1 - sl_pct / 100)}
+            else:
+                hi, lo = df.iloc[i]["high"], df.iloc[i]["low"]
+                if hi >= position["tp"]:
+                    pnl = (position["tp"] - position["entry"]) * position["qty"]
+                    capital += pnl
+                    bt_trades.append({"result": "TP", "pnl": round(pnl, 4)})
+                    position = None
+                elif lo <= position["sl"]:
+                    pnl = (position["sl"] - position["entry"]) * position["qty"]
+                    capital += pnl
+                    bt_trades.append({"result": "SL", "pnl": round(pnl, 4)})
+                    position = None
+            equity_curve.append({"idx": i, "equity": round(capital, 4)})
+
+        wins  = [t for t in bt_trades if t["pnl"] > 0]
+        losses= [t for t in bt_trades if t["pnl"] <= 0]
+        pnl_sum = sum(t["pnl"] for t in bt_trades)
+
+        peak2 = initial_capital; mdd = 0.0; running2 = initial_capital
+        for t in bt_trades:
+            running2 += t["pnl"]
+            if running2 > peak2: peak2 = running2
+            mdd = max(mdd, peak2 - running2)
+
+        return {
+            "symbol": symbol.upper(), "days": days, "candles": len(df),
+            "initial_capital": initial_capital, "final_capital": round(capital, 4),
+            "total_pnl": round(pnl_sum, 4),
+            "total_return_pct": round((capital - initial_capital) / initial_capital * 100, 2),
+            "trades_count": len(bt_trades), "wins": len(wins), "losses": len(losses),
+            "win_rate": round(len(wins) / len(bt_trades) * 100, 1) if bt_trades else 0,
+            "max_drawdown_usdt": round(mdd, 4),
+            "profit_factor": round(
+                sum(t["pnl"] for t in wins) / max(abs(sum(t["pnl"] for t in losses)), 1e-9), 3
+            ),
+            "params": {"tp_pct": tp_pct, "sl_pct": sl_pct, "rsi_threshold": rsi_threshold},
+            "equity_curve": equity_curve[-100:],
+            "recent_trades": bt_trades[-10:],
+        }
+    except Exception as e:
+        logger.warning(f"Backtest {symbol}: {e}")
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# ─── EMAIL NOTIFICATIONS ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_email_lock = threading.Lock()
+
+def send_email_notification(subject: str, body: str) -> bool:
+    """Send HTML email via SMTP. Returns True on success."""
+    if not EMAIL_ENABLED or not all([EMAIL_FROM, EMAIL_TO, EMAIL_PASSWORD]):
+        return False
+    try:
+        with _email_lock:
+            msg = MIMEMultipart("alternative")
+            msg["Subject"] = f"{EMAIL_SUBJECT_PREFIX} {subject}"
+            msg["From"]    = EMAIL_FROM
+            msg["To"]      = EMAIL_TO
+            msg.attach(MIMEText(body, "html"))
+            with smtplib.SMTP(EMAIL_SMTP_HOST, EMAIL_SMTP_PORT, timeout=10) as smtp:
+                smtp.ehlo()
+                smtp.starttls()
+                smtp.login(EMAIL_FROM, EMAIL_PASSWORD)
+                smtp.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
+        logger.info(f"✉️ Email: {subject}")
+        return True
+    except Exception as e:
+        logger.warning(f"Email error: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# ─── AUDIT LOG ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def log_audit(action: str, details: str = "", user: str = "bot") -> None:
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute(
+                    "INSERT INTO audit_log (timestamp, action, user, details) VALUES (?,?,?,?)",
+                    (ts, action, user, details)
+                )
+                conn.commit()
+    except Exception as e:
+        logger.debug(f"Audit log: {e}")
+
+
+def db_get_audit_log(limit: int = 100) -> list:
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM audit_log ORDER BY id DESC LIMIT ?", (limit,)
+                ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"Audit fetch: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# ─── SYSTEM RESOURCES ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_bot_start_time: float = time.time()
+
+def get_system_resources() -> dict:
+    try:
+        cpu  = psutil.cpu_percent(interval=0.1)
+        mem  = psutil.virtual_memory()
+        disk = psutil.disk_usage(".")
+        net  = psutil.net_io_counters()
+        return {
+            "cpu_pct":        round(cpu, 1),
+            "mem_total_gb":   round(mem.total  / 1024**3, 2),
+            "mem_used_gb":    round(mem.used   / 1024**3, 2),
+            "mem_pct":        round(mem.percent, 1),
+            "disk_total_gb":  round(disk.total / 1024**3, 2),
+            "disk_used_gb":   round(disk.used  / 1024**3, 2),
+            "disk_pct":       round(disk.percent, 1),
+            "net_sent_mb":    round(net.bytes_sent / 1024**2, 2),
+            "net_recv_mb":    round(net.bytes_recv / 1024**2, 2),
+            "bot_uptime_sec": int(time.time() - _bot_start_time),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# ─── DATABASE BACKUP ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def backup_database() -> dict:
+    try:
+        os.makedirs(DB_BACKUP_DIR, exist_ok=True)
+        ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        dest = os.path.join(DB_BACKUP_DIR, f"trades_{ts}.db")
+        shutil.copy2(DB_FILE, dest)
+        size = os.path.getsize(dest)
+        log_audit("DB_BACKUP", f"{dest} ({size}B)")
+        return {"ok": True, "file": dest, "size_bytes": size, "timestamp": ts}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+def list_backups() -> list:
+    try:
+        if not os.path.isdir(DB_BACKUP_DIR):
+            return []
+        files = []
+        for f in sorted(os.listdir(DB_BACKUP_DIR), reverse=True):
+            if f.endswith(".db"):
+                fp = os.path.join(DB_BACKUP_DIR, f)
+                files.append({
+                    "file": f, "size_bytes": os.path.getsize(fp),
+                    "modified": datetime.fromtimestamp(
+                        os.path.getmtime(fp), tz=timezone.utc
+                    ).isoformat(),
+                })
+        return files[:20]
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# ─── DCA MANAGEMENT ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def db_get_dca_positions() -> list:
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM dca_positions ORDER BY symbol"
+                ).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"DCA get: {e}")
+        return []
+
+
+def db_save_dca_position(symbol: str, data: dict) -> None:
+    try:
+        next_buy = datetime.now(timezone.utc).isoformat()
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("""
+                    INSERT INTO dca_positions
+                        (symbol, amount_usdt, interval_hours, enabled, next_buy_at)
+                    VALUES (?,?,?,?,?)
+                    ON CONFLICT(symbol) DO UPDATE SET
+                        amount_usdt=excluded.amount_usdt,
+                        interval_hours=excluded.interval_hours,
+                        enabled=excluded.enabled,
+                        next_buy_at=excluded.next_buy_at
+                """, (
+                    symbol,
+                    float(data.get("amount_usdt", DCA_DEFAULT_AMOUNT_USDT)),
+                    int(data.get("interval_hours", DCA_DEFAULT_INTERVAL_HOURS)),
+                    int(data.get("enabled", 1)),
+                    data.get("next_buy_at", next_buy),
+                ))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"DCA save: {e}")
+
+
+def db_delete_dca_position(symbol: str) -> None:
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("DELETE FROM dca_positions WHERE symbol=?", (symbol,))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"DCA delete: {e}")
+
+
+def execute_dca_buy(symbol: str, amount_usdt: float) -> dict:
+    """Execute a DCA market buy for amount_usdt worth of symbol."""
+    try:
+        base = ("https://testnet.binance.vision" if BINANCE_TESTNET
+                else "https://api.binance.com")
+        resp = requests.get(f"{base}/api/v3/ticker/price",
+                            params={"symbol": symbol}, timeout=5)
+        if resp.status_code != 200:
+            return {"ok": False, "error": f"Price fetch: {resp.status_code}"}
+        price = float(resp.json()["price"])
+        qty   = amount_usdt / price
+        order = execute_exchange(symbol, "BUY", qty)
+        if order.get("error"):
+            return {"ok": False, "error": order["error"]}
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("""
+                    UPDATE dca_positions
+                    SET total_invested = total_invested + ?,
+                        total_qty = total_qty + ?,
+                        buy_count = buy_count + 1,
+                        last_buy_at = ?,
+                        next_buy_at = datetime('now', '+' || interval_hours || ' hours')
+                    WHERE symbol = ?
+                """, (amount_usdt, qty, datetime.now(timezone.utc).isoformat(), symbol))
+                conn.commit()
+        log_audit("DCA_BUY", f"{symbol} {qty:.6f} @ {price:.4f} ({amount_usdt:.2f} USDT)")
+        return {"ok": True, "symbol": symbol, "qty": qty,
+                "price": price, "spent": amount_usdt}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# ─── VACATION MODE & SCHEDULE ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_vacation_mode_lock  = threading.Lock()
+_vacation_mode_state = VACATION_MODE_INIT
+
+
+def get_vacation_mode() -> bool:
+    with _vacation_mode_lock:
+        return _vacation_mode_state
+
+
+def set_vacation_mode(enabled: bool) -> None:
+    global _vacation_mode_state, bot_paused
+    with _vacation_mode_lock:
+        _vacation_mode_state = enabled
+    if enabled:
+        with bot_paused_lock:
+            bot_paused = True
+        log_audit("VACATION_ON")
+        send_telegram_message(
+            "🏖 *Vacation mode aktif\\. Bot di\\-pause\\.*",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID
+        )
+    else:
+        with bot_paused_lock:
+            bot_paused = False
+        log_audit("VACATION_OFF")
+        send_telegram_message(
+            "👋 *Vacation mode nonaktif\\. Bot lanjut\\.*",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID
+        )
+
+
+def get_schedule_config() -> dict:
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT * FROM schedule_config WHERE id=1"
+                ).fetchone()
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    return {
+        "trading_start_hour": TRADING_START_HOUR_UTC,
+        "trading_end_hour":   TRADING_END_HOUR_UTC,
+        "trading_days":       "0,1,2,3,4,5,6",
+        "enabled":            0,
+    }
+
+
+def save_schedule_config(data: dict) -> None:
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("""
+                    INSERT INTO schedule_config
+                        (id, trading_start_hour, trading_end_hour, trading_days, enabled)
+                    VALUES (1,?,?,?,?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        trading_start_hour=excluded.trading_start_hour,
+                        trading_end_hour=excluded.trading_end_hour,
+                        trading_days=excluded.trading_days,
+                        enabled=excluded.enabled
+                """, (
+                    int(data.get("trading_start_hour", 0)),
+                    int(data.get("trading_end_hour", 24)),
+                    data.get("trading_days", "0,1,2,3,4,5,6"),
+                    int(data.get("enabled", 0)),
+                ))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"Schedule config: {e}")
+
+
+# ---------------------------------------------------------------------------
+# ─── NEW FLASK ROUTES ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+@flask_app.route("/api/analytics")
+@flask_app.route("/api/stats/advanced")
+def api_analytics():
+    days = int(flask_request.args.get("days", 30))
+    return json.dumps(compute_analytics(days)), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/backtest/run", methods=["GET", "POST"])
+@flask_app.route("/api/backtest", methods=["GET", "POST"])
+def api_backtest():
+    data = (flask_request.get_json(force=True) or {}) if flask_request.method == "POST" \
+           else flask_request.args.to_dict()
+    result = run_backtest(
+        symbol          = data.get("symbol", "BTCUSDT"),
+        days            = int(data.get("days", 14)),
+        initial_capital = float(data.get("initial_capital", 1000)),
+        tp_pct          = float(data.get("tp_pct", TP_PCT)),
+        sl_pct          = float(data.get("sl_pct", SL_PCT)),
+        rsi_threshold   = float(data.get("rsi_threshold", 35)),
+    )
+    return json.dumps(result), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/system")
+@flask_app.route("/api/system/resources")
+def api_system():
+    res = get_system_resources()
+    with _last_signal_lock:
+        last_sig = _last_signal_time
+    res["last_signal_ago_sec"] = int(time.time() - last_sig)
+    return json.dumps(res), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/healthz/detail")
+def api_healthz_detail():
+    with positions_lock:   n_pos   = len(open_positions)
+    with bot_paused_lock:  paused  = bot_paused
+    with pairs_lock:       n_pairs = len(active_pairs)
+    with _api_weight_lock: weight  = _api_weight_1m
+    with _last_signal_lock: last_sig = _last_signal_time
+    sys_res = get_system_resources()
+    checks = {
+        "bot_running":    not paused,
+        "db_accessible":  os.path.exists(DB_FILE),
+        "pairs_loaded":   n_pairs > 0,
+        "api_weight_ok":  weight < 1000,
+        "vacation_mode":  get_vacation_mode(),
+    }
+    status = "healthy" if checks["db_accessible"] and checks["pairs_loaded"] else "degraded"
+    return json.dumps({
+        "status": status, "checks": checks, "open_positions": n_pos,
+        "pairs_scanned": n_pairs, "api_weight_1m": weight, "paused": paused,
+        "last_signal_ago_sec": int(time.time() - last_sig), "system": sys_res,
+    }), 200, {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/audit")
+def api_audit():
+    limit = int(flask_request.args.get("limit", 100))
+    return json.dumps(db_get_audit_log(limit)), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/backup", methods=["POST"])
+def api_backup():
+    denied = _check_api_key()
+    if denied: return denied
+    result = backup_database()
+    code = 200 if result["ok"] else 500
+    return json.dumps(result), code, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/backup/list")
+def api_backup_list():
+    return json.dumps(list_backups()), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/vacation")
+def api_vacation_get():
+    return json.dumps({"vacation_mode": get_vacation_mode()}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/vacation/toggle", methods=["POST"])
+def api_vacation_toggle():
+    denied = _check_api_key()
+    if denied: return denied
+    data    = flask_request.get_json(force=True) or {}
+    enabled = data.get("enabled", not get_vacation_mode())
+    set_vacation_mode(bool(enabled))
+    log_audit("VACATION_TOGGLE", f"enabled={enabled}", user=data.get("user", "api"))
+    return json.dumps({"ok": True, "vacation_mode": get_vacation_mode()}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/schedule")
+def api_schedule_get():
+    return json.dumps(get_schedule_config()), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/schedule/save", methods=["POST"])
+def api_schedule_save():
+    denied = _check_api_key()
+    if denied: return denied
+    data = flask_request.get_json(force=True) or {}
+    save_schedule_config(data)
+    log_audit("SCHEDULE_UPDATE", str(data))
+    return json.dumps({"ok": True}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/dca")
+def api_dca_get():
+    return json.dumps(db_get_dca_positions()), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/dca/add", methods=["POST"])
+def api_dca_add():
+    denied = _check_api_key()
+    if denied: return denied
+    data   = flask_request.get_json(force=True) or {}
+    symbol = data.get("symbol", "").upper().strip()
+    if not symbol:
+        return json.dumps({"ok": False, "error": "symbol required"}), 400, \
+            {"Content-Type": "application/json"}
+    db_save_dca_position(symbol, data)
+    log_audit("DCA_ADD", symbol)
+    return json.dumps({"ok": True, "symbol": symbol}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/dca/remove", methods=["POST"])
+def api_dca_remove():
+    denied = _check_api_key()
+    if denied: return denied
+    data   = flask_request.get_json(force=True) or {}
+    symbol = data.get("symbol", "").upper().strip()
+    db_delete_dca_position(symbol)
+    log_audit("DCA_REMOVE", symbol)
+    return json.dumps({"ok": True, "symbol": symbol}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/dca/trigger", methods=["POST"])
+def api_dca_trigger():
+    denied = _check_api_key()
+    if denied: return denied
+    data   = flask_request.get_json(force=True) or {}
+    symbol = data.get("symbol", "").upper().strip()
+    amount = float(data.get("amount_usdt", DCA_DEFAULT_AMOUNT_USDT))
+    result = execute_dca_buy(symbol, amount)
+    code   = 200 if result.get("ok") else 400
+    return json.dumps(result), code, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/email/test", methods=["POST"])
+def api_email_test():
+    denied = _check_api_key()
+    if denied: return denied
+    data = flask_request.get_json(force=True) or {}
+    ok   = send_email_notification(
+        data.get("subject", "Test Email"),
+        data.get("body", "<b>Email notifikasi berhasil!</b>"),
+    )
+    return json.dumps({
+        "ok": ok, "email_enabled": EMAIL_ENABLED,
+        "from": EMAIL_FROM, "to": EMAIL_TO,
+    }), 200, {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/trades")
+def api_trades_all():
+    limit   = int(flask_request.args.get("limit", 100))
+    days    = int(flask_request.args.get("days", 30))
+    res_f   = flask_request.args.get("result", "")
+    sym_f   = flask_request.args.get("symbol", "")
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                q  = ("SELECT id,timestamp,symbol,side,qty,price,confidence,"
+                      "reason,result,pnl,pnl_pct FROM trades "
+                      "WHERE timestamp >= datetime('now', ?)")
+                ps: list = [f"-{days} days"]
+                if res_f:
+                    q += " AND result=?";  ps.append(res_f)
+                if sym_f:
+                    q += " AND symbol=?";  ps.append(sym_f.upper())
+                q += " ORDER BY id DESC LIMIT ?"; ps.append(limit)
+                rows = conn.execute(q, ps).fetchall()
+        return json.dumps([dict(r) for r in rows]), 200, \
+            {"Content-Type": "application/json"}
+    except Exception as e:
+        return json.dumps({"error": str(e)}), 500, {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/news")
+def api_news_endpoint():
+    symbol = flask_request.args.get("symbol", "")
+    limit  = int(flask_request.args.get("limit", 20))
+    try:
+        items = get_relevant_news(symbol, limit)
+    except Exception:
+        items = []
+    return json.dumps(items), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/position/close", methods=["POST"])
+def api_position_close():
+    denied = _check_api_key()
+    if denied: return denied
+    data   = flask_request.get_json(force=True) or {}
+    symbol = data.get("symbol", "").upper().strip()
+    if not symbol:
+        return json.dumps({"ok": False, "error": "symbol required"}), 400, \
+            {"Content-Type": "application/json"}
+    with positions_lock:
+        pos = open_positions.get(symbol)
+    if not pos:
+        return json.dumps({"ok": False, "error": f"No open position for {symbol}"}), 404, \
+            {"Content-Type": "application/json"}
+    try:
+        emergency_close_position(symbol, pos, "API_MANUAL_CLOSE")
+        log_audit("POSITION_CLOSE", symbol, user="api")
+        return json.dumps({"ok": True, "symbol": symbol}), 200, \
+            {"Content-Type": "application/json"}
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}), 500, \
+            {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/bot/pause", methods=["POST"])
+def api_bot_pause():
+    denied = _check_api_key()
+    if denied: return denied
+    global bot_paused
+    with bot_paused_lock:
+        bot_paused = True
+    log_audit("BOT_PAUSE", "via API")
+    return json.dumps({"ok": True, "paused": True}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/bot/resume", methods=["POST"])
+def api_bot_resume():
+    denied = _check_api_key()
+    if denied: return denied
+    global bot_paused
+    with bot_paused_lock:
+        bot_paused = False
+    log_audit("BOT_RESUME", "via API")
+    return json.dumps({"ok": True, "paused": False}), 200, \
+        {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/bot/close-all", methods=["POST"])
+def api_bot_close_all():
+    denied = _check_api_key()
+    if denied: return denied
+    with positions_lock:
+        syms = list(open_positions.keys())
+    closed, errors = [], []
+    for sym in syms:
+        try:
+            with positions_lock:
+                pos = open_positions.get(sym)
+            if pos:
+                emergency_close_position(sym, pos, "API_CLOSE_ALL")
+                closed.append(sym)
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+    log_audit("CLOSE_ALL", f"closed={closed}")
+    return json.dumps({"ok": True, "closed": closed, "errors": errors}), 200, \
+        {"Content-Type": "application/json"}
+
+
+# CORS preflight
+def _cors_origin_for(request_origin: str | None) -> str:
+    """Return the allowed origin string for this request, or empty string."""
+    if not request_origin:
+        return ""
+    for allowed in _CORS_ALLOWED_ORIGINS:
+        if allowed and request_origin.startswith(allowed):
+            return request_origin
+    return ""
+
+
+def _check_api_key() -> "flask.Response | None":
+    """Return a 401 response if the X-Dashboard-Key header is missing or wrong.
+    Returns None when the request is authorised.
+    If DASHBOARD_API_KEY is not configured the endpoint is disabled (503)."""
+    if not DASHBOARD_API_KEY:
+        resp = flask_app.make_response(
+            (json.dumps({"error": "DASHBOARD_API_KEY not configured — "
+                                  "set it in config.json to enable write endpoints"}),
+             503, {"Content-Type": "application/json"})
+        )
+        return resp
+    provided = (flask_request.headers.get("X-Dashboard-Key") or
+                flask_request.headers.get("Authorization", "").removeprefix("Bearer "))
+    if not provided or provided != DASHBOARD_API_KEY:
+        return flask_app.make_response(
+            (json.dumps({"error": "Unauthorized — provide X-Dashboard-Key header"}),
+             401, {"Content-Type": "application/json"})
+        )
+    return None
+
+
+@flask_app.after_request
+def _add_cors(response):
+    origin = flask_request.headers.get("Origin", "")
+    allowed = _cors_origin_for(origin)
+    if allowed:
+        response.headers["Access-Control-Allow-Origin"] = allowed
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Methods"] = "GET,POST,OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type,X-Dashboard-Key"
+    return response
+
+
+@flask_app.route("/api/<path:path>", methods=["OPTIONS"])
+def _api_options(path):
+    origin = flask_request.headers.get("Origin", "")
+    allowed = _cors_origin_for(origin)
+    headers = {
+        "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type,X-Dashboard-Key",
+    }
+    if allowed:
+        headers["Access-Control-Allow-Origin"] = allowed
+        headers["Vary"] = "Origin"
+    return "", 204, headers
 
 
 def run_flask():
@@ -4185,6 +5123,107 @@ def health_monitor_loop() -> None:
         time.sleep(300)  # cek setiap 5 menit
 
 # ---------------------------------------------------------------------------
+# ─── DCA MONITOR LOOP ────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def dca_monitor_loop() -> None:
+    """Execute DCA buys when due (checks every 5 min)."""
+    logger.info("✅ DCA monitor aktif")
+    while True:
+        try:
+            if DCA_ENABLED and not get_vacation_mode():
+                with bot_paused_lock:
+                    paused = bot_paused
+                if not paused:
+                    now_str = datetime.now(timezone.utc).isoformat()
+                    for pos in db_get_dca_positions():
+                        if not pos.get("enabled"):
+                            continue
+                        next_buy = pos.get("next_buy_at", "")
+                        if next_buy and now_str >= next_buy:
+                            sym    = pos["symbol"]
+                            amount = float(pos.get("amount_usdt", DCA_DEFAULT_AMOUNT_USDT))
+                            logger.info(f"📈 DCA: {sym} {amount} USDT")
+                            result = execute_dca_buy(sym, amount)
+                            if result.get("ok"):
+                                send_telegram_message(
+                                    f"📈 *DCA Buy: {sym}*\n"
+                                    f"Qty  : `{result['qty']:.6f}`\n"
+                                    f"Price: `{result['price']:.4f} USDT`\n"
+                                    f"Spent: `{result['spent']:.2f} USDT`",
+                                    topic_id=TELEGRAM_REPORT_TOPIC_ID,
+                                )
+        except Exception as e:
+            logger.warning(f"DCA monitor: {e}")
+        time.sleep(300)
+
+
+# ---------------------------------------------------------------------------
+# ─── SCHEDULED PAUSE CHECKER ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def scheduled_pause_checker_loop() -> None:
+    """Auto-pause/resume bot based on trading hours schedule."""
+    global bot_paused
+    logger.info("✅ Schedule checker aktif")
+    _paused_by_schedule = False
+    while True:
+        try:
+            cfg = get_schedule_config()
+            if cfg.get("enabled"):
+                now  = datetime.now(timezone.utc)
+                hour = now.hour
+                wday = now.weekday()
+                trading_days = [
+                    int(d) for d in str(cfg.get("trading_days", "0,1,2,3,4,5,6")).split(",")
+                    if d.strip().isdigit()
+                ]
+                s_h = int(cfg.get("trading_start_hour", 0))
+                e_h = int(cfg.get("trading_end_hour", 24))
+                in_hours = wday in trading_days and s_h <= hour < e_h
+                with bot_paused_lock:
+                    cur_paused = bot_paused
+                if not in_hours and not cur_paused:
+                    with bot_paused_lock:
+                        bot_paused = True
+                    _paused_by_schedule = True
+                    log_audit("SCHED_PAUSE", f"hour={hour} UTC")
+                elif in_hours and _paused_by_schedule and cur_paused:
+                    with bot_paused_lock:
+                        bot_paused = False
+                    _paused_by_schedule = False
+                    log_audit("SCHED_RESUME", f"hour={hour} UTC")
+        except Exception as e:
+            logger.debug(f"Schedule checker: {e}")
+        time.sleep(60)
+
+
+# ---------------------------------------------------------------------------
+# ─── DATABASE BACKUP LOOP ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def db_backup_loop() -> None:
+    """Periodic database backup (runs only if DB_BACKUP_ENABLED=true)."""
+    if not DB_BACKUP_ENABLED:
+        return
+    logger.info(f"✅ DB backup loop aktif (interval {DB_BACKUP_INTERVAL_HOURS}h)")
+    while True:
+        time.sleep(DB_BACKUP_INTERVAL_HOURS * 3600)
+        try:
+            res = backup_database()
+            if res["ok"]:
+                logger.info(f"💾 Backup: {res['file']}")
+            # Prune to keep latest 10
+            for b in list_backups()[10:]:
+                try:
+                    os.remove(os.path.join(DB_BACKUP_DIR, b["file"]))
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.warning(f"Backup loop: {e}")
+
+
+# ---------------------------------------------------------------------------
 # ─── 9. MAIN LOOP ───────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
@@ -4439,6 +5478,15 @@ if __name__ == "__main__":
 
     # Monitor kesehatan bot (no-signal alert, equity drop alert, equity snapshot)
     threading.Thread(target=health_monitor_loop, daemon=True).start()
+
+    # DCA automation (beli otomatis sesuai jadwal per-symbol)
+    threading.Thread(target=dca_monitor_loop, daemon=True).start()
+
+    # Scheduled trading hours (auto pause/resume berdasarkan jam trading)
+    threading.Thread(target=scheduled_pause_checker_loop, daemon=True).start()
+
+    # Backup database berkala (hanya aktif kalau DB_BACKUP_ENABLED=true)
+    threading.Thread(target=db_backup_loop, daemon=True).start()
 
     # Main trading loop
     main_loop()

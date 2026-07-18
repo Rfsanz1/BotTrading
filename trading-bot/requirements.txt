@@ -4,3 +4,4 @@ flask
 groq
 python-binance
 feedparser
+psutil
