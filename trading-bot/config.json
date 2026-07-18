@@ -1,3 +1,4 @@
 {
-  "BINANCE_TESTNET": "true"
+  "BINANCE_TESTNET": "true",
+  "TELEGRAM_CHAT_ID": "-100381292862"
 }
