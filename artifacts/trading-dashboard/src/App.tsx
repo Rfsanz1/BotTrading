@@ -4,6 +4,7 @@ import { TooltipProvider } from '@/components/ui/tooltip';
 import NotFound from '@/pages/not-found';
 import { Route, Switch, Router as WouterRouter } from 'wouter';
 import { AppLayout } from '@/components/layout/AppLayout';
+import { AuthGate } from '@/components/AuthGate';
 
 import Overview from '@/pages/overview';
 import Positions from '@/pages/positions';
@@ -15,7 +16,14 @@ import System from '@/pages/system';
 import Schedule from '@/pages/schedule';
 import Settings from '@/pages/settings';
 
-const queryClient = new QueryClient();
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      retry: 1,
+      staleTime: 15_000,
+    },
+  },
+});
 
 function Router() {
   return (
@@ -36,17 +44,17 @@ function Router() {
   );
 }
 
-function App() {
+export default function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <TooltipProvider>
-        <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
-          <Router />
-        </WouterRouter>
+        <AuthGate>
+          <WouterRouter base={import.meta.env.BASE_URL.replace(/\/$/, '')}>
+            <Router />
+          </WouterRouter>
+        </AuthGate>
         <Toaster theme="dark" position="top-right" richColors />
       </TooltipProvider>
     </QueryClientProvider>
   );
 }
-
-export default App;

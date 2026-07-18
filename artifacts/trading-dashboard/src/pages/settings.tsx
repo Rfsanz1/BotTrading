@@ -12,7 +12,7 @@ import { Save, ShieldAlert, Database, History, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
 export default function Settings() {
-  const { data: configData, refetch: refetchConfig } = useApiData<any>('/config/get');
+  const { data: configData, refetch: refetchConfig } = useApiData<any>('/config');
   const { data: backups, refetch: refetchBackups } = useApiData<any[]>('/backup/list');
   const { data: auditLogs } = useApiData<any[]>('/audit?limit=20');
   

@@ -73,10 +73,12 @@ export default defineConfig({
       strict: true,
     },
     proxy: {
-      '/bot': {
+      // Requests arrive at Vite with the full base path prefix, e.g.
+      // /trading-dashboard/bot/api/events → http://localhost:3000/api/events
+      [`${basePath}bot`]: {
         target: 'http://localhost:3000',
         changeOrigin: true,
-        rewrite: (path: string) => path.replace(/^\/bot/, ''),
+        rewrite: (p: string) => p.replace(`${basePath}bot`, ''),
       },
     },
   },

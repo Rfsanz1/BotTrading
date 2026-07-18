@@ -2121,9 +2121,102 @@ def _api_options(path):
     return "", 204, headers
 
 
+@flask_app.route("/api/events")
+def api_events():
+    """Server-Sent Events stream — pushes live status + positions every 3 s.
+    Auto-closes after 60 events (~3 min); clients reconnect transparently."""
+    def generate():
+        for _ in range(60):
+            try:
+                with pairs_lock:
+                    n_pairs = len(active_pairs)
+                with positions_lock:
+                    snap = dict(open_positions)
+                with bot_paused_lock:
+                    paused = bot_paused
+                with _api_weight_lock:
+                    weight = _api_weight_1m
+                today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                daily = compute_daily_report(today_str)
+                positions_list = []
+                for sym, pos in snap.items():
+                    entry   = pos.get("entry_price", 0)
+                    highest = pos.get("highest_price_seen", entry)
+                    unrealized_pct = round((highest / entry - 1) * 100, 2) if entry else 0
+                    positions_list.append({
+                        "symbol":          sym,
+                        "qty":             pos.get("qty", 0),
+                        "entry_price":     entry,
+                        "tp_price":        pos.get("tp_price", 0),
+                        "sl_price":        pos.get("sl_price", 0),
+                        "original_sl":     pos.get("original_sl_price", pos.get("sl_price", 0)),
+                        "highest_price":   highest,
+                        "unrealized_pct":  unrealized_pct,
+                        "trailing_active": pos.get("trailing_sl_active", False),
+                        "breakeven_done":  pos.get("breakeven_done", False),
+                        "partial_tp_done": pos.get("partial_tp_done", False),
+                        "opened_at":       pos.get("opened_at", ""),
+                        "asset_group":     pos.get("asset_group", ""),
+                    })
+                payload = {
+                    "status": {
+                        "paused":          paused,
+                        "pairs_scanned":   n_pairs,
+                        "open_positions":  len(snap),
+                        "api_weight_1m":   weight,
+                        "daily_pnl":       daily["total_pnl"],
+                        "daily_wins":      daily["wins"],
+                        "daily_losses":    daily["losses"],
+                        "daily_win_rate":  daily["win_rate"],
+                        "testnet":         BINANCE_TESTNET,
+                        "live_mode":       LIVE_MODE,
+                        "confidence_min":  CONFIDENCE_THRESHOLD,
+                        "capital_pct":     CAPITAL_ALLOCATION_PCT,
+                        "max_positions":   MAX_CONCURRENT_POSITIONS,
+                        "trailing_sl":     TRAILING_SL_ENABLED,
+                    },
+                    "positions": positions_list,
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+            except Exception as exc:
+                yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            time.sleep(3)
+        yield 'data: {"close": true}\n\n'
+
+    origin = flask_request.headers.get("Origin", "")
+    allowed = _cors_origin_for(origin)
+    headers = {
+        "Content-Type":    "text/event-stream",
+        "Cache-Control":   "no-cache",
+        "X-Accel-Buffering": "no",
+        "Connection":      "keep-alive",
+    }
+    if allowed:
+        headers["Access-Control-Allow-Origin"] = allowed
+        headers["Vary"] = "Origin"
+    return flask_app.response_class(generate(), headers=headers)
+
+
+@flask_app.route("/api/auth/required")
+def api_auth_required():
+    """Returns whether a DASHBOARD_API_KEY is configured on the backend."""
+    return json.dumps({"required": bool(DASHBOARD_API_KEY)}), 200, {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/auth/verify", methods=["POST"])
+def api_auth_verify():
+    """Validate a dashboard API key. Returns {valid: bool}."""
+    if not DASHBOARD_API_KEY:
+        return json.dumps({"valid": False, "reason": "not_configured"}), 200, {"Content-Type": "application/json"}
+    data = flask_request.get_json(silent=True) or {}
+    key = data.get("key", "")
+    valid = bool(key) and key == DASHBOARD_API_KEY
+    return json.dumps({"valid": valid}), 200, {"Content-Type": "application/json"}
+
+
 def run_flask():
     port = int(os.getenv("PORT", 3000))
-    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
 
 # ---------------------------------------------------------------------------
 # ─── 0. DAFTAR PAIR (SEMUA USDT DI BINANCE) ─────────────────────────────────
