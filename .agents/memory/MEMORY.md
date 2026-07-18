@@ -1,5 +1,7 @@
 - [Bot architecture](bot-arch.md) — trading bot standalone di trading-bot/main.py, semua fitur dalam satu file Python
-- [Equity basis rule](equity-basis.md) — daily_start_equity HANYA dari USDT (get_binance_equity), bukan total portfolio
-- [Trailing SL pattern](trailing-sl.md) — cancel OCO lama, pasang OCO baru; global deklarasi harus di top of function, bukan di dalam with block
-- [State persistence](state-persistence.md) — posisi disimpan ke bot_state.json via save_state/load_state; atomic write (tmp + rename)
-- [Python global in with block](python-globals.md) — global declaration tidak boleh di dalam nested block (with, if, for), wajib di top of function
+- [Equity basis rule](equity-basis.md) — daily_start_equity HANYA dari USDT (get_binance_equity), default 0.0 bukan 10000
+- [Trailing SL pattern](trailing-sl.md) — cancel OCO lama, pasang OCO baru; global deklarasi harus di top of function
+- [State persistence](state-persistence.md) — posisi disimpan ke bot_state.json; path TANPA prefix (relatif ke trading-bot/)
+- [Python global in with block](python-globals.md) — global declaration tidak boleh di dalam nested block, wajib di top of function
+- [SQLite dual-write](sqlite-dual-write.md) — log_trade menulis ke trades.log DAN trades.db; file path tanpa prefix
+- [Health monitor startup](health-monitor.md) — daily_start_equity harus 0.0 default agar health monitor tidak false alarm sebelum main_loop set value

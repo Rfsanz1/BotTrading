@@ -16,6 +16,7 @@ import json
 import time
 import queue
 import logging
+import sqlite3
 import threading
 from datetime import datetime, timezone
 from typing import Optional
@@ -122,13 +123,45 @@ MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
 MAX_POSITIONS_PER_GROUP: int = int(os.getenv("MAX_POSITIONS_PER_GROUP", "2"))
 
 # ── State persistence ────────────────────────────────────────────────────────
-# File untuk menyimpan state posisi terbuka — supaya tidak hilang saat restart
-STATE_FILE: str = os.getenv("STATE_FILE", "trading-bot/bot_state.json")
+# Path relatif terhadap working directory (trading-bot/) saat bot dijalankan
+STATE_FILE: str = os.getenv("STATE_FILE", "bot_state.json")
 
 # ── Binance API weight guard ─────────────────────────────────────────────────
 # Kalau used-weight sudah > threshold ini, tambah delay antar request
 BINANCE_WEIGHT_WARN: int = int(os.getenv("BINANCE_WEIGHT_WARN", "800"))
 BINANCE_WEIGHT_PAUSE: int = int(os.getenv("BINANCE_WEIGHT_PAUSE", "1100"))
+
+# ── Hard Stop Daily Loss ──────────────────────────────────────────────────────
+# Bot otomatis di-PAUSE kalau equity turun > X% dari awal hari (threshold awal).
+# Berbeda dari DAILY_LOSS_LIMIT_PCT (5%, matikan LIVE_MODE) — ini threshold
+# pertama (default 3%) yang masih bisa di-resume manual via /resume.
+HARD_STOP_LOSS_PCT: float = float(os.getenv("HARD_STOP_LOSS_PCT", "3.0"))
+
+# ── Breakeven Stop Loss ───────────────────────────────────────────────────────
+# Saat profit ≥ X%, otomatis pindahkan SL ke harga entry — tidak mungkin rugi.
+BREAKEVEN_ENABLED: bool = os.getenv("BREAKEVEN_ENABLED", "true").lower() in ("1","true","yes")
+BREAKEVEN_ACTIVATE_PCT: float = float(os.getenv("BREAKEVEN_ACTIVATE_PCT", "0.5"))
+
+# ── Partial Take Profit ───────────────────────────────────────────────────────
+# Saat profit mencapai 50% dari jarak ke TP, tutup 50% posisi untuk kunci profit.
+# Sisa 50% biarkan jalan dengan trailing SL ke TP penuh.
+PARTIAL_TP_ENABLED: bool = os.getenv("PARTIAL_TP_ENABLED", "true").lower() in ("1","true","yes")
+PARTIAL_TP_RATIO: float = float(os.getenv("PARTIAL_TP_RATIO", "0.5"))         # tutup 50% posisi
+PARTIAL_TP_TRIGGER_RATIO: float = float(os.getenv("PARTIAL_TP_TRIGGER_RATIO", "0.5"))  # trigger di 50% jarak ke TP
+
+# ── Dynamic Position Sizing (Kelly Criterion lite) ───────────────────────────
+# Kurangi ukuran posisi saat win rate rendah, naikkan saat sedang hot.
+KELLY_SIZING_ENABLED: bool = os.getenv("KELLY_SIZING_ENABLED", "true").lower() in ("1","true","yes")
+KELLY_LOOKBACK: int = int(os.getenv("KELLY_LOOKBACK", "20"))  # lihat N trade terakhir
+
+# ── Health Monitor ────────────────────────────────────────────────────────────
+# Alert ke Telegram kalau bot diam > X jam atau equity drop > Y%
+HEALTH_NO_SIGNAL_HOURS: float = float(os.getenv("HEALTH_NO_SIGNAL_HOURS", "2.0"))
+HEALTH_EQUITY_DROP_PCT: float = float(os.getenv("HEALTH_EQUITY_DROP_PCT", "5.0"))
+
+# ── SQLite database ───────────────────────────────────────────────────────────
+# Path relatif terhadap working directory (trading-bot/) saat bot dijalankan
+DB_FILE: str = os.getenv("DB_FILE", "trades.db")
 
 # ---------------------------------------------------------------------------
 # ─── ENVIRONMENT VARIABLES ──────────────────────────────────────────────────
@@ -182,6 +215,154 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 TRADES_LOG = "trades.log"
+
+# ---------------------------------------------------------------------------
+# ─── SQLITE DATABASE ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_db_lock = threading.Lock()
+
+def init_db() -> None:
+    """Inisialisasi SQLite — buat tabel kalau belum ada."""
+    with _db_lock:
+        with sqlite3.connect(DB_FILE) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trades (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp  TEXT    NOT NULL,
+                    symbol     TEXT,
+                    side       TEXT,
+                    qty        REAL,
+                    price      REAL,
+                    confidence INTEGER,
+                    reason     TEXT,
+                    result     TEXT,
+                    order_id   TEXT,
+                    pnl        REAL,
+                    pnl_pct    REAL,
+                    live_mode  INTEGER DEFAULT 1
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(timestamp)
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS equity_snapshots (
+                    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    equity    REAL NOT NULL
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_equity_ts ON equity_snapshots(timestamp)
+            """)
+            conn.commit()
+    logger.info(f"✅ SQLite DB siap: {DB_FILE}")
+
+
+def db_insert_trade(record: dict) -> None:
+    """Tulis satu record trade ke SQLite (non-blocking, hanya log kalau gagal)."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute("""
+                    INSERT INTO trades
+                        (timestamp, symbol, side, qty, price, confidence,
+                         reason, result, order_id, pnl, pnl_pct, live_mode)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                """, (
+                    record.get("timestamp"),
+                    record.get("symbol"),
+                    record.get("side"),
+                    record.get("qty"),
+                    record.get("price"),
+                    record.get("confidence"),
+                    record.get("reason"),
+                    record.get("result"),
+                    record.get("order_id"),
+                    record.get("pnl"),
+                    record.get("pnl_pct"),
+                    int(record.get("live_mode", True)),
+                ))
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"SQLite insert trade gagal: {e}")
+
+
+def db_save_equity_snapshot(equity: float) -> None:
+    """Simpan snapshot equity sekarang ke SQLite."""
+    try:
+        ts = datetime.now(timezone.utc).isoformat()
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.execute(
+                    "INSERT INTO equity_snapshots (timestamp, equity) VALUES (?,?)",
+                    (ts, equity)
+                )
+                conn.commit()
+    except Exception as e:
+        logger.warning(f"SQLite insert equity gagal: {e}")
+
+
+def db_get_recent_trades(n: int = 20) -> list[dict]:
+    """Ambil N trade terakhir yang closed (TP/SL/EARLY_EXIT) dari SQLite."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT result, pnl FROM trades
+                    WHERE result IN ('CLOSED_TP','CLOSED_SL','EARLY_EXIT')
+                    ORDER BY id DESC LIMIT ?
+                """, (n,)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"SQLite get trades gagal: {e}")
+        return []
+
+
+def db_get_equity_history(days: int = 7) -> list[dict]:
+    """Ambil snapshot equity N hari terakhir (satu per jam) untuk chart."""
+    try:
+        since = datetime.now(timezone.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        # Ambil semua snapshot lalu downsample di Python supaya ringan
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT timestamp, equity FROM equity_snapshots
+                    WHERE timestamp >= datetime('now', ?)
+                    ORDER BY timestamp ASC
+                """, (f"-{days} days",)).fetchall()
+        return [{"timestamp": r["timestamp"], "equity": r["equity"]} for r in rows]
+    except Exception as e:
+        logger.warning(f"SQLite get equity history gagal: {e}")
+        return []
+
+
+def db_get_daily_pnl_history(days: int = 7) -> list[dict]:
+    """Hitung PnL per hari dari SQLite untuk chart bar."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT substr(timestamp,1,10) as date,
+                           SUM(COALESCE(pnl,0)) as pnl,
+                           SUM(CASE WHEN result='CLOSED_TP' THEN 1 ELSE 0 END) as wins,
+                           SUM(CASE WHEN result IN ('CLOSED_SL') THEN 1 ELSE 0 END) as losses
+                    FROM trades
+                    WHERE result IN ('CLOSED_TP','CLOSED_SL','EARLY_EXIT')
+                      AND timestamp >= datetime('now', ?)
+                    GROUP BY date
+                    ORDER BY date ASC
+                """, (f"-{days} days",)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"SQLite get daily PnL gagal: {e}")
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +426,7 @@ def load_state() -> None:
 # ─── GLOBAL STATE ───────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-daily_start_equity: float = 10_000.0
+daily_start_equity: float = 0.0  # di-set oleh main_loop setelah fetch equity dari Binance
 
 # Groq conversation history (shared antara analisis trading & chat)
 conversation_history: list[dict] = []
@@ -297,6 +478,13 @@ bot_paused_lock = threading.Lock()
 # Tracking Binance API weight (dari response header x-mbx-used-weight-1m)
 _api_weight_1m: int = 0
 _api_weight_lock = threading.Lock()
+
+# Health monitoring — kapan terakhir AI menghasilkan sinyal (apapun arahnya)
+_last_signal_time: float = time.time()
+_last_signal_lock = threading.Lock()
+
+# Equity snapshot — terakhir kali kita simpan snapshot ke DB (setiap 1 jam)
+_last_equity_snapshot_time: float = 0.0
 
 # ---------------------------------------------------------------------------
 # ─── FLASK KEEP-ALIVE ───────────────────────────────────────────────────────
@@ -362,6 +550,8 @@ def api_positions():
             "highest_price":    highest,
             "unrealized_pct":   profit_pct,
             "trailing_active":  pos.get("trailing_sl_active", False),
+            "breakeven_done":   pos.get("breakeven_done", False),
+            "partial_tp_done":  pos.get("partial_tp_done", False),
             "opened_at":        pos.get("opened_at", ""),
             "asset_group":      pos.get("asset_group", ""),
         })
@@ -379,13 +569,33 @@ def api_daily():
     return json.dumps(daily), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
 
 
+@flask_app.route("/api/history")
+def api_history():
+    """Riwayat equity + PnL harian untuk chart performa di dashboard."""
+    equity_history = db_get_equity_history(days=7)
+    daily_pnl      = db_get_daily_pnl_history(days=7)
+    recent_trades  = db_get_recent_trades(50)
+    wins = sum(1 for t in recent_trades
+               if t.get("result") == "CLOSED_TP"
+               or (t.get("result") == "EARLY_EXIT" and (t.get("pnl") or 0) >= 0))
+    win_rate_7d = round(wins / len(recent_trades) * 100, 1) if recent_trades else 0.0
+    wr_now = get_recent_win_rate(KELLY_LOOKBACK)
+    return json.dumps({
+        "equity_history": equity_history,
+        "daily_pnl":      daily_pnl,
+        "win_rate_7d":    win_rate_7d,
+        "kelly_mult":     round(_kelly_multiplier(), 2),
+        "kelly_wr":       round(wr_now * 100, 1),
+    }), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+
+
 _DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Trading Bot Dashboard</title>
-<meta http-equiv="refresh" content="30">
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; }
@@ -397,23 +607,35 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-live { background: #2d4a22; color: #68d391; }
   .badge-testnet { background: #4a3922; color: #f6ad55; }
   .badge-paused { background: #4a2222; color: #fc8181; }
-  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .refresh-ts { margin-left: auto; font-size: 0.78rem; color: #4a5568; }
+  .container { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; margin-bottom: 24px; }
   .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; padding: 16px; }
-  .card-title { font-size: 0.75rem; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
-  .card-value { font-size: 1.8rem; font-weight: 700; }
-  .card-sub { font-size: 0.8rem; color: #718096; margin-top: 4px; }
-  .green { color: #68d391; } .red { color: #fc8181; } .yellow { color: #f6ad55; } .blue { color: #63b3ed; }
+  .card-title { font-size: 0.72rem; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .card-value { font-size: 1.7rem; font-weight: 700; line-height: 1.1; }
+  .card-sub { font-size: 0.76rem; color: #718096; margin-top: 4px; }
+  .green { color: #68d391; } .red { color: #fc8181; } .yellow { color: #f6ad55; }
+  .blue { color: #63b3ed; } .purple { color: #b794f4; }
   .section-title { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: #a0aec0; }
-  .positions-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
-  .positions-table th { text-align: left; padding: 8px 12px; font-size: 0.75rem; color: #718096; text-transform: uppercase; border-bottom: 1px solid #2d3748; }
-  .positions-table td { padding: 10px 12px; font-size: 0.85rem; border-bottom: 1px solid #1a1f2e; }
+  .charts-row { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 28px; }
+  @media (max-width: 680px) { .charts-row { grid-template-columns: 1fr; } }
+  .chart-card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; padding: 18px; }
+  .chart-card canvas { max-height: 210px; }
+  .chart-note { text-align: center; font-size: 0.7rem; color: #4a5568; margin-top: 6px; }
+  .positions-table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+  .positions-table th { text-align: left; padding: 8px 12px; font-size: 0.7rem; color: #718096;
+                        text-transform: uppercase; letter-spacing: 0.04em; border-bottom: 1px solid #2d3748; }
+  .positions-table td { padding: 10px 12px; font-size: 0.83rem; border-bottom: 1px solid #171c27; }
   .positions-table tr:hover { background: #1e2535; }
-  .trail-badge { background: #2d4a22; color: #68d391; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; }
-  .empty-state { text-align: center; padding: 40px; color: #4a5568; font-size: 0.9rem; }
-  .footer { text-align: center; color: #4a5568; font-size: 0.75rem; padding: 16px; }
-  .weight-bar { height: 6px; background: #2d3748; border-radius: 3px; margin-top: 6px; }
-  .weight-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 4px; font-size: 0.68rem;
+          font-weight: 600; margin-right: 3px; white-space: nowrap; }
+  .pill-trail { background: #2d4a22; color: #68d391; }
+  .pill-be    { background: #1a3a4a; color: #63b3ed; }
+  .pill-ptp   { background: #3a2d4a; color: #b794f4; }
+  .empty-state { text-align: center; padding: 48px; color: #4a5568; font-size: 0.9rem; }
+  .weight-bar { height: 5px; background: #2d3748; border-radius: 3px; margin-top: 7px; }
+  .weight-fill { height: 100%; border-radius: 3px; transition: width 0.4s; }
+  .footer { text-align: center; color: #4a5568; font-size: 0.72rem; padding: 20px; border-top: 1px solid #1a1f2e; }
 </style>
 </head>
 <body>
@@ -421,9 +643,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <h1>🤖 Trading Bot AI</h1>
   <span id="mode-badge" class="badge"></span>
   <span id="pause-badge" class="badge badge-paused" style="display:none">⏸ PAUSED</span>
-  <span style="margin-left:auto; font-size:0.8rem; color:#4a5568">Auto-refresh 30s</span>
+  <span class="refresh-ts" id="refresh-ts">—</span>
 </div>
 <div class="container">
+
+  <!-- ── Metric Cards ── -->
   <div class="grid">
     <div class="card">
       <div class="card-title">P&L Hari Ini</div>
@@ -446,6 +670,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="card-sub" id="trades-opened">— trade dibuka</div>
     </div>
     <div class="card">
+      <div class="card-title">Kelly Sizing</div>
+      <div class="card-value purple" id="kelly-mult">—</div>
+      <div class="card-sub" id="kelly-wr">WR — dari — trade</div>
+    </div>
+    <div class="card">
       <div class="card-title">API Weight</div>
       <div class="card-value" id="api-weight">—</div>
       <div class="weight-bar"><div class="weight-fill" id="weight-fill" style="width:0%"></div></div>
@@ -453,89 +682,188 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="card">
       <div class="card-title">Pair Dipindai</div>
       <div class="card-value blue" id="pairs">—</div>
-      <div class="card-sub">tiap 1m</div>
+      <div class="card-sub">setiap 1 menit</div>
     </div>
   </div>
 
+  <!-- ── Charts ── -->
+  <div class="charts-row">
+    <div class="chart-card">
+      <div class="section-title">📈 Equity Curve (7 hari)</div>
+      <canvas id="equityChart"></canvas>
+      <div class="chart-note" id="equity-note">Memuat data…</div>
+    </div>
+    <div class="chart-card">
+      <div class="section-title">📊 PnL Harian (7 hari)</div>
+      <canvas id="pnlChart"></canvas>
+      <div class="chart-note" id="pnl-note">Memuat data…</div>
+    </div>
+  </div>
+
+  <!-- ── Positions Table ── -->
   <div class="section-title">📂 Posisi Terbuka</div>
   <table class="positions-table">
     <thead>
       <tr>
-        <th>Symbol</th><th>Entry</th><th>TP</th><th>SL</th>
+        <th>Symbol</th><th>Entry</th><th>TP</th><th>SL (aktif)</th>
         <th>Tertinggi</th><th>Unrealized</th><th>Dibuka</th><th>Status</th>
       </tr>
     </thead>
     <tbody id="positions-body">
-      <tr><td colspan="8" class="empty-state">Memuat data...</td></tr>
+      <tr><td colspan="8" class="empty-state">Memuat data…</td></tr>
     </tbody>
   </table>
+
 </div>
-<div class="footer">Refresh otomatis tiap 30 detik · Data dari Binance Testnet</div>
+<div class="footer">
+  Auto-refresh status 30s · Chart update 5 menit · Binance Testnet ·
+  <span id="footer-ts">—</span>
+</div>
 
 <script>
-async function load() {
-  try {
-    const [status, positions, daily] = await Promise.all([
-      fetch('/api/status').then(r=>r.json()),
-      fetch('/api/positions').then(r=>r.json()),
-      fetch('/api/daily').then(r=>r.json()),
-    ]);
+let equityInst = null, pnlInst = null;
 
-    const badge = document.getElementById('mode-badge');
-    badge.textContent = status.testnet ? '🟡 TESTNET' : (status.live_mode ? '🔴 LIVE' : '🔵 Simulasi');
-    badge.className = 'badge ' + (status.testnet ? 'badge-testnet' : 'badge-live');
-    document.getElementById('pause-badge').style.display = status.paused ? '' : 'none';
+const CHART_DEFAULTS = {
+  responsive: true,
+  plugins: { legend: { display: false } },
+  scales: {
+    x: { ticks: { color: '#718096', font: { size: 10 }, maxRotation: 40 },
+         grid: { color: '#1a1f2e' } },
+    y: { ticks: { color: '#718096', font: { size: 10 } },
+         grid: { color: '#2d3748' } }
+  }
+};
 
-    const pnl = daily.total_pnl;
-    const pnlEl = document.getElementById('daily-pnl');
-    pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' USDT';
-    pnlEl.className = 'card-value ' + (pnl >= 0 ? 'green' : 'red');
-    document.getElementById('daily-wr').textContent = `WR ${daily.win_rate}% (${daily.wins}W ${daily.losses}L)`;
+async function loadStatus() {
+  const [status, positions, daily] = await Promise.all([
+    fetch('/api/status').then(r=>r.json()),
+    fetch('/api/positions').then(r=>r.json()),
+    fetch('/api/daily').then(r=>r.json()),
+  ]);
 
-    const eq = daily.current_equity;
-    document.getElementById('equity').textContent = eq.toFixed(2) + ' USDT';
-    const chg = daily.net_change;
-    const chgEl = document.getElementById('equity-change');
-    chgEl.textContent = 'vs. awal: ' + (chg >= 0 ? '+' : '') + chg.toFixed(4);
-    chgEl.style.color = chg >= 0 ? '#68d391' : '#fc8181';
+  /* badges */
+  const b = document.getElementById('mode-badge');
+  b.textContent = status.testnet ? '🟡 TESTNET' : (status.live_mode ? '🔴 LIVE' : '🔵 Simulasi');
+  b.className = 'badge ' + (status.testnet ? 'badge-testnet' : 'badge-live');
+  document.getElementById('pause-badge').style.display = status.paused ? '' : 'none';
 
-    document.getElementById('open-pos').textContent = status.open_positions;
-    document.getElementById('max-pos').textContent = `max ${status.max_positions} slot`;
-    document.getElementById('winloss').textContent = daily.wins + 'W / ' + daily.losses + 'L';
-    document.getElementById('trades-opened').textContent = daily.trades_opened + ' trade dibuka';
-    document.getElementById('pairs').textContent = status.pairs_scanned;
+  /* P&L */
+  const pnl = daily.total_pnl;
+  const pe = document.getElementById('daily-pnl');
+  pe.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' USDT';
+  pe.className = 'card-value ' + (pnl >= 0 ? 'green' : 'red');
+  document.getElementById('daily-wr').textContent =
+    `WR ${daily.win_rate}% (${daily.wins}W ${daily.losses}L)`;
 
-    const w = status.api_weight_1m;
-    document.getElementById('api-weight').textContent = w + ' / 1200';
-    const fill = document.getElementById('weight-fill');
-    const pct = Math.min(w / 1200 * 100, 100);
-    fill.style.width = pct + '%';
-    fill.style.background = pct > 85 ? '#fc8181' : pct > 60 ? '#f6ad55' : '#68d391';
+  /* equity */
+  const eq = daily.current_equity;
+  document.getElementById('equity').textContent = eq.toFixed(2) + ' USDT';
+  const chg = daily.net_change;
+  const ce = document.getElementById('equity-change');
+  ce.textContent = 'vs. awal: ' + (chg >= 0 ? '+' : '') + chg.toFixed(4) + ' USDT';
+  ce.style.color = chg >= 0 ? '#68d391' : '#fc8181';
 
-    const tbody = document.getElementById('positions-body');
-    if (!positions.length) {
-      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">📭 Tidak ada posisi terbuka</td></tr>';
-      return;
-    }
+  /* counters */
+  document.getElementById('open-pos').textContent = status.open_positions;
+  document.getElementById('max-pos').textContent = `max ${status.max_positions} slot`;
+  const wle = document.getElementById('winloss');
+  wle.textContent = daily.wins + 'W / ' + daily.losses + 'L';
+  wle.className = 'card-value ' + (daily.wins > daily.losses ? 'green' : daily.losses > daily.wins ? 'red' : '');
+  document.getElementById('trades-opened').textContent = daily.trades_opened + ' trade dibuka';
+  document.getElementById('pairs').textContent = status.pairs_scanned;
+
+  /* weight bar */
+  const w = status.api_weight_1m;
+  document.getElementById('api-weight').textContent = w + ' / 1200';
+  const pct = Math.min(w / 1200 * 100, 100);
+  const fill = document.getElementById('weight-fill');
+  fill.style.width = pct + '%';
+  fill.style.background = pct > 85 ? '#fc8181' : pct > 60 ? '#f6ad55' : '#68d391';
+
+  /* positions table */
+  const tbody = document.getElementById('positions-body');
+  if (!positions.length) {
+    tbody.innerHTML = '<tr><td colspan="8" class="empty-state">📭 Tidak ada posisi terbuka</td></tr>';
+  } else {
     tbody.innerHTML = positions.map(p => {
       const upct = p.unrealized_pct;
       const cl = upct > 0 ? 'green' : upct < 0 ? 'red' : '';
-      const trailBadge = p.trailing_active ? '<span class="trail-badge">📈 Trail</span>' : '';
+      const pills = [
+        p.trailing_active ? '<span class="pill pill-trail">📈 Trail</span>' : '',
+        p.breakeven_done  ? '<span class="pill pill-be">🛡️ BE</span>'       : '',
+        p.partial_tp_done ? '<span class="pill pill-ptp">🎯 PTP</span>'     : '',
+      ].join('');
       const opened = p.opened_at ? p.opened_at.replace('T',' ').slice(0,16)+' UTC' : '—';
       return `<tr>
-        <td><strong>${p.symbol}</strong></td>
+        <td><strong>${p.symbol}</strong><br><span style="font-size:0.68rem;color:#718096">${p.asset_group||''}</span></td>
         <td>${p.entry_price}</td>
         <td class="green">${p.tp_price}</td>
         <td class="red">${p.sl_price}</td>
         <td>${p.highest_price}</td>
-        <td class="${cl}">${upct >= 0 ? '+' : ''}${upct}%</td>
-        <td style="font-size:0.75rem;color:#718096">${opened}</td>
-        <td>${trailBadge}</td>
+        <td class="${cl}" style="font-weight:600">${upct >= 0 ? '+' : ''}${upct}%</td>
+        <td style="font-size:0.72rem;color:#718096">${opened}</td>
+        <td>${pills || '<span style="color:#4a5568">—</span>'}</td>
       </tr>`;
     }).join('');
-  } catch(e) { console.error(e); }
+  }
+
+  /* timestamp */
+  const now = new Date().toLocaleString('id-ID');
+  document.getElementById('refresh-ts').textContent = 'Update: ' + new Date().toLocaleTimeString('id-ID');
+  document.getElementById('footer-ts').textContent = now;
 }
-load();
+
+async function loadHistory() {
+  try {
+    const h = await fetch('/api/history').then(r=>r.json());
+
+    /* Kelly card */
+    document.getElementById('kelly-mult').textContent = h.kelly_mult + '×';
+    document.getElementById('kelly-wr').textContent =
+      `WR ${h.kelly_wr}% dari ${h.daily_pnl.reduce((s,d)=>s+d.wins+d.losses,0)} trade`;
+
+    /* Equity curve */
+    const eqD = h.equity_history;
+    document.getElementById('equity-note').textContent =
+      eqD.length > 1 ? `${eqD.length} snapshot` : 'Butuh >1 jam untuk muncul';
+    if (eqD.length > 1) {
+      const labels = eqD.map(d => d.timestamp.slice(5,16).replace('T',' '));
+      const vals   = eqD.map(d => d.equity);
+      if (equityInst) equityInst.destroy();
+      equityInst = new Chart(document.getElementById('equityChart'), {
+        type: 'line',
+        data: { labels, datasets: [{
+          data: vals, borderColor: '#63b3ed',
+          backgroundColor: 'rgba(99,179,237,0.07)',
+          borderWidth: 2, pointRadius: 2, tension: 0.3, fill: true,
+        }]},
+        options: CHART_DEFAULTS,
+      });
+    }
+
+    /* Daily PnL bars */
+    const pnlD = h.daily_pnl;
+    document.getElementById('pnl-note').textContent =
+      pnlD.length ? `${pnlD.length} hari tercatat` : 'Belum ada trade closed';
+    if (pnlD.length) {
+      const labels = pnlD.map(d => d.date.slice(5));
+      const vals   = pnlD.map(d => parseFloat(d.pnl)||0);
+      const colors = vals.map(v => v >= 0 ? 'rgba(104,211,145,0.75)' : 'rgba(252,129,129,0.75)');
+      if (pnlInst) pnlInst.destroy();
+      pnlInst = new Chart(document.getElementById('pnlChart'), {
+        type: 'bar',
+        data: { labels, datasets: [{
+          data: vals, backgroundColor: colors, borderRadius: 5,
+        }]},
+        options: CHART_DEFAULTS,
+      });
+    }
+  } catch(e) { console.error('History:', e); }
+}
+
+(async () => { await loadStatus(); await loadHistory(); })();
+setInterval(loadStatus,  30_000);   /* status refresh 30s */
+setInterval(loadHistory, 300_000);  /* chart refresh 5 menit */
 </script>
 </body>
 </html>"""
@@ -2449,12 +2777,249 @@ def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
         logger.warning(f"Trailing SL gagal untuk {symbol}: {e}")
 
 
+# ---------------------------------------------------------------------------
+# ─── BREAKEVEN STOP LOSS ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _check_breakeven_sl(symbol: str, pos: dict, current_price: float) -> None:
+    """Pindahkan SL ke entry price saat profit ≥ BREAKEVEN_ACTIVATE_PCT (default 0.5%).
+
+    Efek: setelah breakeven aktif, posisi ini tidak akan pernah rugi dari SL.
+    Hanya dilakukan sekali per posisi (ditandai 'breakeven_done').
+    Tidak dilakukan kalau trailing SL sudah aktif (SL sudah di atas entry).
+    """
+    if not BREAKEVEN_ENABLED:
+        return
+    if not (LIVE_MODE and BINANCE_API_KEY):
+        return
+    if pos.get("breakeven_done"):
+        return
+
+    entry_price = pos.get("entry_price", 0)
+    if entry_price <= 0 or current_price <= 0:
+        return
+
+    profit_pct = (current_price / entry_price - 1) * 100
+    if profit_pct < BREAKEVEN_ACTIVATE_PCT:
+        return
+
+    current_sl = pos.get("sl_price", 0)
+    # Kalau SL sudah >= entry (dari trailing), tandai breakeven done dan keluar
+    if current_sl >= entry_price * 0.9999:
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["breakeven_done"] = True
+        return
+
+    logger.info(
+        f"🛡️ Breakeven SL {symbol}: pindah SL {current_sl:.8f} → entry {entry_price:.8f} "
+        f"(profit={profit_pct:.2f}%)"
+    )
+
+    try:
+        qty = pos.get("qty", 0)
+        tp_price = pos.get("tp_price", 0)
+        if not qty or not tp_price:
+            return
+
+        f_info = get_symbol_filters(symbol)
+        tick = f_info.get("tickSize", 0.00000001)
+        step = f_info.get("stepSize", 0.00001)
+        rounded_qty = _round_step(qty, step)
+        rounded_sl = _round_price(entry_price, tick)
+        # SL limit sedikit di bawah stop price supaya order bisa terisi
+        rounded_sl_limit = _round_price(entry_price * 0.999, tick)
+        rounded_tp = _round_price(tp_price, tick)
+
+        # Cancel OCO lama, pasang OCO baru dengan SL di entry
+        cancel_oco_orders(symbol, pos)
+        time.sleep(0.3)
+
+        client = make_binance_client()
+        oco = client.create_oco_order(
+            symbol=symbol,
+            side="SELL",
+            quantity=rounded_qty,
+            price=str(rounded_tp),
+            stopPrice=str(rounded_sl),
+            stopLimitPrice=str(rounded_sl_limit),
+            stopLimitTimeInForce="GTC",
+        )
+        reports = oco.get("orderReports", [])
+        new_tp_id = next(
+            (r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None
+        )
+        new_sl_id = next(
+            (r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None
+        )
+
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["sl_price"]       = rounded_sl
+                open_positions[symbol]["tp_order_id"]    = new_tp_id
+                open_positions[symbol]["sl_order_id"]    = new_sl_id
+                open_positions[symbol]["order_list_id"]  = oco.get("orderListId")
+                open_positions[symbol]["breakeven_done"] = True
+        save_state()
+
+        send_telegram_message(
+            f"🛡️ *Breakeven SL aktif — `{symbol}`*\n\n"
+            f"Profit saat ini : `{profit_pct:+.2f}%`\n"
+            f"SL dipindah ke  : `{rounded_sl:.8f}` \\(= entry price\\)\n"
+            f"TP tetap        : `{rounded_tp:.8f}`\n\n"
+            f"_Posisi ini tidak akan rugi dari SL sekarang\\._",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
+        )
+        logger.info(f"✅ Breakeven SL aktif untuk {symbol}")
+
+    except Exception as e:
+        logger.warning(f"Breakeven SL gagal untuk {symbol}: {e}")
+
+
+# ---------------------------------------------------------------------------
+# ─── PARTIAL TAKE PROFIT ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
+    """Tutup 50% posisi saat profit mencapai 50% jarak ke TP (configurable).
+
+    Contoh: entry=100, TP=104, trigger saat harga ≥ 102 (50% dari 4 USDT gap).
+    → Jual 50% via market sell, update OCO untuk sisa 50%.
+    Sisa posisi dibiarkan dengan trailing SL ke TP penuh.
+    """
+    if not PARTIAL_TP_ENABLED:
+        return
+    if not (LIVE_MODE and BINANCE_API_KEY):
+        return
+    if pos.get("partial_tp_done"):
+        return
+
+    entry_price = pos.get("entry_price", 0)
+    tp_price    = pos.get("tp_price", 0)
+    if entry_price <= 0 or tp_price <= 0:
+        return
+
+    tp_distance   = tp_price - entry_price
+    trigger_price = entry_price + tp_distance * PARTIAL_TP_TRIGGER_RATIO
+
+    if current_price < trigger_price:
+        return
+
+    qty = pos.get("qty", 0)
+    if not qty:
+        return
+
+    f_info         = get_symbol_filters(symbol)
+    step           = f_info.get("stepSize", 0.00001)
+    tick           = f_info.get("tickSize", 0.00000001)
+    min_notional   = f_info.get("minNotional", 0) or 0
+    min_qty        = f_info.get("minQty", 0)
+
+    sell_qty      = _round_step(qty * PARTIAL_TP_RATIO, step)
+    sell_qty      = max(sell_qty, min_qty)
+    remaining_qty = _round_step(qty - sell_qty, step)
+
+    # Cek sisa qty masih memenuhi MIN_NOTIONAL
+    if remaining_qty <= 0 or (remaining_qty * current_price) < min_notional:
+        logger.debug(f"Partial TP {symbol}: sisa qty terlalu kecil, skip")
+        return
+
+    profit_pct = (current_price / entry_price - 1) * 100
+    logger.info(
+        f"🎯 Partial TP {symbol}: profit={profit_pct:.2f}%, jual {sell_qty} dari {qty}, "
+        f"sisa {remaining_qty}"
+    )
+
+    try:
+        # Tandai dulu supaya tidak double-trigger dari thread lain
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["partial_tp_done"] = True
+            else:
+                return  # posisi sudah tutup
+
+        # Step 1: Cancel OCO lama supaya tidak konflik dengan partial sell
+        cancel_oco_orders(symbol, pos)
+        time.sleep(0.3)
+
+        # Step 2: Market sell sebagian
+        fill_info = execute_binance(symbol, "SELL", sell_qty)
+        fills = fill_info.get("fills", [])
+        if fills:
+            total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
+            total_qty_f = sum(float(f["qty"]) for f in fills)
+            exit_price  = total_quote / total_qty_f if total_qty_f else current_price
+        else:
+            exit_price = float(fill_info.get("price", current_price) or current_price)
+
+        pnl_partial = (exit_price - entry_price) * sell_qty
+        pnl_pct     = (exit_price / entry_price - 1) * 100
+
+        log_trade(symbol, "SELL", sell_qty, exit_price, 0,
+                  f"Partial TP {PARTIAL_TP_RATIO*100:.0f}% dari posisi",
+                  "PARTIAL_TP", str(fill_info.get("orderId", "")),
+                  extra={"pnl": round(pnl_partial, 4), "pnl_pct": round(pnl_pct, 3)})
+
+        # Step 3: Pasang OCO baru untuk sisa qty dengan SL yang sudah ada
+        current_sl    = pos.get("sl_price", entry_price * 0.99)
+        rounded_sl    = _round_price(current_sl, tick)
+        rounded_sl_l  = _round_price(current_sl * 0.999, tick)
+        rounded_tp    = _round_price(tp_price, tick)
+        rounded_rem   = _round_step(remaining_qty, step)
+
+        client = make_binance_client()
+        oco = client.create_oco_order(
+            symbol=symbol,
+            side="SELL",
+            quantity=rounded_rem,
+            price=str(rounded_tp),
+            stopPrice=str(rounded_sl),
+            stopLimitPrice=str(rounded_sl_l),
+            stopLimitTimeInForce="GTC",
+        )
+        reports    = oco.get("orderReports", [])
+        new_tp_id  = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
+        new_sl_id  = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["qty"]            = remaining_qty
+                open_positions[symbol]["tp_order_id"]    = new_tp_id
+                open_positions[symbol]["sl_order_id"]    = new_sl_id
+                open_positions[symbol]["order_list_id"]  = oco.get("orderListId")
+        save_state()
+
+        saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+        send_telegram_message(
+            f"🎯 *Partial TP — `{symbol}`*\n\n"
+            f"Profit saat ini  : `{profit_pct:+.2f}%`\n"
+            f"Qty dijual       : `{sell_qty}` \\({PARTIAL_TP_RATIO*100:.0f}% posisi\\)\n"
+            f"Harga exit       : `{exit_price:.8f}`\n"
+            f"PnL partial      : `{pnl_partial:+.4f} USDT`\n"
+            f"Saldo USDT       : `{saldo_after:.4f}`\n\n"
+            f"Sisa `{remaining_qty}` qty masih terbuka menuju TP = `{tp_price}`\n"
+            f"_Profit sebagian sudah dikunci\\!_",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
+        )
+        logger.info(f"✅ Partial TP berhasil {symbol}: jual {sell_qty}, sisa {remaining_qty}")
+
+    except Exception as e:
+        # Rollback flag kalau gagal supaya bisa dicoba lagi cycle berikutnya
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["partial_tp_done"] = False
+        logger.warning(f"Partial TP gagal untuk {symbol}: {e}")
+
+
 def position_monitor_loop() -> None:
     """Cek berkala apakah ada posisi yang ditutup lewat TP/SL, dan:
-    - Update trailing stop loss kalau harga naik
+    - Breakeven SL: pindahkan SL ke entry saat profit ≥ 0.5%
+    - Partial TP: tutup 50% posisi saat profit mencapai 50% jarak ke TP
+    - Trailing SL: geser SL naik seiring harga naik
     - Deteksi sinyal reversal → early exit sebelum SL kena
-    - Kirim laporan profit/loss harian otomatis (DAILY_REPORT_HOUR_UTC)."""
-    global daily_report_sent_date
+    - Laporan harian otomatis 23:55 WIB + reset equity di tengah malam
+    """
+    global daily_report_sent_date, daily_start_equity
     while True:
         try:
             with positions_lock:
@@ -2468,33 +3033,59 @@ def position_monitor_loop() -> None:
                 with positions_lock:
                     if symbol not in open_positions:
                         continue
-                    # Refresh pos snapshot setelah _check_position_close
-                    pos = dict(open_positions[symbol])
+                    pos = dict(open_positions[symbol])  # refresh snapshot
 
-                # ── 2. Trailing Stop Loss — geser SL naik seiring profit ─────
-                if LIVE_MODE and BINANCE_API_KEY and not pos.get("reversal_exits_attempted", 0):
+                # ── 2. Ambil harga terkini (sekali, dipakai oleh step 2-4) ──
+                current_price = None
+                if LIVE_MODE and BINANCE_API_KEY:
                     try:
-                        # Ambil harga terkini dari candle 1m terakhir (lebih murah weight)
-                        df_trail = fetch_market(symbol, "1m", 2)
-                        if df_trail is not None and len(df_trail) >= 1:
-                            current_price = float(df_trail.iloc[-1]["close"])
-                            _update_trailing_sl(symbol, pos, current_price)
+                        df_live = fetch_market(symbol, "1m", 2)
+                        if df_live is not None and len(df_live) >= 1:
+                            current_price = float(df_live.iloc[-1]["close"])
+                    except Exception as e:
+                        logger.debug(f"Fetch harga live {symbol}: {e}")
+
+                if current_price is None:
+                    continue  # skip semua monitoring kalau tidak bisa ambil harga
+
+                if not pos.get("reversal_exits_attempted", 0):
+                    # ── 2a. Breakeven SL ─────────────────────────────────────
+                    try:
+                        _check_breakeven_sl(symbol, pos, current_price)
+                        with positions_lock:
+                            if symbol not in open_positions:
+                                continue
+                            pos = dict(open_positions[symbol])
+                    except Exception as e:
+                        logger.debug(f"Breakeven SL check error {symbol}: {e}")
+
+                    # ── 2b. Partial Take Profit ──────────────────────────────
+                    try:
+                        _check_partial_tp(symbol, pos, current_price)
+                        with positions_lock:
+                            if symbol not in open_positions:
+                                continue
+                            pos = dict(open_positions[symbol])
+                    except Exception as e:
+                        logger.debug(f"Partial TP check error {symbol}: {e}")
+
+                    # ── 2c. Trailing Stop Loss ───────────────────────────────
+                    try:
+                        _update_trailing_sl(symbol, pos, current_price)
+                        with positions_lock:
+                            if symbol not in open_positions:
+                                continue
+                            pos = dict(open_positions[symbol])
                     except Exception as e:
                         logger.debug(f"Trailing SL check error {symbol}: {e}")
-
-                    # Refresh pos setelah trailing update
-                    with positions_lock:
-                        if symbol not in open_positions:
-                            continue
-                        pos = dict(open_positions[symbol])
 
                 # ── 3. Guard: jangan coba early exit lebih dari 1 kali ──────
                 if pos.get("reversal_exits_attempted", 0) >= 1:
                     continue
 
-                # ── 4. Ambil candle segar & cek reversal ────────────────────
+                # ── 4. Cek reversal untuk early exit ─────────────────────────
                 if not (LIVE_MODE and BINANCE_API_KEY):
-                    continue  # reversal exit hanya di mode LIVE
+                    continue
 
                 try:
                     df_fresh = fetch_market(symbol, "1m", 30)
@@ -2504,27 +3095,35 @@ def position_monitor_loop() -> None:
 
                     is_rev, rev_reason = detect_reversal(df_fresh)
                     if is_rev:
-                        # Tandai dulu agar thread lain tidak ikut masuk
                         with positions_lock:
                             if symbol in open_positions:
                                 open_positions[symbol]["reversal_exits_attempted"] = 1
                             else:
-                                continue  # sudah ditutup thread lain
-
+                                continue
                         logger.warning(
-                            f"🔄 Reversal terdeteksi pada posisi terbuka {symbol}: {rev_reason}"
+                            f"🔄 Reversal terdeteksi {symbol}: {rev_reason}"
                         )
                         emergency_close_position(symbol, pos, rev_reason)
 
                 except Exception as e:
                     logger.warning(f"Reversal check error {symbol}: {e}")
 
-            # ── 5. Laporan harian ────────────────────────────────────────────
+            # ── 5. Laporan harian: 23:55 WIB (= 16:55 UTC) ───────────────────
             now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
-            if now.hour == DAILY_REPORT_HOUR_UTC and daily_report_sent_date != today_str:
+            if (now.hour == DAILY_REPORT_HOUR_UTC and now.minute >= 55
+                    and daily_report_sent_date != today_str):
                 send_daily_report(today_str)
                 daily_report_sent_date = today_str
+
+            # ── 6. Reset equity awal hari di tengah malam WIB (17:00 UTC) ───
+            if now.hour == 17 and now.minute < 1 and daily_report_sent_date == today_str:
+                if LIVE_MODE and BINANCE_API_KEY:
+                    new_equity = get_binance_equity()
+                    if new_equity > 0:
+                        daily_start_equity = new_equity
+                        logger.info(f"🔄 Equity awal hari baru: {daily_start_equity:.4f} USDT")
+                        db_save_equity_snapshot(new_equity)
 
         except Exception as e:
             logger.error(f"position_monitor_loop error: {e}")
@@ -2632,20 +3231,56 @@ def log_trade(symbol, side, qty, price, confidence, reason, result,
         "live_mode":  LIVE_MODE,
         **(extra or {}),
     }
+    # Tulis ke trades.log (backward compat)
     with trades_log_lock:
         with open(TRADES_LOG, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(record) + "\n")
+    # Tulis ke SQLite (analisis historis + chart)
+    db_insert_trade(record)
     logger.info(f"Log: {result} | {side} {symbol} @ {price} | conf={confidence}%")
 
 # ---------------------------------------------------------------------------
 # ─── 7. MANAJEMEN RISIKO ────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
+def get_recent_win_rate(lookback: int = 20) -> float:
+    """Hitung win rate dari N trade closed terakhir di SQLite.
+    Return 0.5 (netral) kalau data tidak cukup (< 5 trade)."""
+    trades = db_get_recent_trades(lookback)
+    if len(trades) < 5:
+        return 0.5  # netral — tidak cukup data
+    wins = sum(1 for t in trades if t.get("result") == "CLOSED_TP"
+               or (t.get("result") == "EARLY_EXIT" and (t.get("pnl") or 0) >= 0))
+    return wins / len(trades)
+
+
+def _kelly_multiplier() -> float:
+    """Kelly Criterion lite: skala qty antara 0.5× – 1.5× berdasarkan win rate terkini.
+    Hanya aktif kalau KELLY_SIZING_ENABLED=true dan ada cukup data historis."""
+    if not KELLY_SIZING_ENABLED:
+        return 1.0
+    wr = get_recent_win_rate(KELLY_LOOKBACK)
+    # Scale: WR ≥ 70% → 1.5×, WR 55-70% → 1.0×, WR 40-55% → 0.75×, WR < 40% → 0.5×
+    if wr >= 0.70:
+        mult = 1.5
+    elif wr >= 0.55:
+        mult = 1.0
+    elif wr >= 0.40:
+        mult = 0.75
+    else:
+        mult = 0.5
+    logger.debug(f"Kelly mult={mult:.2f}× (WR terkini={wr*100:.0f}% dari {KELLY_LOOKBACK} trade)")
+    return mult
+
+
 def calc_quantity(current_price: float, atr: float,
                   equity: float = 10_000.0, symbol: str = "") -> float:
     max_loss  = equity * MAX_EXPOSURE_PCT
     stop_dist = atr if atr > 0 else current_price * 0.01
     raw_qty   = max(max_loss / stop_dist, 0.0)
+
+    # Terapkan Kelly multiplier (skala berdasarkan win rate terkini)
+    raw_qty *= _kelly_multiplier()
 
     if symbol:
         f = get_symbol_filters(symbol)
@@ -2666,17 +3301,48 @@ def qty_is_tradable(symbol: str, qty: float, price: float) -> bool:
 
 
 def check_daily_loss(equity_now: float) -> bool:
-    global LIVE_MODE
+    """Cek dua level perlindungan equity:
+    1. HARD STOP (HARD_STOP_LOSS_PCT, default 3%) → pause bot, masih bisa resume manual
+    2. DAILY LIMIT (DAILY_LOSS_LIMIT_PCT, default 5%) → matikan LIVE_MODE, perlu restart
+    Return False berarti jangan eksekusi order baru."""
+    global LIVE_MODE, bot_paused
     if daily_start_equity <= 0 or equity_now <= 0:
         return True
-    if equity_now < daily_start_equity * (1 - DAILY_LOSS_LIMIT_PCT):
-        logger.warning("⛔ Daily loss limit 5% tercapai – LIVE_MODE dimatikan")
+
+    loss_pct = (1 - equity_now / daily_start_equity) * 100
+
+    # Level 1: Hard stop — pause bot, bisa resume manual
+    if loss_pct >= HARD_STOP_LOSS_PCT and not bot_paused:
+        logger.warning(
+            f"🚨 Hard stop daily loss {loss_pct:.2f}% (threshold {HARD_STOP_LOSS_PCT}%) — bot di-PAUSE"
+        )
+        with bot_paused_lock:
+            bot_paused = True
+        send_telegram_message(
+            f"🚨 *HARD STOP — Daily Loss {loss_pct:.2f}%\\!*\n\n"
+            f"Equity sekarang : `{equity_now:.4f} USDT`\n"
+            f"Equity awal     : `{daily_start_equity:.4f} USDT`\n"
+            f"Penurunan       : `{loss_pct:.2f}%` \\(threshold `{HARD_STOP_LOSS_PCT}%`\\)\n\n"
+            f"⏸ *Bot otomatis di\\-pause\\.*\n"
+            f"Posisi terbuka masih dipantau \\(trailing/TP/SL tetap jalan\\)\\.\n"
+            f"Ketik `/resume` untuk lanjutkan trading setelah situasi membaik\\.",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
+        )
+
+    # Level 2: Daily limit — matikan LIVE_MODE (perlu restart bot)
+    if loss_pct >= DAILY_LOSS_LIMIT_PCT * 100:
+        logger.warning(
+            f"⛔ Daily loss limit {DAILY_LOSS_LIMIT_PCT*100:.0f}% tercapai — LIVE_MODE dimatikan"
+        )
         LIVE_MODE = False
-        send_trend_message(
-            "⛔ *Bot ditangguhkan* – daily loss limit 5% tercapai\\. LIVE\\_MODE dimatikan\\."
+        send_telegram_message(
+            f"⛔ *Bot ditangguhkan total — daily loss limit {DAILY_LOSS_LIMIT_PCT*100:.0f}% tercapai\\.*\n"
+            f"LIVE\\_MODE dimatikan\\. Perlu restart manual\\.",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
         )
         return False
-    return True
+
+    return not bot_paused  # kalau paused (hard stop), jangan eksekusi order baru
 
 
 def _in_cooldown(symbol: str) -> bool:
@@ -2900,11 +3566,91 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
             )
 
 # ---------------------------------------------------------------------------
+# ─── HEALTH MONITOR ──────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def health_monitor_loop() -> None:
+    """Monitor kesehatan bot setiap 5 menit:
+    1. Alert Telegram kalau tidak ada sinyal AI > HEALTH_NO_SIGNAL_HOURS jam
+    2. Alert Telegram kalau equity drop > HEALTH_EQUITY_DROP_PCT% dari awal hari
+    3. Simpan equity snapshot ke SQLite setiap jam (untuk equity curve chart)
+    """
+    global _last_equity_snapshot_time
+    last_no_signal_alert = 0.0
+    last_equity_alert    = 0.0
+
+    while True:
+        try:
+            now = time.time()
+
+            # ── 1. Alert kalau bot diam terlalu lama ──────────────────────────
+            with _last_signal_lock:
+                last_sig = _last_signal_time
+            since_hours = (now - last_sig) / 3600
+
+            with bot_paused_lock:
+                paused = bot_paused
+
+            # Alert max 1x per jam, dan hanya kalau bot tidak sedang di-pause
+            if (since_hours >= HEALTH_NO_SIGNAL_HOURS
+                    and not paused
+                    and (now - last_no_signal_alert) >= 3600):
+                with pairs_lock:
+                    n_pairs = len(active_pairs)
+                send_telegram_message(
+                    f"⚠️ *Alert: Bot sudah `{since_hours:.1f}` jam tanpa sinyal AI\\!*\n\n"
+                    f"Kemungkinan penyebab:\n"
+                    f"• Semua pair tidak lolos pre\\-filter \\(pasar sangat sideways\\)\n"
+                    f"• Confidence AI selalu di bawah `{CONFIDENCE_THRESHOLD}%`\n"
+                    f"• Rate limit Groq atau Claude \\(cek log\\)\n\n"
+                    f"_Bot masih aktif memindai `{n_pairs}` pair\\._",
+                    topic_id=TELEGRAM_REPORT_TOPIC_ID,
+                )
+                last_no_signal_alert = now
+                logger.warning(f"⚠️ Health alert: {since_hours:.1f}j tanpa sinyal")
+
+            # ── 2. Alert equity drop + simpan snapshot ───────────────────────
+            if LIVE_MODE and BINANCE_API_KEY and daily_start_equity > 0:
+                try:
+                    equity = get_binance_equity()
+                    if equity > 0:
+                        drop_pct = (daily_start_equity - equity) / daily_start_equity * 100
+
+                        if drop_pct >= HEALTH_EQUITY_DROP_PCT and (now - last_equity_alert) >= 3600:
+                            with bot_paused_lock:
+                                is_paused = bot_paused
+                            send_telegram_message(
+                                f"🚨 *Alert: Equity turun `{drop_pct:.2f}%` hari ini\\!*\n\n"
+                                f"Equity awal    : `{daily_start_equity:.4f} USDT`\n"
+                                f"Equity sekarang: `{equity:.4f} USDT`\n"
+                                f"Penurunan      : `{drop_pct:.2f}%`\n\n"
+                                f"Hard stop di `{HARD_STOP_LOSS_PCT}%` — "
+                                f"{'⏸ bot sudah di\\-pause' if is_paused else f'⚠️ belum tercapai \\(masih {HARD_STOP_LOSS_PCT - drop_pct:.1f}% lagi\\)'}\\.",
+                                topic_id=TELEGRAM_REPORT_TOPIC_ID,
+                            )
+                            last_equity_alert = now
+                            logger.warning(f"🚨 Health alert: equity turun {drop_pct:.2f}%")
+
+                        # Simpan equity snapshot ke SQLite setiap jam
+                        if (now - _last_equity_snapshot_time) >= 3600:
+                            db_save_equity_snapshot(equity)
+                            _last_equity_snapshot_time = now
+                            logger.debug(f"💾 Equity snapshot: {equity:.4f} USDT")
+
+                except Exception as e:
+                    logger.debug(f"Health equity check error: {e}")
+
+        except Exception as e:
+            logger.warning(f"health_monitor_loop error: {e}")
+
+        time.sleep(300)  # cek setiap 5 menit
+
+# ---------------------------------------------------------------------------
 # ─── 9. MAIN LOOP ───────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
 def main_loop():
-    global daily_start_equity
+    global daily_start_equity, _last_signal_time
     # Load posisi tersimpan sebelum mulai loop
     load_state()
 
@@ -3040,6 +3786,9 @@ def main_loop():
                         funding=funding, oi_change=oi_change,
                     )
                     ai_calls_this_cycle += 1
+                    # Perbarui timestamp sinyal terakhir (untuk health monitor)
+                    with _last_signal_lock:
+                        _last_signal_time = time.time()
                     decision   = signal["decision"]
                     confidence = signal["confidence"]
                     reason     = signal["reason"]
@@ -3111,6 +3860,9 @@ if __name__ == "__main__":
         logger.error("❌ BINANCE_API_KEY dan BINANCE_API_SECRET wajib diisi saat LIVE_MODE = True")
         raise SystemExit(1)
 
+    # Inisialisasi SQLite database (buat tabel trades + equity_snapshots)
+    init_db()
+
     # Ambil daftar pair pertama kali sebelum mulai
     refresh_pairs()
 
@@ -3129,6 +3881,9 @@ if __name__ == "__main__":
 
     # Ambil berita crypto/market pertama kali sebelum mulai, lalu refresh berkala
     threading.Thread(target=news_refresher_loop, daemon=True).start()
+
+    # Monitor kesehatan bot (no-signal alert, equity drop alert, equity snapshot)
+    threading.Thread(target=health_monitor_loop, daemon=True).start()
 
     # Main trading loop
     main_loop()
