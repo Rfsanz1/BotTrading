@@ -107,6 +107,29 @@ TP_ATR_MULT: float = float(os.getenv("TP_ATR_MULT", "4.0"))
 MTF_INTERVALS: list[str] = ["1m", "5m", "15m"]
 MTF_LIMIT: int = 100  # jumlah candle per interval
 
+# ── Trailing Stop Loss ───────────────────────────────────────────────────────
+# Aktifkan trailing SL (geser SL naik seiring harga naik untuk kunci profit)
+TRAILING_SL_ENABLED: bool = os.getenv("TRAILING_SL_ENABLED", "true").lower() in ("1","true","yes")
+# Harga harus naik berapa % dari entry sebelum trailing mulai aktif
+TRAILING_SL_ACTIVATE_PCT: float = float(os.getenv("TRAILING_SL_ACTIVATE_PCT", "1.0"))
+# Trailing SL dipasang berapa % DI BAWAH harga tertinggi yang dicapai
+TRAILING_SL_TRAIL_PCT: float = float(os.getenv("TRAILING_SL_TRAIL_PCT", "0.6"))
+
+# ── Concurrent position limit ────────────────────────────────────────────────
+# Maksimum posisi terbuka sekaligus — mencegah overexposure saat banyak sinyal
+MAX_CONCURRENT_POSITIONS: int = int(os.getenv("MAX_CONCURRENT_POSITIONS", "4"))
+# Maksimum posisi per "grup aset" (BTC-family, ETH-family, dll)
+MAX_POSITIONS_PER_GROUP: int = int(os.getenv("MAX_POSITIONS_PER_GROUP", "2"))
+
+# ── State persistence ────────────────────────────────────────────────────────
+# File untuk menyimpan state posisi terbuka — supaya tidak hilang saat restart
+STATE_FILE: str = os.getenv("STATE_FILE", "trading-bot/bot_state.json")
+
+# ── Binance API weight guard ─────────────────────────────────────────────────
+# Kalau used-weight sudah > threshold ini, tambah delay antar request
+BINANCE_WEIGHT_WARN: int = int(os.getenv("BINANCE_WEIGHT_WARN", "800"))
+BINANCE_WEIGHT_PAUSE: int = int(os.getenv("BINANCE_WEIGHT_PAUSE", "1100"))
+
 # ---------------------------------------------------------------------------
 # ─── ENVIRONMENT VARIABLES ──────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -160,6 +183,64 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 TRADES_LOG = "trades.log"
 
+
+# ---------------------------------------------------------------------------
+# ─── STATE PERSISTENCE ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def save_state() -> None:
+    """Simpan state bot (open_positions + seen_news_links) ke disk.
+    Dipanggil setiap kali posisi terbuka / tertutup supaya data tidak hilang
+    saat bot restart karena crash atau update."""
+    try:
+        with positions_lock:
+            positions_snapshot = dict(open_positions)
+        state = {
+            "open_positions": positions_snapshot,
+            "seen_news_links": list(seen_news_links),
+            "saved_at": datetime.now(timezone.utc).isoformat(),
+        }
+        # Tulis ke file temp dulu, lalu rename — atomic write
+        tmp = STATE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+        os.replace(tmp, STATE_FILE)
+        logger.debug(f"💾 State tersimpan: {len(positions_snapshot)} posisi terbuka")
+    except Exception as e:
+        logger.warning(f"Gagal simpan state: {e}")
+
+
+def load_state() -> None:
+    """Load state bot dari disk saat startup — pulihkan posisi terbuka
+    yang ada sebelum bot di-restart."""
+    global seen_news_links
+    if not os.path.exists(STATE_FILE):
+        logger.info("📂 Tidak ada state tersimpan — mulai segar")
+        return
+    try:
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        positions = state.get("open_positions", {})
+        news_links = set(state.get("seen_news_links", []))
+        saved_at = state.get("saved_at", "?")
+        with positions_lock:
+            open_positions.update(positions)
+        seen_news_links.update(news_links)
+        logger.info(
+            f"📂 State di-load: {len(positions)} posisi dipulihkan "
+            f"(tersimpan: {saved_at})"
+        )
+        if positions:
+            pos_list = ", ".join(f"`{s}`" for s in positions)
+            send_telegram_message(
+                f"♻️ *Bot restart — posisi dipulihkan*\n\n"
+                f"Posisi aktif: {pos_list}\n\n"
+                f"_Monitoring TP/SL dilanjutkan otomatis\\._",
+                topic_id=TELEGRAM_REPORT_TOPIC_ID,
+            )
+    except Exception as e:
+        logger.warning(f"Gagal load state: {e}")
+
 # ---------------------------------------------------------------------------
 # ─── GLOBAL STATE ───────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -209,6 +290,14 @@ news_lock = threading.Lock()
 seen_news_links: set[str] = set()
 MAX_NEW_NEWS_PER_CYCLE = 6  # batasi spam kalau tiba-tiba banyak headline baru
 
+# Flag untuk pause/resume trading dari Telegram
+bot_paused: bool = False
+bot_paused_lock = threading.Lock()
+
+# Tracking Binance API weight (dari response header x-mbx-used-weight-1m)
+_api_weight_1m: int = 0
+_api_weight_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # ─── FLASK KEEP-ALIVE ───────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
@@ -219,21 +308,243 @@ flask_app = Flask(__name__)
 def keep_alive():
     return "alive", 200
 
+
+@flask_app.route("/api/status")
 @flask_app.route("/status")
 def status():
     with pairs_lock:
         n_pairs = len(active_pairs)
+    with positions_lock:
+        n_pos = len(open_positions)
+    with bot_paused_lock:
+        paused = bot_paused
+    with _api_weight_lock:
+        weight = _api_weight_1m
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = compute_daily_report(today_str)
     return json.dumps({
-        "live_mode":       LIVE_MODE,
-        "pairs_scanned":   n_pairs,
-        "interval":        CANDLE_INTERVAL,
-        "history_len":     len(conversation_history),
-        "buy_topic":       TELEGRAM_BUY_TOPIC_ID,
-        "sell_topic":      TELEGRAM_SELL_TOPIC_ID,
-        "bull_topic":      TELEGRAM_BULL_TOPIC_ID,
-        "bear_topic":      TELEGRAM_BEAR_TOPIC_ID,
-        "chat_topic":      TELEGRAM_CHAT_TOPIC_ID,
-    }), 200
+        "live_mode":         LIVE_MODE,
+        "testnet":           BINANCE_TESTNET,
+        "paused":            paused,
+        "pairs_scanned":     n_pairs,
+        "interval":          CANDLE_INTERVAL,
+        "open_positions":    n_pos,
+        "max_positions":     MAX_CONCURRENT_POSITIONS,
+        "api_weight_1m":     weight,
+        "trailing_sl":       TRAILING_SL_ENABLED,
+        "confidence_min":    CONFIDENCE_THRESHOLD,
+        "capital_pct":       CAPITAL_ALLOCATION_PCT,
+        "daily_pnl":         daily["total_pnl"],
+        "daily_wins":        daily["wins"],
+        "daily_losses":      daily["losses"],
+        "daily_win_rate":    daily["win_rate"],
+    }), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+
+
+@flask_app.route("/api/positions")
+def api_positions():
+    with positions_lock:
+        snap = dict(open_positions)
+    result = []
+    for sym, pos in snap.items():
+        entry = pos.get("entry_price", 0)
+        tp    = pos.get("tp_price", 0)
+        sl    = pos.get("sl_price", 0)
+        highest = pos.get("highest_price_seen", entry)
+        profit_pct = round((highest / entry - 1) * 100, 2) if entry else 0
+        result.append({
+            "symbol":           sym,
+            "qty":              pos.get("qty", 0),
+            "entry_price":      entry,
+            "tp_price":         tp,
+            "sl_price":         sl,
+            "original_sl":      pos.get("original_sl_price", sl),
+            "highest_price":    highest,
+            "unrealized_pct":   profit_pct,
+            "trailing_active":  pos.get("trailing_sl_active", False),
+            "opened_at":        pos.get("opened_at", ""),
+            "asset_group":      pos.get("asset_group", ""),
+        })
+    return json.dumps(result), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+
+
+@flask_app.route("/api/daily")
+def api_daily():
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    daily = compute_daily_report(today_str)
+    equity = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    daily["current_equity"] = equity
+    daily["start_equity"]   = daily_start_equity
+    daily["net_change"]     = round(equity - daily_start_equity, 4) if daily_start_equity else 0
+    return json.dumps(daily), 200, {"Content-Type": "application/json", "Access-Control-Allow-Origin": "*"}
+
+
+_DASHBOARD_HTML = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Trading Bot Dashboard</title>
+<meta http-equiv="refresh" content="30">
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; }
+  .header { background: linear-gradient(135deg, #1a1f2e 0%, #0f1117 100%);
+            border-bottom: 1px solid #2d3748; padding: 16px 24px;
+            display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 1.4rem; font-weight: 700; }
+  .badge { padding: 3px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+  .badge-live { background: #2d4a22; color: #68d391; }
+  .badge-testnet { background: #4a3922; color: #f6ad55; }
+  .badge-paused { background: #4a2222; color: #fc8181; }
+  .container { max-width: 1100px; margin: 0 auto; padding: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; padding: 16px; }
+  .card-title { font-size: 0.75rem; color: #718096; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 8px; }
+  .card-value { font-size: 1.8rem; font-weight: 700; }
+  .card-sub { font-size: 0.8rem; color: #718096; margin-top: 4px; }
+  .green { color: #68d391; } .red { color: #fc8181; } .yellow { color: #f6ad55; } .blue { color: #63b3ed; }
+  .section-title { font-size: 1rem; font-weight: 600; margin-bottom: 12px; color: #a0aec0; }
+  .positions-table { width: 100%; border-collapse: collapse; margin-bottom: 24px; }
+  .positions-table th { text-align: left; padding: 8px 12px; font-size: 0.75rem; color: #718096; text-transform: uppercase; border-bottom: 1px solid #2d3748; }
+  .positions-table td { padding: 10px 12px; font-size: 0.85rem; border-bottom: 1px solid #1a1f2e; }
+  .positions-table tr:hover { background: #1e2535; }
+  .trail-badge { background: #2d4a22; color: #68d391; padding: 2px 6px; border-radius: 4px; font-size: 0.7rem; }
+  .empty-state { text-align: center; padding: 40px; color: #4a5568; font-size: 0.9rem; }
+  .footer { text-align: center; color: #4a5568; font-size: 0.75rem; padding: 16px; }
+  .weight-bar { height: 6px; background: #2d3748; border-radius: 3px; margin-top: 6px; }
+  .weight-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>🤖 Trading Bot AI</h1>
+  <span id="mode-badge" class="badge"></span>
+  <span id="pause-badge" class="badge badge-paused" style="display:none">⏸ PAUSED</span>
+  <span style="margin-left:auto; font-size:0.8rem; color:#4a5568">Auto-refresh 30s</span>
+</div>
+<div class="container">
+  <div class="grid">
+    <div class="card">
+      <div class="card-title">P&L Hari Ini</div>
+      <div class="card-value" id="daily-pnl">—</div>
+      <div class="card-sub" id="daily-wr">Win rate —</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Saldo USDT</div>
+      <div class="card-value blue" id="equity">—</div>
+      <div class="card-sub" id="equity-change">vs. awal hari —</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Posisi Terbuka</div>
+      <div class="card-value yellow" id="open-pos">—</div>
+      <div class="card-sub" id="max-pos">max — slot</div>
+    </div>
+    <div class="card">
+      <div class="card-title">Win / Loss</div>
+      <div class="card-value" id="winloss">—</div>
+      <div class="card-sub" id="trades-opened">— trade dibuka</div>
+    </div>
+    <div class="card">
+      <div class="card-title">API Weight</div>
+      <div class="card-value" id="api-weight">—</div>
+      <div class="weight-bar"><div class="weight-fill" id="weight-fill" style="width:0%"></div></div>
+    </div>
+    <div class="card">
+      <div class="card-title">Pair Dipindai</div>
+      <div class="card-value blue" id="pairs">—</div>
+      <div class="card-sub">tiap 1m</div>
+    </div>
+  </div>
+
+  <div class="section-title">📂 Posisi Terbuka</div>
+  <table class="positions-table">
+    <thead>
+      <tr>
+        <th>Symbol</th><th>Entry</th><th>TP</th><th>SL</th>
+        <th>Tertinggi</th><th>Unrealized</th><th>Dibuka</th><th>Status</th>
+      </tr>
+    </thead>
+    <tbody id="positions-body">
+      <tr><td colspan="8" class="empty-state">Memuat data...</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="footer">Refresh otomatis tiap 30 detik · Data dari Binance Testnet</div>
+
+<script>
+async function load() {
+  try {
+    const [status, positions, daily] = await Promise.all([
+      fetch('/api/status').then(r=>r.json()),
+      fetch('/api/positions').then(r=>r.json()),
+      fetch('/api/daily').then(r=>r.json()),
+    ]);
+
+    const badge = document.getElementById('mode-badge');
+    badge.textContent = status.testnet ? '🟡 TESTNET' : (status.live_mode ? '🔴 LIVE' : '🔵 Simulasi');
+    badge.className = 'badge ' + (status.testnet ? 'badge-testnet' : 'badge-live');
+    document.getElementById('pause-badge').style.display = status.paused ? '' : 'none';
+
+    const pnl = daily.total_pnl;
+    const pnlEl = document.getElementById('daily-pnl');
+    pnlEl.textContent = (pnl >= 0 ? '+' : '') + pnl.toFixed(4) + ' USDT';
+    pnlEl.className = 'card-value ' + (pnl >= 0 ? 'green' : 'red');
+    document.getElementById('daily-wr').textContent = `WR ${daily.win_rate}% (${daily.wins}W ${daily.losses}L)`;
+
+    const eq = daily.current_equity;
+    document.getElementById('equity').textContent = eq.toFixed(2) + ' USDT';
+    const chg = daily.net_change;
+    const chgEl = document.getElementById('equity-change');
+    chgEl.textContent = 'vs. awal: ' + (chg >= 0 ? '+' : '') + chg.toFixed(4);
+    chgEl.style.color = chg >= 0 ? '#68d391' : '#fc8181';
+
+    document.getElementById('open-pos').textContent = status.open_positions;
+    document.getElementById('max-pos').textContent = `max ${status.max_positions} slot`;
+    document.getElementById('winloss').textContent = daily.wins + 'W / ' + daily.losses + 'L';
+    document.getElementById('trades-opened').textContent = daily.trades_opened + ' trade dibuka';
+    document.getElementById('pairs').textContent = status.pairs_scanned;
+
+    const w = status.api_weight_1m;
+    document.getElementById('api-weight').textContent = w + ' / 1200';
+    const fill = document.getElementById('weight-fill');
+    const pct = Math.min(w / 1200 * 100, 100);
+    fill.style.width = pct + '%';
+    fill.style.background = pct > 85 ? '#fc8181' : pct > 60 ? '#f6ad55' : '#68d391';
+
+    const tbody = document.getElementById('positions-body');
+    if (!positions.length) {
+      tbody.innerHTML = '<tr><td colspan="8" class="empty-state">📭 Tidak ada posisi terbuka</td></tr>';
+      return;
+    }
+    tbody.innerHTML = positions.map(p => {
+      const upct = p.unrealized_pct;
+      const cl = upct > 0 ? 'green' : upct < 0 ? 'red' : '';
+      const trailBadge = p.trailing_active ? '<span class="trail-badge">📈 Trail</span>' : '';
+      const opened = p.opened_at ? p.opened_at.replace('T',' ').slice(0,16)+' UTC' : '—';
+      return `<tr>
+        <td><strong>${p.symbol}</strong></td>
+        <td>${p.entry_price}</td>
+        <td class="green">${p.tp_price}</td>
+        <td class="red">${p.sl_price}</td>
+        <td>${p.highest_price}</td>
+        <td class="${cl}">${upct >= 0 ? '+' : ''}${upct}%</td>
+        <td style="font-size:0.75rem;color:#718096">${opened}</td>
+        <td>${trailBadge}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+load();
+</script>
+</body>
+</html>"""
+
+
+@flask_app.route("/dashboard")
+def dashboard():
+    return _DASHBOARD_HTML, 200, {"Content-Type": "text/html"}
+
 
 def run_flask():
     port = int(os.getenv("PORT", 3000))
@@ -540,16 +851,33 @@ def pairs_refresher_loop() -> None:
 
 def fetch_market(symbol: str, interval: str = CANDLE_INTERVAL,
                   limit: int = CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+    global _api_weight_1m  # diperbarui dari response header Binance
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
 
     for attempt in range(3):
         try:
+            # Guard: periksa API weight sebelum request baru
+            with _api_weight_lock:
+                w = _api_weight_1m
+            if w >= BINANCE_WEIGHT_PAUSE:
+                logger.warning(f"⚠️ API weight kritis ({w}/1200) — tunggu 10s sebelum request")
+                time.sleep(10)
+            elif w >= BINANCE_WEIGHT_WARN:
+                time.sleep(0.5)  # slow down saja
+
             r = requests.get(url, params=params, timeout=10)
+
+            # Catat used-weight dari header Binance
+            weight_hdr = r.headers.get("x-mbx-used-weight-1m")
+            if weight_hdr:
+                with _api_weight_lock:
+                    _api_weight_1m = int(weight_hdr)
+
             if r.status_code == 429:
-                wait = 2 ** attempt
-                logger.warning(f"Rate-limited oleh Binance ({symbol}), coba ulang {wait}s …")
-                time.sleep(wait)
+                retry_after = int(r.headers.get("Retry-After", 30))
+                logger.warning(f"🚫 Rate-limited Binance ({symbol}), tunggu {retry_after}s …")
+                time.sleep(retry_after)
                 continue
             r.raise_for_status()
             raw = r.json()
@@ -570,6 +898,56 @@ def fetch_market(symbol: str, interval: str = CANDLE_INTERVAL,
             time.sleep(1)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# ─── CORRELATION / ASSET GROUP FILTER ────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# Grup aset berdasarkan ekosistem / korelasi tinggi
+_ASSET_GROUPS: dict[str, list[str]] = {
+    "btc":     ["BTC"],
+    "eth":     ["ETH", "WETH"],
+    "bnb":     ["BNB"],
+    "solana":  ["SOL", "BONK", "JTO", "PYTH", "WIF", "BOME", "JUP", "RNDR"],
+    "l2":      ["MATIC", "POL", "ARB", "OP", "STRK", "MANTA", "BLAST"],
+    "defi":    ["UNI", "AAVE", "CRV", "COMP", "MKR", "SNX", "BAL", "1INCH"],
+    "ai":      ["FET", "AGIX", "OCEAN", "RNDR", "TAO", "WLD", "GRT"],
+    "gaming":  ["AXS", "SAND", "MANA", "GALA", "IMX", "PIXEL", "PORTAL"],
+    "meme":    ["DOGE", "SHIB", "PEPE", "FLOKI", "BONK", "WIF", "BOME", "NEIRO"],
+    "xrp":     ["XRP", "XLM"],
+    "ada":     ["ADA", "DOT", "ATOM"],
+    "avax":    ["AVAX"],
+    "link":    ["LINK"],
+}
+
+def _get_asset_group(symbol: str) -> str:
+    """Kembalikan nama grup aset untuk simbol ini (misal 'meme', 'defi', dll.)"""
+    base = symbol.replace("USDT", "")
+    for group, assets in _ASSET_GROUPS.items():
+        if base in assets:
+            return group
+    return f"other_{base[:3]}"  # satu grup unik per aset yang tidak dikenal
+
+
+def _is_position_allowed(symbol: str) -> tuple[bool, str]:
+    """Cek apakah boleh buka posisi baru:
+    1. Total posisi < MAX_CONCURRENT_POSITIONS
+    2. Posisi di grup aset ini < MAX_POSITIONS_PER_GROUP
+    Return (allowed, reason)"""
+    with positions_lock:
+        n_total = len(open_positions)
+        group = _get_asset_group(symbol)
+        n_group = sum(
+            1 for s in open_positions
+            if _get_asset_group(s) == group
+        )
+
+    if n_total >= MAX_CONCURRENT_POSITIONS:
+        return False, f"terlalu banyak posisi terbuka ({n_total}/{MAX_CONCURRENT_POSITIONS})"
+    if n_group >= MAX_POSITIONS_PER_GROUP:
+        return False, f"sudah {n_group} posisi di grup '{group}'"
+    return True, ""
 
 # ---------------------------------------------------------------------------
 # ─── 2. HITUNG INDIKATOR TEKNIKAL ───────────────────────────────────────────
@@ -1240,33 +1618,142 @@ def handle_incoming_message(msg: dict) -> None:
     if cmd in ("/start", "/help"):
         with pairs_lock:
             n_pairs = len(active_pairs)
-        topics_info = (
-            f"\n\n📌 *Topic Config:*\n"
-            f"Buy        : `{TELEGRAM_BUY_TOPIC_ID  or 'belum diset'}`\n"
-            f"Sell       : `{TELEGRAM_SELL_TOPIC_ID or 'belum diset'}`\n"
-            f"Tren naik  : `{TELEGRAM_BULL_TOPIC_ID or 'belum diset'}`\n"
-            f"Tren turun : `{TELEGRAM_BEAR_TOPIC_ID or 'belum diset'}`\n"
-            f"Chat AI    : `{TELEGRAM_CHAT_TOPIC_ID or 'belum diset'}`\n"
-            f"Laporan    : `{TELEGRAM_REPORT_TOPIC_ID or 'belum diset'}`\n"
-            f"Berita     : `{TELEGRAM_NEWS_TOPIC_ID or 'belum diset'}`"
-        )
+        with positions_lock:
+            n_pos = len(open_positions)
+        with bot_paused_lock:
+            paused = bot_paused
+        mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
+        pause_note = "\n⏸ *BOT SEDANG DIPAUSE* — ketik `/resume` untuk lanjut" if paused else ""
         send_telegram_message(
-            "🤖 *Trading Bot AI*\n\n"
-            "Ngobrol bebas dengan AI di topic ini\\.\n"
-            "Tanya kondisi market, strategi, atau analisis kapan saja\\.\n\n"
-            f"*Mode:* {'🔴 LIVE' if LIVE_MODE else '🔵 Simulasi'} | "
-            f"memindai `{n_pairs}` pair setiap `{CANDLE_INTERVAL}`\n"
-            f"*AI Memory:* {len(conversation_history)//2}/{MAX_HISTORY_EXCHANGES} exchange\n\n"
-            "*Perintah:*\n"
-            "`/pairs`   — jumlah pair yang dipindai\n"
+            f"🤖 *Trading Bot AI*{pause_note}\n\n"
+            f"Mode  : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
+            f"Pair  : `{n_pairs}` USDT tiap `{CANDLE_INTERVAL}`\n"
+            f"Posisi: `{n_pos}/{MAX_CONCURRENT_POSITIONS}` terbuka\n"
+            f"AI    : Groq Llama 3\\.1 \\+ Claude Sonnet 5\n\n"
+            "*📊 Perintah trading:*\n"
+            "`/saldo`        — saldo & portfolio akun\n"
+            "`/posisi`       — daftar posisi terbuka\n"
+            "`/laporan`      — laporan P&L hari ini\n"
+            "`/pause`        — hentikan trading sementara\n"
+            "`/resume`       — lanjutkan trading\n"
+            "`/tutup SYMBOL` — paksa tutup posisi \\(misal `/tutup BTCUSDT`\\)\n"
+            "`/tutupall`     — tutup semua posisi terbuka\n\n"
+            "*💬 Perintah lain:*\n"
+            "`/berita`  — headline crypto terbaru\n"
+            "`/pairs`   — jumlah pair dipindai\n"
             "`/history` — cek memory AI\n"
-            "`/reset`   — hapus memory AI\n"
-            "`/laporan` — laporan profit/loss hari ini\n"
-            "`/berita`  — headline crypto/market terbaru"
-            + topics_info,
+            "`/reset`   — hapus memory AI",
             topic_id=thread_id,
             chat_id=chat_id,
         )
+        return
+
+    if cmd in ("/saldo", "/balance", "/wallet"):
+        if not (LIVE_MODE and BINANCE_API_KEY):
+            send_telegram_message("⚠️ Cek saldo hanya tersedia di LIVE\\_MODE\\.", topic_id=thread_id, chat_id=chat_id)
+            return
+        portfolio = get_binance_portfolio()
+        send_telegram_message(format_portfolio_text(portfolio), topic_id=thread_id, chat_id=chat_id)
+        return
+
+    if cmd in ("/posisi", "/positions", "/pos"):
+        with positions_lock:
+            snap = dict(open_positions)
+        if not snap:
+            send_telegram_message(
+                "📭 *Tidak ada posisi terbuka saat ini\\.*",
+                topic_id=thread_id, chat_id=chat_id,
+            )
+            return
+        lines = [f"📂 *Posisi terbuka ({len(snap)}):*\n"]
+        for sym, p in snap.items():
+            entry  = p.get("entry_price", 0)
+            tp     = p.get("tp_price", 0)
+            sl     = p.get("sl_price", 0)
+            qty    = p.get("qty", 0)
+            opened = p.get("opened_at", "?")[:16].replace("T", " ")
+            trailing_note = " 📈trail" if p.get("trailing_sl_active") else ""
+            lines.append(
+                f"• *`{sym}`*{trailing_note}\n"
+                f"  Entry: `{entry}` \\| Qty: `{qty}`\n"
+                f"  TP: `{tp}` \\| SL: `{sl}`\n"
+                f"  Buka: `{opened} UTC`"
+            )
+        send_telegram_message("\n\n".join(lines), topic_id=thread_id, chat_id=chat_id)
+        return
+
+    if cmd == "/pause":
+        if not _is_allowed(chat_id):
+            return
+        with bot_paused_lock:
+            bot_paused = True
+        send_telegram_message(
+            "⏸ *Bot dipause\\.*\n\nTrading dihentikan sementara\\. "
+            "Posisi terbuka tetap dipantau \\(TP/SL/trailing\\)\\.\n"
+            "Ketik `/resume` untuk lanjutkan\\.",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        return
+
+    if cmd == "/resume":
+        if not _is_allowed(chat_id):
+            return
+        with bot_paused_lock:
+            bot_paused = False
+        with pairs_lock:
+            n_pairs = len(active_pairs)
+        send_telegram_message(
+            f"▶️ *Bot dilanjutkan\\!*\n\nMemindai `{n_pairs}` pair kembali\\.",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        return
+
+    if cmd == "/tutupall":
+        if not _is_allowed(chat_id):
+            return
+        with positions_lock:
+            snap = dict(open_positions)
+        if not snap:
+            send_telegram_message("📭 Tidak ada posisi terbuka\\.", topic_id=thread_id, chat_id=chat_id)
+            return
+        send_telegram_message(
+            f"🔄 Menutup *{len(snap)}* posisi terbuka\\.\\.\\.",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        for sym, pos in snap.items():
+            threading.Thread(
+                target=emergency_close_position,
+                args=(sym, pos, "manual /tutupall dari Telegram"),
+                daemon=True,
+            ).start()
+            time.sleep(0.5)
+        return
+
+    if cmd == "/tutup":
+        if not _is_allowed(chat_id):
+            return
+        parts = text.split()
+        if len(parts) < 2:
+            send_telegram_message("⚠️ Format: `/tutup SYMBOL` \\— contoh: `/tutup BTCUSDT`", topic_id=thread_id, chat_id=chat_id)
+            return
+        target_sym = parts[1].upper()
+        with positions_lock:
+            pos = open_positions.get(target_sym)
+        if not pos:
+            send_telegram_message(
+                f"❌ Tidak ada posisi terbuka untuk `{target_sym}`\\.",
+                topic_id=thread_id, chat_id=chat_id,
+            )
+            return
+        send_telegram_message(
+            f"🔄 Menutup posisi `{target_sym}` secara manual\\.\\.\\.",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        threading.Thread(
+            target=emergency_close_position,
+            args=(target_sym, pos, "manual /tutup dari Telegram"),
+            daemon=True,
+        ).start()
         return
 
     if cmd == "/pairs":
@@ -1573,16 +2060,21 @@ def place_oco_sell(symbol: str, qty: float, entry_price: float,
 def register_open_position(symbol: str, qty: float, entry_price: float, oco: dict) -> None:
     with positions_lock:
         open_positions[symbol] = {
-            "qty":           qty,
-            "entry_price":   entry_price,
-            "tp_order_id":   oco.get("_tp_order_id"),
-            "sl_order_id":   oco.get("_sl_order_id"),
-            "tp_price":      oco.get("_tp_price"),
-            "sl_price":      oco.get("_sl_price"),
-            "order_list_id": oco.get("orderListId"),   # untuk cancel OCO sekaligus
-            "opened_at":     datetime.now(timezone.utc).isoformat(),
-            "reversal_exits_attempted": 0,             # guard agar tidak loop
+            "qty":                      qty,
+            "entry_price":              entry_price,
+            "tp_order_id":              oco.get("_tp_order_id"),
+            "sl_order_id":              oco.get("_sl_order_id"),
+            "tp_price":                 oco.get("_tp_price"),
+            "sl_price":                 oco.get("_sl_price"),
+            "original_sl_price":        oco.get("_sl_price"),   # untuk trailing SL
+            "order_list_id":            oco.get("orderListId"),  # untuk cancel OCO sekaligus
+            "opened_at":                datetime.now(timezone.utc).isoformat(),
+            "reversal_exits_attempted": 0,                       # guard agar tidak loop
+            "highest_price_seen":       entry_price,             # tracking untuk trailing SL
+            "trailing_sl_active":       False,                   # apakah trailing sudah aktif
+            "asset_group":              _get_asset_group(symbol),
         }
+    save_state()
 
 
 def cancel_oco_orders(symbol: str, pos: dict) -> bool:
@@ -1769,6 +2261,7 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
 
     with positions_lock:
         open_positions.pop(symbol, None)
+    save_state()
 
 
 def _check_position_close(symbol: str, pos: dict) -> None:
@@ -1840,11 +2333,125 @@ def _check_position_close(symbol: str, pos: dict) -> None:
 
         with positions_lock:
             open_positions.pop(symbol, None)
+        save_state()
         return
+
+
+# ---------------------------------------------------------------------------
+# ─── TRAILING STOP LOSS ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
+    """Cek dan perbarui trailing SL kalau harga sudah naik cukup dari entry.
+
+    Logika:
+    1. Catat harga tertinggi yang pernah dicapai sejak posisi dibuka
+    2. Kalau profit sudah ≥ TRAILING_SL_ACTIVATE_PCT → trailing mulai aktif
+    3. Trailing SL = highest_price × (1 - TRAILING_SL_TRAIL_PCT/100)
+    4. Kalau SL baru > SL lama → cancel OCO lama, pasang OCO baru dengan SL lebih tinggi
+    """
+    if not TRAILING_SL_ENABLED:
+        return
+    if not (LIVE_MODE and BINANCE_API_KEY):
+        return  # trailing hanya di live mode
+
+    entry_price = pos.get("entry_price", 0)
+    if entry_price <= 0 or current_price <= 0:
+        return
+
+    profit_pct = (current_price / entry_price - 1) * 100
+
+    # Update highest price seen
+    highest = pos.get("highest_price_seen", entry_price)
+    if current_price > highest:
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["highest_price_seen"] = current_price
+        highest = current_price
+
+    # Trailing belum aktif kalau profit masih di bawah threshold
+    if profit_pct < TRAILING_SL_ACTIVATE_PCT:
+        return
+
+    # Hitung trailing SL baru
+    new_sl = highest * (1 - TRAILING_SL_TRAIL_PCT / 100)
+    old_sl = pos.get("sl_price", 0)
+
+    # Hanya geser SL ke atas — tidak pernah turun
+    if new_sl <= old_sl + 0.0000001:
+        return
+
+    # Tandai trailing aktif (pertama kali)
+    first_activation = not pos.get("trailing_sl_active", False)
+
+    logger.info(
+        f"📈 Trailing SL {symbol}: SL lama={old_sl:.8f} → baru={new_sl:.8f} "
+        f"(highest={highest:.8f}, profit={profit_pct:.2f}%)"
+    )
+
+    try:
+        qty = pos.get("qty", 0)
+        tp_price = pos.get("tp_price", 0)
+        if not qty or not tp_price:
+            return
+
+        # Cancel OCO lama
+        cancel_oco_orders(symbol, pos)
+        time.sleep(0.3)
+
+        # Pasang OCO baru dengan SL yang sudah di-trail
+        f_info = get_symbol_filters(symbol)
+        tick = f_info.get("tickSize", 0.00000001)
+        step = f_info.get("stepSize", 0.00001)
+        rounded_qty = _round_step(qty, step)
+        rounded_sl  = _round_price(new_sl, tick)
+        rounded_sl_limit = _round_price(new_sl * 0.999, tick)
+        rounded_tp  = _round_price(tp_price, tick)
+
+        client = make_binance_client()
+        oco = client.create_oco_order(
+            symbol=symbol,
+            side="SELL",
+            quantity=rounded_qty,
+            price=str(rounded_tp),
+            stopPrice=str(rounded_sl),
+            stopLimitPrice=str(rounded_sl_limit),
+            stopLimitTimeInForce="GTC",
+        )
+        reports = oco.get("orderReports", [])
+        new_tp_id = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
+        new_sl_id = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+
+        with positions_lock:
+            if symbol in open_positions:
+                open_positions[symbol]["sl_price"]       = rounded_sl
+                open_positions[symbol]["tp_order_id"]    = new_tp_id
+                open_positions[symbol]["sl_order_id"]    = new_sl_id
+                open_positions[symbol]["order_list_id"]  = oco.get("orderListId")
+                open_positions[symbol]["trailing_sl_active"] = True
+        save_state()
+
+        sl_moved_pct = (rounded_sl / entry_price - 1) * 100
+        msg_prefix = "🔒 *Trailing SL AKTIF" if first_activation else "📈 *Trailing SL diperbarui"
+        send_telegram_message(
+            f"{msg_prefix} — `{symbol}`*\n\n"
+            f"Profit saat ini : `{profit_pct:+.2f}%`\n"
+            f"Harga tertinggi : `{highest:.8f}`\n"
+            f"SL lama         : `{old_sl:.8f}`\n"
+            f"SL baru         : `{rounded_sl:.8f}` \\(`{sl_moved_pct:+.2f}%` dari entry\\)\n"
+            f"TP tetap        : `{rounded_tp:.8f}`\n\n"
+            f"_SL otomatis naik mengikuti profit — modal lebih terlindungi\\._",
+            topic_id=TELEGRAM_REPORT_TOPIC_ID,
+        )
+        logger.info(f"✅ Trailing SL berhasil diperbarui untuk {symbol}")
+
+    except Exception as e:
+        logger.warning(f"Trailing SL gagal untuk {symbol}: {e}")
 
 
 def position_monitor_loop() -> None:
     """Cek berkala apakah ada posisi yang ditutup lewat TP/SL, dan:
+    - Update trailing stop loss kalau harga naik
     - Deteksi sinyal reversal → early exit sebelum SL kena
     - Kirim laporan profit/loss harian otomatis (DAILY_REPORT_HOUR_UTC)."""
     global daily_report_sent_date
@@ -1857,16 +2464,35 @@ def position_monitor_loop() -> None:
                 # ── 1. Cek apakah OCO (TP/SL) sudah FILLED ──────────────────
                 _check_position_close(symbol, pos)
 
-                # Kalau posisi sudah tutup oleh TP/SL di atas, skip reversal
+                # Kalau posisi sudah tutup oleh TP/SL di atas, skip sisa
                 with positions_lock:
                     if symbol not in open_positions:
                         continue
+                    # Refresh pos snapshot setelah _check_position_close
+                    pos = dict(open_positions[symbol])
 
-                # ── 2. Guard: jangan coba early exit lebih dari 1 kali ──────
+                # ── 2. Trailing Stop Loss — geser SL naik seiring profit ─────
+                if LIVE_MODE and BINANCE_API_KEY and not pos.get("reversal_exits_attempted", 0):
+                    try:
+                        # Ambil harga terkini dari candle 1m terakhir (lebih murah weight)
+                        df_trail = fetch_market(symbol, "1m", 2)
+                        if df_trail is not None and len(df_trail) >= 1:
+                            current_price = float(df_trail.iloc[-1]["close"])
+                            _update_trailing_sl(symbol, pos, current_price)
+                    except Exception as e:
+                        logger.debug(f"Trailing SL check error {symbol}: {e}")
+
+                    # Refresh pos setelah trailing update
+                    with positions_lock:
+                        if symbol not in open_positions:
+                            continue
+                        pos = dict(open_positions[symbol])
+
+                # ── 3. Guard: jangan coba early exit lebih dari 1 kali ──────
                 if pos.get("reversal_exits_attempted", 0) >= 1:
                     continue
 
-                # ── 3. Ambil candle segar & cek reversal ────────────────────
+                # ── 4. Ambil candle segar & cek reversal ────────────────────
                 if not (LIVE_MODE and BINANCE_API_KEY):
                     continue  # reversal exit hanya di mode LIVE
 
@@ -1893,7 +2519,7 @@ def position_monitor_loop() -> None:
                 except Exception as e:
                     logger.warning(f"Reversal check error {symbol}: {e}")
 
-            # ── 4. Laporan harian ────────────────────────────────────────────
+            # ── 5. Laporan harian ────────────────────────────────────────────
             now = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
             if now.hour == DAILY_REPORT_HOUR_UTC and daily_report_sent_date != today_str:
@@ -2088,6 +2714,20 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     confidence = signal["confidence"]
     reason     = signal["reason"]
 
+    # ── Guard: bot sedang di-pause ───────────────────────────────────────────
+    with bot_paused_lock:
+        paused = bot_paused
+    if paused:
+        logger.debug(f"⏸ Bot di-pause — sinyal {symbol} {decision} diabaikan")
+        return
+
+    # ── Guard: limit posisi terbuka & korelasi ───────────────────────────────
+    if decision == "BUY":
+        allowed, reason_denied = _is_position_allowed(symbol)
+        if not allowed:
+            logger.info(f"⏭️ {symbol} dilewati — {reason_denied}")
+            return
+
     # ATR untuk sizing + OCO levels
     atr_sl = atr * SL_ATR_MULT  # jarak Stop Loss dari entry
     atr_tp = atr * TP_ATR_MULT  # jarak Take Profit dari entry
@@ -2265,6 +2905,9 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
 
 def main_loop():
     global daily_start_equity
+    # Load posisi tersimpan sebelum mulai loop
+    load_state()
+
     if LIVE_MODE and BINANCE_API_KEY:
         daily_start_equity = get_binance_equity()
         logger.info(f"💰 Equity awal Binance: {daily_start_equity} USDT")
@@ -2298,16 +2941,22 @@ def main_loop():
         "🟡 TESTNET \\(uang virtual\\)" if BINANCE_TESTNET
         else ("🔴 LIVE \\(uang beneran\\)" if LIVE_MODE else "🔵 Simulasi")
     )
+    with positions_lock:
+        n_recovered = len(open_positions)
+    recovery_note = f"\n♻️ *{n_recovered} posisi dipulihkan dari restart*" if n_recovered else ""
     send_telegram_message(
-        f"👋 *Bot trading udah nyala nih\\!*\n\n"
-        f"Broker  : Binance Spot\n"
-        f"Mode    : {mode_label}\n"
-        f"Pair    : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
-        f"AI      : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
-        f"Filter  : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
-        f"TP/SL   : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
-        f"Modal   : `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari saldo \\(sisanya tidak disentuh\\)\n"
-        f"Min keyakinan: `{CONFIDENCE_THRESHOLD}%`"
+        f"👋 *Bot trading udah nyala nih\\!*{recovery_note}\n\n"
+        f"Broker   : Binance Spot\n"
+        f"Mode     : {mode_label}\n"
+        f"Pair     : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
+        f"AI       : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
+        f"Filter   : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
+        f"TP/SL    : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
+        f"Trailing : {'✅ aktif' if TRAILING_SL_ENABLED else '❌ nonaktif'} "
+        f"\\(aktif di \\+{TRAILING_SL_ACTIVATE_PCT}%, trail {TRAILING_SL_TRAIL_PCT}%\\)\n"
+        f"Modal    : `{int(CAPITAL_ALLOCATION_PCT*100)}%` saldo \\| max `{MAX_CONCURRENT_POSITIONS}` posisi\n"
+        f"Min yakin: `{CONFIDENCE_THRESHOLD}%`\n\n"
+        f"📊 *Perintah:* `/saldo` `/posisi` `/laporan` `/pause` `/resume` `/tutup SYMBOL`"
         + portfolio_text
         + topic_info,
         topic_id=None,
@@ -2315,6 +2964,13 @@ def main_loop():
 
     while True:
         try:
+            # ── Pause guard: kalau bot di-pause, skip cycle tapi tetap jaga posisi
+            with bot_paused_lock:
+                paused = bot_paused
+            if paused:
+                time.sleep(10)
+                continue
+
             with pairs_lock:
                 pairs_snapshot = list(active_pairs)
 
@@ -2322,6 +2978,11 @@ def main_loop():
             cycle_start = time.time()
 
             for symbol in pairs_snapshot:
+                # Cek pause di tengah loop juga
+                with bot_paused_lock:
+                    if bot_paused:
+                        break
+
                 try:
                     if _in_cooldown(symbol):
                         continue

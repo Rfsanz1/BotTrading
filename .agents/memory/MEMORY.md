@@ -1,0 +1,5 @@
+- [Bot architecture](bot-arch.md) — trading bot standalone di trading-bot/main.py, semua fitur dalam satu file Python
+- [Equity basis rule](equity-basis.md) — daily_start_equity HANYA dari USDT (get_binance_equity), bukan total portfolio
+- [Trailing SL pattern](trailing-sl.md) — cancel OCO lama, pasang OCO baru; global deklarasi harus di top of function, bukan di dalam with block
+- [State persistence](state-persistence.md) — posisi disimpan ke bot_state.json via save_state/load_state; atomic write (tmp + rename)
+- [Python global in with block](python-globals.md) — global declaration tidak boleh di dalam nested block (with, if, for), wajib di top of function
