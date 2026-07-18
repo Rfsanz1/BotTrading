@@ -1,53 +1,38 @@
-# AI Crypto Trading Bot
+# AI Trading Bot
 
-An automated trading bot that watches every USDT trading pair on Binance, uses Groq AI (Llama 3.1) to analyze the ones showing interesting technical signals, and asks for approval via Telegram (inline ✅/❌ buttons) before placing real Binance orders.
+Bot trading otomatis: Binance/MEXC (spot) + Groq AI (Llama 3.1) + Telegram.
 
-## Run & Operate
+## Cara Jalankan
 
-- `pnpm --filter @workspace/api-server run dev` — run the shared API server (port 5000, currently unused by the bot)
-- `pnpm run typecheck` — full typecheck across all pnpm packages (not applicable to the Python bot)
-- The `Trading Bot` workflow runs `cd trading-bot && python3 main.py` automatically
-- Required secrets: `GROQ_API_KEY`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `ALLOWED_CHAT_IDS` (optional), topic ID env vars (optional, see below)
+```
+cd trading-bot && python3 main.py
+```
 
-## Stack
+Workflow sudah dikonfigurasi sebagai **Trading Bot**.
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9 (shared API server + mockup sandbox, not used by the bot yet)
-- **Trading bot**: standalone Python 3.12 service in `trading-bot/` — Flask keep-alive server, Groq SDK, python-binance, pandas for indicators
-- DB: PostgreSQL + Drizzle ORM (provisioned, not used by the bot)
+## Isi API Keys
 
-## Where things live
+Buka halaman **`/config`** di preview bot (port 3000) untuk mengisi semua API key tanpa perlu edit file manual. Setelah simpan, restart bot agar aktif.
 
-- `trading-bot/main.py` — the entire bot: pair discovery, indicator pre-filter, Groq analysis, Telegram confirmation flow, Binance execution, trade logging (`trading-bot/trades.log`)
-- `trading-bot/test_telegram.py` — standalone script to sanity-check the Telegram bot token/chat ID
-- `artifacts/api-server`, `artifacts/mockup-sandbox` — scaffolded but unused by the bot; kept for future web/dashboard work
+### Key yang dibutuhkan
+| Key | Dapat dari |
+|-----|-----------|
+| `GROQ_API_KEY` | console.groq.com → API Keys (gratis) |
+| `BINANCE_API_KEY` + `SECRET` | binance.com → API Management |
+| `MEXC_API_KEY` + `SECRET` | mexc.com → API Management (jika pakai MEXC) |
+| `TELEGRAM_BOT_TOKEN` | @BotFather → /newbot |
+| `TELEGRAM_CHAT_ID` | api.telegram.org/bot\<TOKEN\>/getUpdates |
 
-## Architecture decisions
+Config disimpan ke `trading-bot/config.json` (prioritas di atas env vars).
 
-- The bot scans **all** Binance USDT spot pairs (~440+) every cycle instead of a single hardcoded symbol, per user request. Sending every pair to Groq every minute would blow through API rate limits, so a cheap technical pre-filter (RSI extremes or MACD zero-crossings) shortlists candidates first, and only those go to the AI (capped via `MAX_AI_CALLS_PER_CYCLE`, default 8).
-- **Multi-timeframe confluence (1m + 5m + 15m)**: the pre-filter runs on 1m candles; when a pair passes, the bot also fetches 5m and 15m candles and passes all three timeframes to both AI models. 15m sets trend direction, 5m confirms momentum, 1m provides entry precision.
-- **Funding Rate + Open Interest from Binance Futures API** (public, no key needed): funding rate signals crowded positioning (extreme positive = crowded longs, risk of reversal; extreme negative = crowded shorts, squeeze risk). OI trend confirms whether price moves are backed by new money or just liquidations/profit-taking.
-- **ATR-based dynamic TP/SL (R:R 1:4)**: instead of fixed %, Take Profit is set at `TP_ATR_MULT × ATR` (default 4×) above entry and Stop Loss at `SL_ATR_MULT × ATR` (default 1×) below. Override via `TP_ATR_MULT` and `SL_ATR_MULT` env vars.
-- **Dual-AI consensus**: Groq (Llama 3.1) analyzes first; Claude Sonnet 5 via OpenRouter validates independently. Both see the full multi-TF + futures data context. Only when both agree on direction (BUY or SELL) does the bot execute automatically. Disagreement = skip and notify Telegram.
-- Each execution thread runs independently so one pair's validation/execution doesn't block the scan loop. Per-symbol cooldown (`SYMBOL_COOLDOWN_SEC`, default 600s) prevents re-flagging the same pair every cycle.
-- `TRADING_PAIRS` env var can override the "scan everything" default with an explicit comma-separated list (e.g. `BTCUSDT,ETHUSDT`).
+## Exchange
 
-## Product
+Set `ACTIVE_EXCHANGE` ke `binance` (default) atau `mexc` di halaman `/config`.
 
-- Runs unattended, continuously scanning the crypto market.
-- Sends a Telegram message with an AI-written rationale and a confidence score whenever a pair looks worth trading.
-- User approves or rejects each trade from Telegram before any real money moves.
-- Separate Telegram topics can be wired up for buy signals, sell signals, bullish/bearish trend commentary, and free-form AI chat (`/topicid` command reveals the ID to configure).
+## Dashboard
 
-## User preferences
+- `/config` — isi API key
+- `/dashboard` — status bot, posisi terbuka, equity curve, PnL
+- `/api/status` — JSON status
 
-- User wants the bot live-trading from day one (not simulation-first) and wants it analyzing every available pair, not just BTC/USDT.
-
-## Gotchas
-
-- `LIVE_MODE = True` in `trading-bot/main.py` means real Binance orders can be placed once a signal is confirmed in Telegram — treat any code change there as high-stakes.
-- Groq's free tier rate limits are tight relative to scanning 400+ pairs; expect periodic 429s that the Groq SDK retries automatically. Lower `MAX_AI_CALLS_PER_CYCLE` if this becomes disruptive.
-- Restart the `Trading Bot` workflow after any edit to `trading-bot/main.py`.
-
-## Pointers
-
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details (applies to the untouched Node side of the project only)
+## User Preferences

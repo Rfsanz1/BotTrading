@@ -21,10 +21,38 @@ import threading
 from datetime import datetime, timezone
 from typing import Optional
 
+import hashlib
+import hmac
 import pandas as pd
 import requests
 from groq import Groq
-from flask import Flask
+from flask import Flask, request as flask_request
+
+# ---------------------------------------------------------------------------
+# ─── CONFIG FILE LOADER (config.json prioritas di atas env vars) ─────────────
+# ---------------------------------------------------------------------------
+
+_BOT_CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+
+def _load_bot_config() -> dict:
+    """Baca config.json — dipakai agar user tidak perlu isi Replit Secrets manual."""
+    try:
+        with open(_BOT_CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+def _save_bot_config(data: dict) -> None:
+    """Simpan config ke config.json."""
+    with open(_BOT_CONFIG_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+_BOT_CONFIG: dict = _load_bot_config()
+
+def _cfg(key: str, default: str = "") -> str:
+    """Ambil nilai config: config.json dulu, lalu env var, lalu default."""
+    v = str(_BOT_CONFIG.get(key, "")).strip()
+    return v if v else os.getenv(key, default)
 
 # ---------------------------------------------------------------------------
 # ─── KONFIGURASI ────────────────────────────────────────────────────────────
@@ -36,8 +64,8 @@ LIVE_MODE: bool = True
 # spot USDT yang ada di Binance. Atau isi daftar spesifik, contoh:
 # TRADING_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT
 # Mode testnet Binance — pakai API key dari testnet.binance.vision (uang virtual)
-# Set BINANCE_TESTNET=true di Replit Secrets untuk aktifkan
-BINANCE_TESTNET: bool = os.getenv("BINANCE_TESTNET", "false").strip().lower() in ("1", "true", "yes")
+# Set BINANCE_TESTNET=true di config.json atau Replit Secrets untuk aktifkan
+BINANCE_TESTNET: bool = _cfg("BINANCE_TESTNET", "false").lower() in ("1", "true", "yes")
 
 TRADING_PAIRS_ENV: str = os.getenv("TRADING_PAIRS", "ALL").strip()
 
@@ -164,32 +192,33 @@ HEALTH_EQUITY_DROP_PCT: float = float(os.getenv("HEALTH_EQUITY_DROP_PCT", "5.0")
 DB_FILE: str = os.getenv("DB_FILE", "trades.db")
 
 # ---------------------------------------------------------------------------
-# ─── ENVIRONMENT VARIABLES ──────────────────────────────────────────────────
+# ─── ENVIRONMENT VARIABLES (dibaca dari config.json atau env var) ────────────
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY        = os.getenv("GROQ_API_KEY", "")
-OPENROUTER_API_KEY  = os.getenv("OPENROUTER_API_KEY", "")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
+GROQ_API_KEY        = _cfg("GROQ_API_KEY")
+OPENROUTER_API_KEY  = _cfg("OPENROUTER_API_KEY")
+TELEGRAM_BOT_TOKEN  = _cfg("TELEGRAM_BOT_TOKEN")
 
-_raw_chat_id = os.getenv("TELEGRAM_CHAT_ID", "0").strip()
+_raw_chat_id = _cfg("TELEGRAM_CHAT_ID", "0")
 try:
     TELEGRAM_CHAT_ID = int(_raw_chat_id)
 except ValueError:
     print(
         f"\n❌ ERROR: TELEGRAM_CHAT_ID harus berupa angka, bukan '{_raw_chat_id}'.\n"
         f"   Cara dapat Chat ID: cari @userinfobot di Telegram → klik Start.\n"
+        f"   Atau isi lewat halaman /config di dashboard bot.\n"
     )
     raise SystemExit(1)
 
 ALLOWED_CHAT_IDS = [
     int(x.strip())
-    for x in os.getenv("ALLOWED_CHAT_IDS", "").split(",")
+    for x in _cfg("ALLOWED_CHAT_IDS", "").split(",")
     if x.strip()
 ]
 
 # Topic IDs untuk Telegram group forum
 def _parse_topic(env_key: str) -> Optional[int]:
-    v = os.getenv(env_key, "").strip()
+    v = _cfg(env_key, "").strip()
     return int(v) if v.isdigit() else None
 
 TELEGRAM_BUY_TOPIC_ID:  Optional[int] = _parse_topic("TELEGRAM_BUY_TOPIC_ID")
@@ -201,8 +230,17 @@ TELEGRAM_REPORT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID
 TELEGRAM_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
 TELEGRAM_HOLD_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_HOLD_TOPIC_ID")
 
-BINANCE_API_KEY    = os.getenv("BINANCE_API_KEY", "")
-BINANCE_API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+# Binance credentials
+BINANCE_API_KEY    = _cfg("BINANCE_API_KEY")
+BINANCE_API_SECRET = _cfg("BINANCE_API_SECRET")
+
+# MEXC credentials
+MEXC_API_KEY    = _cfg("MEXC_API_KEY")
+MEXC_API_SECRET = _cfg("MEXC_API_SECRET")
+
+# Exchange aktif: "binance" (default) atau "mexc"
+# Set lewat config.json (halaman /config) atau env var ACTIVE_EXCHANGE
+ACTIVE_EXCHANGE: str = _cfg("ACTIVE_EXCHANGE", "binance").lower()
 
 # ---------------------------------------------------------------------------
 # ─── LOGGING ────────────────────────────────────────────────────────────────
@@ -562,7 +600,7 @@ def api_positions():
 def api_daily():
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = compute_daily_report(today_str)
-    equity = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    equity = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
     daily["current_equity"] = equity
     daily["start_equity"]   = daily_start_equity
     daily["net_change"]     = round(equity - daily_start_equity, 4) if daily_start_equity else 0
@@ -874,6 +912,277 @@ def dashboard():
     return _DASHBOARD_HTML, 200, {"Content-Type": "text/html"}
 
 
+# ---------------------------------------------------------------------------
+# ─── HALAMAN KONFIGURASI API KEYS ───────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_CONFIG_HTML = """<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bot Config — API Keys</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0f1117; color: #e1e4e8; min-height: 100vh; }
+  .header { background: linear-gradient(135deg,#1a1f2e,#0f1117); border-bottom: 1px solid #2d3748;
+            padding: 16px 24px; display: flex; align-items: center; gap: 12px; }
+  .header h1 { font-size: 1.3rem; font-weight: 700; }
+  .header a { margin-left: auto; font-size: 0.82rem; color: #63b3ed; text-decoration: none; }
+  .container { max-width: 720px; margin: 0 auto; padding: 32px 20px; }
+  .card { background: #1a1f2e; border: 1px solid #2d3748; border-radius: 12px; padding: 24px; margin-bottom: 20px; }
+  .card h2 { font-size: 0.9rem; color: #a0aec0; text-transform: uppercase; letter-spacing: .05em;
+             margin-bottom: 16px; border-bottom: 1px solid #2d3748; padding-bottom: 10px; }
+  .field { margin-bottom: 14px; }
+  .field label { display: block; font-size: 0.8rem; color: #a0aec0; margin-bottom: 5px; }
+  .field input, .field select {
+    width: 100%; padding: 9px 12px; background: #0f1117; border: 1px solid #2d3748;
+    border-radius: 8px; color: #e1e4e8; font-size: 0.88rem; outline: none;
+    transition: border-color .2s;
+  }
+  .field input:focus, .field select:focus { border-color: #63b3ed; }
+  .field .hint { font-size: 0.72rem; color: #4a5568; margin-top: 4px; }
+  .btn { width: 100%; padding: 12px; background: #2b6cb0; border: none; border-radius: 8px;
+         color: #fff; font-size: 0.95rem; font-weight: 600; cursor: pointer; transition: background .2s; }
+  .btn:hover { background: #2c5282; }
+  .alert { padding: 12px 16px; border-radius: 8px; font-size: 0.85rem; margin-bottom: 18px; display: none; }
+  .alert-ok  { background: #1a3a2a; border: 1px solid #2f855a; color: #68d391; }
+  .alert-err { background: #3a1a1a; border: 1px solid #c53030; color: #fc8181; }
+  .masked { letter-spacing: .15em; color: #718096; }
+  .note { font-size: 0.78rem; color: #4a5568; padding: 12px 16px; background: #161b27;
+          border-left: 3px solid #2d3748; border-radius: 4px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span>🔑</span>
+  <h1>Konfigurasi API Keys</h1>
+  <a href="/dashboard">← Dashboard</a>
+</div>
+<div class="container">
+  <div id="alert" class="alert"></div>
+
+  <form id="configForm">
+
+    <div class="card">
+      <h2>🔄 Exchange</h2>
+      <div class="field">
+        <label>Exchange Aktif</label>
+        <select name="ACTIVE_EXCHANGE" id="ACTIVE_EXCHANGE">
+          <option value="binance">Binance</option>
+          <option value="mexc">MEXC</option>
+        </select>
+        <div class="hint">Bot hanya mengeksekusi order di exchange yang dipilih.</div>
+      </div>
+    </div>
+
+    <div class="card" id="binanceCard">
+      <h2>🟡 Binance</h2>
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" name="BINANCE_API_KEY" id="BINANCE_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="binance_key_status"></div>
+      </div>
+      <div class="field">
+        <label>API Secret</label>
+        <input type="password" name="BINANCE_API_SECRET" id="BINANCE_API_SECRET" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Mode Testnet?</label>
+        <select name="BINANCE_TESTNET">
+          <option value="false">Tidak (LIVE — uang beneran)</option>
+          <option value="true">Ya (Testnet — uang virtual)</option>
+        </select>
+        <div class="hint">Testnet: buat API key di testnet.binance.vision</div>
+      </div>
+    </div>
+
+    <div class="card" id="mexcCard" style="display:none">
+      <h2>🔵 MEXC</h2>
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" name="MEXC_API_KEY" id="MEXC_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="mexc_key_status"></div>
+      </div>
+      <div class="field">
+        <label>API Secret</label>
+        <input type="password" name="MEXC_API_SECRET" id="MEXC_API_SECRET" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🤖 AI — Groq</h2>
+      <div class="field">
+        <label>Groq API Key</label>
+        <input type="password" name="GROQ_API_KEY" id="GROQ_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="groq_key_status"></div>
+        <div class="hint">Gratis di console.groq.com → API Keys</div>
+      </div>
+      <div class="field">
+        <label>OpenRouter API Key (opsional — untuk Claude validator)</label>
+        <input type="password" name="OPENROUTER_API_KEY" id="OPENROUTER_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="openrouter_key_status"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>📱 Telegram</h2>
+      <div class="field">
+        <label>Bot Token</label>
+        <input type="password" name="TELEGRAM_BOT_TOKEN" id="TELEGRAM_BOT_TOKEN" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="tg_token_status"></div>
+        <div class="hint">Dari @BotFather → /newbot</div>
+      </div>
+      <div class="field">
+        <label>Chat ID</label>
+        <input type="text" name="TELEGRAM_CHAT_ID" id="TELEGRAM_CHAT_ID" placeholder="Contoh: -1001234567890">
+        <div class="hint">Kirim pesan ke bot, buka api.telegram.org/bot&lt;TOKEN&gt;/getUpdates</div>
+      </div>
+      <div class="field">
+        <label>Topic ID — Sinyal BUY (opsional)</label>
+        <input type="text" name="TELEGRAM_BUY_TOPIC_ID" placeholder="Nomor topic ID">
+      </div>
+      <div class="field">
+        <label>Topic ID — Sinyal SELL/TP/SL (opsional)</label>
+        <input type="text" name="TELEGRAM_SELL_TOPIC_ID" placeholder="Nomor topic ID">
+      </div>
+      <div class="field">
+        <label>Topic ID — Laporan harian (opsional)</label>
+        <input type="text" name="TELEGRAM_REPORT_TOPIC_ID" placeholder="Nomor topic ID">
+      </div>
+      <div class="field">
+        <label>Topic ID — Berita (opsional)</label>
+        <input type="text" name="TELEGRAM_NEWS_TOPIC_ID" placeholder="Nomor topic ID">
+      </div>
+    </div>
+
+    <button type="submit" class="btn">💾 Simpan Konfigurasi</button>
+    <div class="note">
+      ⚠️ Setelah simpan, <strong>restart bot</strong> agar perubahan aktif.<br>
+      Konfigurasi disimpan ke <code>config.json</code> di folder <code>trading-bot/</code>.
+      Kolom yang dikosongkan tidak akan mengubah nilai yang sudah tersimpan.
+    </div>
+  </form>
+</div>
+
+<script>
+async function loadCurrentConfig() {
+  try {
+    const r = await fetch('/api/config');
+    const d = await r.json();
+    document.getElementById('ACTIVE_EXCHANGE').value = d.ACTIVE_EXCHANGE || 'binance';
+    toggleExchangeCards(d.ACTIVE_EXCHANGE || 'binance');
+    if (d.BINANCE_TESTNET === 'true') {
+      document.querySelector('[name=BINANCE_TESTNET]').value = 'true';
+    }
+    document.getElementById('TELEGRAM_CHAT_ID').value = d.TELEGRAM_CHAT_ID || '';
+    document.querySelector('[name=TELEGRAM_BUY_TOPIC_ID]').value = d.TELEGRAM_BUY_TOPIC_ID || '';
+    document.querySelector('[name=TELEGRAM_SELL_TOPIC_ID]').value = d.TELEGRAM_SELL_TOPIC_ID || '';
+    document.querySelector('[name=TELEGRAM_REPORT_TOPIC_ID]').value = d.TELEGRAM_REPORT_TOPIC_ID || '';
+    document.querySelector('[name=TELEGRAM_NEWS_TOPIC_ID]').value = d.TELEGRAM_NEWS_TOPIC_ID || '';
+    // Status badge untuk key yang sudah terisi
+    if (d.has_BINANCE_API_KEY)   document.getElementById('binance_key_status').textContent = '✅ Sudah terisi';
+    if (d.has_MEXC_API_KEY)      document.getElementById('mexc_key_status').textContent    = '✅ Sudah terisi';
+    if (d.has_GROQ_API_KEY)      document.getElementById('groq_key_status').textContent    = '✅ Sudah terisi';
+    if (d.has_OPENROUTER_API_KEY) document.getElementById('openrouter_key_status').textContent = '✅ Sudah terisi';
+    if (d.has_TELEGRAM_BOT_TOKEN) document.getElementById('tg_token_status').textContent   = '✅ Sudah terisi';
+  } catch(e) { console.warn('Gagal load config:', e); }
+}
+
+function toggleExchangeCards(val) {
+  document.getElementById('binanceCard').style.display = val === 'binance' ? '' : 'none';
+  document.getElementById('mexcCard').style.display    = val === 'mexc'    ? '' : 'none';
+}
+
+document.getElementById('ACTIVE_EXCHANGE').addEventListener('change', function() {
+  toggleExchangeCards(this.value);
+});
+
+document.getElementById('configForm').addEventListener('submit', async function(e) {
+  e.preventDefault();
+  const data = {};
+  new FormData(this).forEach((v, k) => { if (v.trim()) data[k] = v.trim(); });
+  try {
+    const r = await fetch('/api/config/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    const result = await r.json();
+    const alert = document.getElementById('alert');
+    if (result.ok) {
+      alert.className = 'alert alert-ok';
+      alert.textContent = '✅ ' + result.message;
+      alert.style.display = '';
+      loadCurrentConfig();
+    } else {
+      alert.className = 'alert alert-err';
+      alert.textContent = '❌ ' + (result.error || 'Gagal simpan');
+      alert.style.display = '';
+    }
+    setTimeout(() => alert.style.display = 'none', 6000);
+  } catch(err) {
+    const alert = document.getElementById('alert');
+    alert.className = 'alert alert-err';
+    alert.textContent = '❌ Error: ' + err.message;
+    alert.style.display = '';
+  }
+});
+
+loadCurrentConfig();
+</script>
+</body>
+</html>"""
+
+# Kolom yang TIDAK boleh dikembalikan plain ke browser (hanya status has_*)
+_SENSITIVE_KEYS = {
+    "BINANCE_API_KEY", "BINANCE_API_SECRET",
+    "MEXC_API_KEY", "MEXC_API_SECRET",
+    "GROQ_API_KEY", "OPENROUTER_API_KEY",
+    "TELEGRAM_BOT_TOKEN",
+}
+
+@flask_app.route("/config")
+def config_page():
+    return _CONFIG_HTML, 200, {"Content-Type": "text/html"}
+
+
+@flask_app.route("/api/config")
+def api_config_get():
+    """Kembalikan config saat ini — key sensitif hanya ditampilkan sebagai has_* boolean."""
+    cfg = _load_bot_config()
+    safe = {}
+    for k, v in cfg.items():
+        if k in _SENSITIVE_KEYS:
+            safe[f"has_{k}"] = bool(v)
+        else:
+            safe[k] = v
+    # Tambahkan has_* untuk env var yang mungkin tidak ada di config.json
+    for sk in _SENSITIVE_KEYS:
+        if f"has_{sk}" not in safe:
+            safe[f"has_{sk}"] = bool(os.getenv(sk, ""))
+    return json.dumps(safe), 200, {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/config/save", methods=["POST"])
+def api_config_save():
+    """Simpan API keys ke config.json. Kolom kosong/tidak dikirim = tidak diubah."""
+    try:
+        data = flask_request.get_json(force=True) or {}
+        cfg = _load_bot_config()
+        for key, value in data.items():
+            v = str(value).strip()
+            if v:
+                cfg[key] = v
+        _save_bot_config(cfg)
+        return json.dumps({
+            "ok": True,
+            "message": "Tersimpan! Restart bot agar konfigurasi aktif.",
+        }), 200, {"Content-Type": "application/json"}
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e)}), 500, {"Content-Type": "application/json"}
+
+
 def run_flask():
     port = int(os.getenv("PORT", 3000))
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
@@ -1151,11 +1460,16 @@ def refresh_pairs() -> None:
     """Refresh daftar pair yang dipindai — dipanggil di startup & tiap 1 jam."""
     global active_pairs
     if TRADING_PAIRS_ENV.upper() == "ALL":
-        fetched = fetch_usdt_pairs()
+        if ACTIVE_EXCHANGE == "mexc":
+            fetched = fetch_mexc_pairs()
+            exch_label = "MEXC"
+        else:
+            fetched = fetch_usdt_pairs()
+            exch_label = "Binance"
         if fetched:
             with pairs_lock:
                 active_pairs = fetched
-            logger.info(f"📈 Memindai SEMUA pair USDT Binance: {len(fetched)} pair")
+            logger.info(f"📈 Memindai SEMUA pair USDT {exch_label}: {len(fetched)} pair")
         else:
             logger.warning("⚠️ Gagal refresh daftar pair — pakai daftar lama/fallback")
             with pairs_lock:
@@ -1179,6 +1493,9 @@ def pairs_refresher_loop() -> None:
 
 def fetch_market(symbol: str, interval: str = CANDLE_INTERVAL,
                   limit: int = CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+    """Route ke MEXC atau Binance sesuai ACTIVE_EXCHANGE."""
+    if ACTIVE_EXCHANGE == "mexc":
+        return fetch_mexc_market(symbol, interval, limit)
     global _api_weight_1m  # diperbarui dari response header Binance
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -2432,6 +2749,204 @@ def cancel_oco_orders(symbol: str, pos: dict) -> bool:
     return True
 
 
+# ---------------------------------------------------------------------------
+# ─── 5b. MEXC EXCHANGE FUNCTIONS ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_MEXC_BASE = "https://api.mexc.com"
+
+def _mexc_sign(params: dict) -> dict:
+    """Tambahkan timestamp + signature HMAC-SHA256 ke params MEXC."""
+    params["timestamp"] = int(time.time() * 1000)
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    sig = hmac.new(MEXC_API_SECRET.encode(), query.encode(), hashlib.sha256).hexdigest()
+    params["signature"] = sig
+    return params
+
+def _mexc_headers() -> dict:
+    return {"X-MEXC-APIKEY": MEXC_API_KEY, "Content-Type": "application/json"}
+
+
+def fetch_mexc_pairs() -> list[str]:
+    """Ambil semua pair spot USDT yang TRADING di MEXC."""
+    try:
+        r = requests.get(f"{_MEXC_BASE}/api/v3/exchangeInfo", timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        pairs = []
+        for s in data.get("symbols", []):
+            if s.get("status") != "ENABLED":
+                continue
+            if s.get("quoteAsset") != "USDT":
+                continue
+            symbol = s["symbol"]
+            base = s.get("baseAsset", "")
+            if any(symbol.endswith(suf) for suf in _EXCLUDED_SUFFIXES):
+                continue
+            if base in _EXCLUDED_BASES:
+                continue
+            pairs.append(symbol)
+        return sorted(pairs)
+    except Exception as e:
+        logger.error(f"Gagal ambil daftar pair MEXC: {e}")
+        return []
+
+
+def fetch_mexc_market(symbol: str, interval: str = CANDLE_INTERVAL,
+                      limit: int = CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+    """Ambil klines dari MEXC (format sama dengan Binance)."""
+    url = f"{_MEXC_BASE}/api/v3/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": limit}
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 429:
+                time.sleep(30)
+                continue
+            r.raise_for_status()
+            raw = r.json()
+            if not raw:
+                return None
+            df = pd.DataFrame(raw, columns=[
+                "open_time", "open", "high", "low", "close", "volume",
+                "close_time", "quote_vol", "trades", "taker_buy_base",
+                "taker_buy_quote", "ignore",
+            ])
+            numeric_cols = ["open", "high", "low", "close", "volume"]
+            df[numeric_cols] = df[numeric_cols].astype(float)
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df.set_index("open_time", inplace=True)
+            return df[numeric_cols]
+        except Exception as e:
+            logger.warning(f"MEXC fetch error {symbol} (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    return None
+
+
+def get_mexc_equity() -> float:
+    """Ambil saldo USDT dari akun MEXC."""
+    try:
+        params = _mexc_sign({})
+        r = requests.get(f"{_MEXC_BASE}/api/v3/account",
+                         params=params, headers=_mexc_headers(), timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        for b in data.get("balances", []):
+            if b["asset"] == "USDT":
+                return float(b["free"]) + float(b["locked"])
+    except Exception as e:
+        logger.warning(f"Tidak bisa ambil equity MEXC: {e}")
+    return 0.0
+
+
+def execute_mexc(symbol: str, side: str, qty: float) -> dict:
+    """Eksekusi market order di MEXC."""
+    params = _mexc_sign({
+        "symbol": symbol,
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": str(qty),
+    })
+    for attempt in range(3):
+        try:
+            r = requests.post(f"{_MEXC_BASE}/api/v3/order",
+                              params=params, headers=_mexc_headers(), timeout=10)
+            r.raise_for_status()
+            order = r.json()
+            logger.info(f"MEXC order: {order}")
+            return order
+        except Exception as e:
+            logger.error(f"MEXC order error (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    raise RuntimeError("MEXC order gagal setelah 3 kali coba")
+
+
+def place_mexc_tp_sl(symbol: str, qty: float, entry_price: float,
+                     atr: float = 0.0) -> Optional[dict]:
+    """MEXC tidak support OCO identik Binance — pasang LIMIT sell (TP) saja.
+    SL ditangani position monitor + emergency_close."""
+    try:
+        if atr > 0:
+            tp_price = round(entry_price + TP_ATR_MULT * atr, 8)
+        else:
+            tp_price = round(entry_price * (1 + TP_PCT / 100), 8)
+        sl_price = round(
+            entry_price - SL_ATR_MULT * atr if atr > 0 else entry_price * (1 - SL_PCT / 100),
+            8,
+        )
+        params = _mexc_sign({
+            "symbol": symbol,
+            "side": "SELL",
+            "type": "LIMIT",
+            "quantity": str(qty),
+            "price": str(tp_price),
+            "timeInForce": "GTC",
+        })
+        r = requests.post(f"{_MEXC_BASE}/api/v3/order",
+                          params=params, headers=_mexc_headers(), timeout=10)
+        r.raise_for_status()
+        order = r.json()
+        order["_tp_price"] = tp_price
+        order["_sl_price"] = sl_price
+        order["_tp_order_id"] = order.get("orderId")
+        order["_sl_order_id"] = None
+        order["orderListId"] = None
+        logger.info(f"🎯 MEXC LIMIT sell (TP) terpasang {symbol}: TP={tp_price} | SL (monitor)={sl_price}")
+        return order
+    except Exception as e:
+        logger.error(f"MEXC TP order error {symbol}: {e}")
+        return None
+
+
+def cancel_mexc_orders(symbol: str, pos: dict) -> bool:
+    """Cancel LIMIT sell (TP) di MEXC jika masih aktif."""
+    tp_id = pos.get("tp_order_id")
+    if not tp_id:
+        return True
+    try:
+        params = _mexc_sign({"symbol": symbol, "orderId": str(tp_id)})
+        r = requests.delete(f"{_MEXC_BASE}/api/v3/order",
+                            params=params, headers=_mexc_headers(), timeout=10)
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning(f"Gagal cancel MEXC order {tp_id} {symbol}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# ─── 5c. EXCHANGE-AWARE WRAPPERS ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def get_exchange_equity() -> float:
+    """Ambil equity USDT dari exchange yang sedang aktif."""
+    if ACTIVE_EXCHANGE == "mexc":
+        return get_mexc_equity()
+    return get_binance_equity()
+
+
+def execute_exchange(symbol: str, side: str, qty: float) -> dict:
+    """Eksekusi market order di exchange yang sedang aktif."""
+    if ACTIVE_EXCHANGE == "mexc":
+        return execute_mexc(symbol, side, qty)
+    return execute_binance(symbol, side, qty)
+
+
+def place_exchange_tp_sl(symbol: str, qty: float, entry_price: float,
+                         atr: float = 0.0) -> Optional[dict]:
+    """Pasang TP/SL di exchange yang sedang aktif."""
+    if ACTIVE_EXCHANGE == "mexc":
+        return place_mexc_tp_sl(symbol, qty, entry_price, atr)
+    return place_oco_sell(symbol, qty, entry_price, atr)
+
+
+def cancel_exchange_orders(symbol: str, pos: dict) -> bool:
+    """Cancel order TP/SL di exchange yang sedang aktif."""
+    if ACTIVE_EXCHANGE == "mexc":
+        return cancel_mexc_orders(symbol, pos)
+    return cancel_oco_orders(symbol, pos)
+
+
 def detect_reversal(df: pd.DataFrame) -> tuple[bool, str]:
     """
     Deteksi sinyal pembalikan arah (reversal) atau breakdown dari indikator teknikal.
@@ -2515,8 +3030,8 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
         topic_id=TELEGRAM_REPORT_TOPIC_ID,
     )
 
-    # Step 1: cancel OCO
-    cancel_oco_orders(symbol, pos)
+    # Step 1: cancel TP/SL order
+    cancel_exchange_orders(symbol, pos)
     time.sleep(0.5)
 
     # Step 2: market sell
@@ -2529,7 +3044,7 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
     exit_price = entry_price
     fill_info: dict = {}
     try:
-        fill_info = execute_binance(symbol, "SELL", sell_qty)
+        fill_info = execute_exchange(symbol, "SELL", sell_qty)
         fills = fill_info.get("fills", [])
         if fills:
             total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -2570,7 +3085,7 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
     today_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_r    = compute_daily_report(today_str)
     cum_pnl    = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
-    saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
 
     icon = "🟡" if pnl >= 0 else "🟠"
     send_telegram_message(
@@ -2641,7 +3156,7 @@ def _check_position_close(symbol: str, pos: dict) -> None:
         cum_pnl  = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
 
         # Saldo setelah close
-        saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
 
         icon = "✅" if pnl >= 0 else "🔴"
         result_label = "Take Profit 🎯" if label == "TP" else "Stop Loss 🛡"
@@ -2723,11 +3238,11 @@ def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
         if not qty or not tp_price:
             return
 
-        # Cancel OCO lama
-        cancel_oco_orders(symbol, pos)
+        # Cancel TP/SL order lama
+        cancel_exchange_orders(symbol, pos)
         time.sleep(0.3)
 
-        # Pasang OCO baru dengan SL yang sudah di-trail
+        # Pasang OCO/TP baru dengan SL yang sudah di-trail
         f_info = get_symbol_filters(symbol)
         tick = f_info.get("tickSize", 0.00000001)
         step = f_info.get("stepSize", 0.00001)
@@ -2736,19 +3251,27 @@ def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
         rounded_sl_limit = _round_price(new_sl * 0.999, tick)
         rounded_tp  = _round_price(tp_price, tick)
 
-        client = make_binance_client()
-        oco = client.create_oco_order(
-            symbol=symbol,
-            side="SELL",
-            quantity=rounded_qty,
-            price=str(rounded_tp),
-            stopPrice=str(rounded_sl),
-            stopLimitPrice=str(rounded_sl_limit),
-            stopLimitTimeInForce="GTC",
-        )
-        reports = oco.get("orderReports", [])
-        new_tp_id = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
-        new_sl_id = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+        new_tp_id = new_sl_id = None
+        if ACTIVE_EXCHANGE == "mexc":
+            # MEXC: pasang LIMIT sell (TP) baru, SL ditangani position monitor
+            mexc_ord = place_mexc_tp_sl(symbol, rounded_qty, pos.get("entry_price", 0), atr=0)
+            if mexc_ord:
+                new_tp_id = mexc_ord.get("_tp_order_id")
+            oco = mexc_ord or {}
+        else:
+            client = make_binance_client()
+            oco = client.create_oco_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=rounded_qty,
+                price=str(rounded_tp),
+                stopPrice=str(rounded_sl),
+                stopLimitPrice=str(rounded_sl_limit),
+                stopLimitTimeInForce="GTC",
+            )
+            reports = oco.get("orderReports", [])
+            new_tp_id = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
+            new_sl_id = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
 
         with positions_lock:
             if symbol in open_positions:
@@ -2831,34 +3354,42 @@ def _check_breakeven_sl(symbol: str, pos: dict, current_price: float) -> None:
         rounded_sl_limit = _round_price(entry_price * 0.999, tick)
         rounded_tp = _round_price(tp_price, tick)
 
-        # Cancel OCO lama, pasang OCO baru dengan SL di entry
-        cancel_oco_orders(symbol, pos)
+        # Cancel TP/SL order lama, pasang baru dengan SL di entry
+        cancel_exchange_orders(symbol, pos)
         time.sleep(0.3)
 
-        client = make_binance_client()
-        oco = client.create_oco_order(
-            symbol=symbol,
-            side="SELL",
-            quantity=rounded_qty,
-            price=str(rounded_tp),
-            stopPrice=str(rounded_sl),
-            stopLimitPrice=str(rounded_sl_limit),
-            stopLimitTimeInForce="GTC",
-        )
-        reports = oco.get("orderReports", [])
-        new_tp_id = next(
-            (r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None
-        )
-        new_sl_id = next(
-            (r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None
-        )
+        new_tp_id = new_sl_id = None
+        new_order_list_id_be = None
+        if ACTIVE_EXCHANGE == "mexc":
+            mexc_ord = place_mexc_tp_sl(symbol, rounded_qty, entry_price, atr=0)
+            if mexc_ord:
+                new_tp_id = mexc_ord.get("_tp_order_id")
+        else:
+            client = make_binance_client()
+            oco = client.create_oco_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=rounded_qty,
+                price=str(rounded_tp),
+                stopPrice=str(rounded_sl),
+                stopLimitPrice=str(rounded_sl_limit),
+                stopLimitTimeInForce="GTC",
+            )
+            reports = oco.get("orderReports", [])
+            new_tp_id = next(
+                (r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None
+            )
+            new_sl_id = next(
+                (r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None
+            )
+            new_order_list_id_be = oco.get("orderListId")
 
         with positions_lock:
             if symbol in open_positions:
                 open_positions[symbol]["sl_price"]       = rounded_sl
                 open_positions[symbol]["tp_order_id"]    = new_tp_id
                 open_positions[symbol]["sl_order_id"]    = new_sl_id
-                open_positions[symbol]["order_list_id"]  = oco.get("orderListId")
+                open_positions[symbol]["order_list_id"]  = new_order_list_id_be
                 open_positions[symbol]["breakeven_done"] = True
         save_state()
 
@@ -2938,12 +3469,12 @@ def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
             else:
                 return  # posisi sudah tutup
 
-        # Step 1: Cancel OCO lama supaya tidak konflik dengan partial sell
-        cancel_oco_orders(symbol, pos)
+        # Step 1: Cancel TP/SL order lama supaya tidak konflik dengan partial sell
+        cancel_exchange_orders(symbol, pos)
         time.sleep(0.3)
 
         # Step 2: Market sell sebagian
-        fill_info = execute_binance(symbol, "SELL", sell_qty)
+        fill_info = execute_exchange(symbol, "SELL", sell_qty)
         fills = fill_info.get("fills", [])
         if fills:
             total_quote = sum(float(f["price"]) * float(f["qty"]) for f in fills)
@@ -2960,36 +3491,44 @@ def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
                   "PARTIAL_TP", str(fill_info.get("orderId", "")),
                   extra={"pnl": round(pnl_partial, 4), "pnl_pct": round(pnl_pct, 3)})
 
-        # Step 3: Pasang OCO baru untuk sisa qty dengan SL yang sudah ada
+        # Step 3: Pasang TP/SL baru untuk sisa qty
         current_sl    = pos.get("sl_price", entry_price * 0.99)
         rounded_sl    = _round_price(current_sl, tick)
         rounded_sl_l  = _round_price(current_sl * 0.999, tick)
         rounded_tp    = _round_price(tp_price, tick)
         rounded_rem   = _round_step(remaining_qty, step)
 
-        client = make_binance_client()
-        oco = client.create_oco_order(
-            symbol=symbol,
-            side="SELL",
-            quantity=rounded_rem,
-            price=str(rounded_tp),
-            stopPrice=str(rounded_sl),
-            stopLimitPrice=str(rounded_sl_l),
-            stopLimitTimeInForce="GTC",
-        )
-        reports    = oco.get("orderReports", [])
-        new_tp_id  = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
-        new_sl_id  = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+        new_tp_id = new_sl_id = None
+        new_order_list_id = None
+        if ACTIVE_EXCHANGE == "mexc":
+            mexc_ord = place_mexc_tp_sl(symbol, rounded_rem, entry_price, atr=0)
+            if mexc_ord:
+                new_tp_id = mexc_ord.get("_tp_order_id")
+        else:
+            client = make_binance_client()
+            oco = client.create_oco_order(
+                symbol=symbol,
+                side="SELL",
+                quantity=rounded_rem,
+                price=str(rounded_tp),
+                stopPrice=str(rounded_sl),
+                stopLimitPrice=str(rounded_sl_l),
+                stopLimitTimeInForce="GTC",
+            )
+            reports    = oco.get("orderReports", [])
+            new_tp_id  = next((r["orderId"] for r in reports if r.get("type") == "LIMIT_MAKER"), None)
+            new_sl_id  = next((r["orderId"] for r in reports if r.get("type") == "STOP_LOSS_LIMIT"), None)
+            new_order_list_id = oco.get("orderListId")
 
         with positions_lock:
             if symbol in open_positions:
                 open_positions[symbol]["qty"]            = remaining_qty
                 open_positions[symbol]["tp_order_id"]    = new_tp_id
                 open_positions[symbol]["sl_order_id"]    = new_sl_id
-                open_positions[symbol]["order_list_id"]  = oco.get("orderListId")
+                open_positions[symbol]["order_list_id"]  = new_order_list_id
         save_state()
 
-        saldo_after = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
         send_telegram_message(
             f"🎯 *Partial TP — `{symbol}`*\n\n"
             f"Profit saat ini  : `{profit_pct:+.2f}%`\n"
@@ -3037,7 +3576,7 @@ def position_monitor_loop() -> None:
 
                 # ── 2. Ambil harga terkini (sekali, dipakai oleh step 2-4) ──
                 current_price = None
-                if LIVE_MODE and BINANCE_API_KEY:
+                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
                     try:
                         df_live = fetch_market(symbol, "1m", 2)
                         if df_live is not None and len(df_live) >= 1:
@@ -3084,7 +3623,7 @@ def position_monitor_loop() -> None:
                     continue
 
                 # ── 4. Cek reversal untuk early exit ─────────────────────────
-                if not (LIVE_MODE and BINANCE_API_KEY):
+                if not (LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY)):
                     continue
 
                 try:
@@ -3118,8 +3657,8 @@ def position_monitor_loop() -> None:
 
             # ── 6. Reset equity awal hari di tengah malam WIB (17:00 UTC) ───
             if now.hour == 17 and now.minute < 1 and daily_report_sent_date == today_str:
-                if LIVE_MODE and BINANCE_API_KEY:
-                    new_equity = get_binance_equity()
+                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
+                    new_equity = get_exchange_equity()
                     if new_equity > 0:
                         daily_start_equity = new_equity
                         logger.info(f"🔄 Equity awal hari baru: {daily_start_equity:.4f} USDT")
@@ -3185,7 +3724,7 @@ def send_daily_report(date_str: str, chat_id: Optional[int] = None,
         n_open = len(open_positions)
 
     # Ambil saldo sekarang untuk bandingkan dengan modal awal hari ini
-    saldo_now = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    saldo_now = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
     net_change = round(saldo_now - daily_start_equity, 4) if daily_start_equity > 0 else 0.0
     net_pct    = round((net_change / daily_start_equity * 100), 2) if daily_start_equity > 0 else 0.0
 
@@ -3398,7 +3937,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     atr_sl = atr * SL_ATR_MULT  # jarak Stop Loss dari entry
     atr_tp = atr * TP_ATR_MULT  # jarak Take Profit dari entry
 
-    raw_equity    = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 10_000.0
+    raw_equity    = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 10_000.0
     equity        = raw_equity * CAPITAL_ALLOCATION_PCT   # hanya pakai sebagian saldo
     qty           = calc_quantity(current_price, atr_sl if atr_sl > 0 else atr, equity, symbol=symbol)
 
@@ -3501,24 +4040,24 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         topic_id=_signal_topic(decision),
     )
 
-    binance_result, errors = {}, []
+    exchange_result, errors = {}, []
     try:
-        binance_result = execute_binance(symbol, decision, qty)
+        exchange_result = execute_exchange(symbol, decision, qty)
     except Exception as e:
-        errors.append(f"Binance: {e}")
+        errors.append(f"{ACTIVE_EXCHANGE.upper()}: {e}")
 
     fill_price = float(
-        binance_result.get("fills", [{}])[0].get("price", current_price)
-    ) if binance_result.get("fills") else current_price
-    filled_qty = float(binance_result.get("executedQty", qty)) if binance_result else qty
-    order_id   = str(binance_result.get("orderId", "ERR"))
+        exchange_result.get("fills", [{}])[0].get("price", current_price)
+    ) if exchange_result.get("fills") else float(exchange_result.get("price", current_price) or current_price)
+    filled_qty = float(exchange_result.get("executedQty", qty)) if exchange_result else qty
+    order_id   = str(exchange_result.get("orderId", "ERR"))
     status_str = "EXECUTED" if not errors else f"ERROR: {'; '.join(errors)}"
 
     log_trade(symbol, decision, qty, fill_price, avg_confidence,
               f"[Groq] {reason} | [Claude] {claude_reason}", status_str, order_id)
 
     total_spent    = round(filled_qty * fill_price, 4)
-    saldo_sekarang = get_binance_equity() if LIVE_MODE and BINANCE_API_KEY else 0.0
+    saldo_sekarang = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
     icon = "✅" if not errors else "⚠️"
     send_telegram_message(
         f"{icon} *Order {'masuk' if not errors else 'GAGAL'} — `{symbol}`*\n\n"
@@ -3534,9 +4073,9 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         topic_id=_signal_topic(decision),
     )
 
-    # Pasang OCO ATR-based TP/SL otomatis setelah BUY tereksekusi
+    # Pasang TP/SL otomatis setelah BUY tereksekusi
     if not errors and decision == "BUY" and filled_qty > 0:
-        oco = place_oco_sell(symbol, filled_qty, fill_price, atr=atr)
+        oco = place_exchange_tp_sl(symbol, filled_qty, fill_price, atr=atr)
         if oco:
             tp_price = oco.get("_tp_price", fill_price + atr_tp)
             sl_price = oco.get("_sl_price", fill_price - atr_sl)
@@ -3610,9 +4149,9 @@ def health_monitor_loop() -> None:
                 logger.warning(f"⚠️ Health alert: {since_hours:.1f}j tanpa sinyal")
 
             # ── 2. Alert equity drop + simpan snapshot ───────────────────────
-            if LIVE_MODE and BINANCE_API_KEY and daily_start_equity > 0:
+            if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) and daily_start_equity > 0:
                 try:
-                    equity = get_binance_equity()
+                    equity = get_exchange_equity()
                     if equity > 0:
                         drop_pct = (daily_start_equity - equity) / daily_start_equity * 100
 
@@ -3654,9 +4193,9 @@ def main_loop():
     # Load posisi tersimpan sebelum mulai loop
     load_state()
 
-    if LIVE_MODE and BINANCE_API_KEY:
-        daily_start_equity = get_binance_equity()
-        logger.info(f"💰 Equity awal Binance: {daily_start_equity} USDT")
+    if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
+        daily_start_equity = get_exchange_equity()
+        logger.info(f"💰 Equity awal {ACTIVE_EXCHANGE.upper()}: {daily_start_equity} USDT")
 
     with pairs_lock:
         n_pairs = len(active_pairs)
@@ -3846,6 +4385,7 @@ def main_loop():
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # ── Cek config kosong — beri tahu user untuk isi via /config ─────────────
     missing = [k for k, v in {
         "GROQ_API_KEY":       GROQ_API_KEY,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
@@ -3853,12 +4393,27 @@ if __name__ == "__main__":
     }.items() if not v or v == "0"]
 
     if missing:
-        logger.error(f"❌ Secret belum diisi: {', '.join(missing)}")
-        raise SystemExit(1)
+        logger.warning(
+            f"⚠️ Config belum lengkap: {', '.join(missing)}\n"
+            f"   → Buka /config di dashboard bot untuk mengisi API key."
+        )
+        # Jalankan Flask saja supaya user bisa akses /config untuk isi key
+        port = int(os.getenv("PORT", 3000))
+        logger.info(f"🌐 Dashboard config tersedia di port {port} → /config")
+        flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+        raise SystemExit(0)
 
-    if LIVE_MODE and not (BINANCE_API_KEY and BINANCE_API_SECRET):
-        logger.error("❌ BINANCE_API_KEY dan BINANCE_API_SECRET wajib diisi saat LIVE_MODE = True")
-        raise SystemExit(1)
+    if LIVE_MODE and ACTIVE_EXCHANGE == "binance" and not (BINANCE_API_KEY and BINANCE_API_SECRET):
+        logger.warning("⚠️ BINANCE_API_KEY/SECRET belum diisi → buka /config")
+        port = int(os.getenv("PORT", 3000))
+        flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+        raise SystemExit(0)
+
+    if LIVE_MODE and ACTIVE_EXCHANGE == "mexc" and not (MEXC_API_KEY and MEXC_API_SECRET):
+        logger.warning("⚠️ MEXC_API_KEY/SECRET belum diisi → buka /config")
+        port = int(os.getenv("PORT", 3000))
+        flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+        raise SystemExit(0)
 
     # Inisialisasi SQLite database (buat tabel trades + equity_snapshots)
     init_db()
