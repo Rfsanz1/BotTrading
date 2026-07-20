@@ -73,7 +73,7 @@ LIVE_MODE: bool = True
 # Set BINANCE_TESTNET=true di config.json atau Replit Secrets untuk aktifkan
 BINANCE_TESTNET: bool = _cfg("BINANCE_TESTNET", "false").lower() in ("1", "true", "yes")
 
-TRADING_PAIRS_ENV: str = os.getenv("TRADING_PAIRS", "ALL").strip()
+TRADING_PAIRS_ENV: str = _cfg("TRADING_PAIRS", "ALL").strip()
 
 CANDLE_INTERVAL: str = "1m"
 CANDLE_LIMIT: int = 100
