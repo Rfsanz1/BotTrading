@@ -1,38 +1,58 @@
 # AI Trading Bot
 
-Bot trading otomatis: Binance/MEXC (spot) + Groq AI (Llama 3.1) + Telegram.
+Automated crypto trading bot with dual-AI signals, Binance execution, and Telegram notifications.
 
-## Cara Jalankan
+## Stack
+- **Backend**: Python 3 + Flask (single file: `trading-bot/main.py`)
+- **Primary AI**: Groq – Llama 3.1-8b-instant
+- **Validator AI**: Claude Sonnet 5 via OpenRouter (optional — bot falls back to Groq if key missing)
+- **Exchange**: Binance Spot (testnet or live)
+- **Notifications**: Telegram (group topics support)
+- **Database**: SQLite (`trading-bot/trades.db`)
+- **State**: `trading-bot/bot_state.json` (open positions persisted across restarts)
 
-```
-cd trading-bot && python3 main.py
-```
+## Running on Replit
 
-Workflow sudah dikonfigurasi sebagai **Trading Bot**.
+Workflow: **Trading Bot** — `cd trading-bot && python3 main.py`
 
-## Isi API Keys
+Flask API runs on port `3000` (or `$PORT` env var). Endpoints:
+- `GET /api/status` — bot status
+- `GET /api/positions` — open positions
+- `GET /api/daily` — daily P&L
+- `GET /api/healthz` — health check
+- `GET /dashboard` — legacy HTML dashboard
 
-Buka halaman **`/config`** di preview bot (port 3000) untuk mengisi semua API key tanpa perlu edit file manual. Setelah simpan, restart bot agar aktif.
+## Required Secrets (Replit Secrets)
 
-### Key yang dibutuhkan
-| Key | Dapat dari |
-|-----|-----------|
-| `GROQ_API_KEY` | console.groq.com → API Keys (gratis) |
-| `BINANCE_API_KEY` + `SECRET` | binance.com → API Management |
-| `MEXC_API_KEY` + `SECRET` | mexc.com → API Management (jika pakai MEXC) |
-| `TELEGRAM_BOT_TOKEN` | @BotFather → /newbot |
-| `TELEGRAM_CHAT_ID` | api.telegram.org/bot\<TOKEN\>/getUpdates |
+| Secret | Description |
+|--------|-------------|
+| `TELEGRAM_BOT_TOKEN` | From @BotFather |
+| `TELEGRAM_CHAT_ID` | Group chat ID |
+| `BINANCE_API_KEY` | Binance API key |
+| `BINANCE_API_SECRET` | Binance API secret |
+| `GROQ_API_KEY` | From console.groq.com |
+| `OPENROUTER_API_KEY` | Optional — enables Claude Sonnet 5 validator |
 
-Config disimpan ke `trading-bot/config.json` (prioritas di atas env vars).
+## Config File
 
-## Exchange
+`trading-bot/config.json` — bot reads this first, then falls back to env vars.
+Currently set to `BINANCE_TESTNET: true` (virtual money). Change to `false` for live trading.
 
-Set `ACTIVE_EXCHANGE` ke `binance` (default) atau `mexc` di halaman `/config`.
+## Railway Deployment
 
-## Dashboard
+1. Push to GitHub
+2. Connect repo to Railway
+3. Railway picks up `railway.json` (root) and `trading-bot/nixpacks.toml` automatically
+4. Set the same env vars in Railway → Variables tab
+5. Deploy
 
-- `/config` — isi API key
-- `/dashboard` — status bot, posisi terbuka, equity curve, PnL
-- `/api/status` — JSON status
+## AI Models Used
+
+| Role | Model | Provider |
+|------|-------|----------|
+| Primary analyst | `llama-3.1-8b-instant` | Groq |
+| Validator (optional) | `anthropic/claude-sonnet-5` | OpenRouter |
 
 ## User Preferences
+- Keep all bot logic in the single `trading-bot/main.py` file (existing architecture)
+- Use `config.json` as primary config source, env vars as fallback
