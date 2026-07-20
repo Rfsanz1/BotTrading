@@ -4892,6 +4892,17 @@ def calc_quantity(current_price: float, atr: float,
     stop_dist = atr if atr > 0 else current_price * 0.01
     raw_qty   = max(max_loss / stop_dist, 0.0)
 
+    # CAP: total biaya tidak boleh melebihi seluruh equity yang dialokasikan.
+    # ATR kecil (harga ketat) bisa membuat qty sangat besar → biaya > saldo → -2010.
+    if current_price > 0:
+        max_affordable_qty = equity / current_price
+        if raw_qty > max_affordable_qty:
+            logger.debug(
+                f"calc_quantity: qty {raw_qty:.4f} dicap ke {max_affordable_qty:.4f} "
+                f"(biaya {raw_qty*current_price:.2f} USDT > equity {equity:.2f} USDT)"
+            )
+            raw_qty = max_affordable_qty
+
     # Terapkan Kelly multiplier (skala berdasarkan win rate terkini)
     raw_qty *= _kelly_multiplier()
 
