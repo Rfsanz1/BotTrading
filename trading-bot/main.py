@@ -3110,6 +3110,17 @@ def _tg_post(endpoint: str, payload: dict) -> Optional[dict]:
                 body = r.json() if r.content else {}
                 desc = body.get("description", "")
                 logger.error(f"Telegram {endpoint} error (attempt {attempt+1}): {r.status_code} {desc}")
+
+                # FIX 1: Markdown parse error — retry tanpa parse_mode (plain text)
+                if "can't parse entities" in desc and "parse_mode" in payload:
+                    logger.warning("⚠️ Markdown parse error — retry tanpa parse_mode (plain text)")
+                    payload_plain = {k: v for k, v in payload.items() if k != "parse_mode"}
+                    r2 = requests.post(url, json=payload_plain, timeout=10)
+                    if r2.ok:
+                        return r2.json()
+                    logger.error(f"Telegram plain-text retry juga gagal: {r2.status_code}")
+                    return None
+
                 if "message thread not found" in desc and "message_thread_id" in payload:
                     logger.warning("⚠️ Topic ID salah/belum diset — kirim ke General sebagai fallback")
                     payload_fallback = {k: v for k, v in payload.items() if k != "message_thread_id"}
@@ -3534,9 +3545,25 @@ def update_poller():
                 timeout=25,
             )
             if r.status_code == 409:
-                logger.warning("⚠️ 409 Conflict: ada instance bot lain. Tunggu 15s...")
-                time.sleep(15)
+                # FIX 2: 409 Conflict — instance bot lain masih aktif.
+                # Coba force-delete webhook lagi lalu backoff exponential.
+                _conflict_wait = min(60, 15 * (2 ** getattr(update_poller, '_conflict_count', 0)))
+                update_poller._conflict_count = getattr(update_poller, '_conflict_count', 0) + 1
+                logger.warning(
+                    f"⚠️ 409 Conflict: ada instance bot lain (#{update_poller._conflict_count}). "
+                    f"Coba force-delete webhook & tunggu {_conflict_wait}s..."
+                )
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+                        json={"drop_pending_updates": True},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+                time.sleep(_conflict_wait)
                 continue
+            update_poller._conflict_count = 0  # reset counter kalau sukses
             r.raise_for_status()
             for upd in r.json().get("result", []):
                 offset = upd["update_id"] + 1
@@ -3664,7 +3691,23 @@ def execute_binance(symbol: str, side: str, qty: float) -> dict:
             logger.info(f"Binance order: {order}")
             return order
         except Exception as e:
+            err_str = str(e)
             logger.error(f"Binance order error (attempt {attempt+1}): {e}")
+
+            # FIX 3: Saldo tidak cukup (-2010) — tidak perlu retry, langsung notif Telegram
+            if "-2010" in err_str or "insufficient balance" in err_str.lower():
+                top_up_hint = (
+                    "Testnet: top\\-up di testnet\\.binance\\.vision"
+                    if BINANCE_TESTNET else
+                    "Live: pastikan saldo USDT cukup di akun Binance"
+                )
+                send_telegram_message(
+                    f"⚠️ *Saldo tidak cukup \\— order dibatalkan*\n\n"
+                    f"Pair : `{symbol}` \\| Sisi : `{side}` \\| Qty : `{qty}`\n\n"
+                    f"💡 {top_up_hint}"
+                )
+                raise RuntimeError(f"Saldo tidak cukup untuk {side} {symbol}: {e}")
+
             time.sleep(2 ** attempt)
     raise RuntimeError("Binance order gagal setelah 3 kali coba")
 
