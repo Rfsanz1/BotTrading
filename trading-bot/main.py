@@ -249,6 +249,9 @@ DB_FILE: str = os.getenv("DB_FILE", "trades.db")
 
 GROQ_API_KEY        = _cfg("GROQ_API_KEY")
 OPENROUTER_API_KEY  = _cfg("OPENROUTER_API_KEY")
+ANTHROPIC_API_KEY   = _cfg("ANTHROPIC_API_KEY")
+OPENAI_API_KEY      = _cfg("OPENAI_API_KEY")
+GEMINI_API_KEY      = _cfg("GEMINI_API_KEY")
 TELEGRAM_BOT_TOKEN  = _cfg("TELEGRAM_BOT_TOKEN")
 
 _raw_chat_id = _cfg("TELEGRAM_CHAT_ID", "0")
@@ -3085,39 +3088,448 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
     return {"decision": "HOLD", "reason": "Validator AI gagal", "confidence": 0}
 
 
-def ask_ai_chat(user_text: str, user_name: str = "User") -> str:
-    """Percakapan bebas dengan Groq (bukan analisis trading)."""
-    global conversation_history
-    client = Groq(api_key=GROQ_API_KEY)
+# ---------------------------------------------------------------------------
+# ─── VALIDATOR: OpenAI GPT-4o ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 
-    user_msg = f"[{user_name}]: {user_text}"
-
+def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+                             df_5m=None, df_15m=None, funding=None, oi_change=None):
+    """Validator: OpenAI GPT-4o. Return dict atau None jika error/key kosong."""
+    if not OPENAI_API_KEY:
+        return None
     try:
-        with history_lock:
-            messages = (
-                [{"role": "system", "content": SYSTEM_PROMPT_TRADING}]
-                + conversation_history
-                + [{"role": "user", "content": user_msg}]
-            )
-
-        response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            max_tokens=600,
-            temperature=0.6,
-            messages=messages,
+        import openai as _openai
+        client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+        tf_blocks = (
+            _build_tf_block("1m — Primary", df_1m, 5)
+            + _build_tf_block("5m — Momentum", df_5m, 3)
+            + _build_tf_block("15m — Trend", df_15m, 3)
         )
-        reply = response.choices[0].message.content.strip()
+        atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+        price_now = float(df_1m.iloc[-1]["close"])
+        user_msg = (
+            f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
+            f"\n— MULTI-TIMEFRAME —{tf_blocks}\n"
+            f"\n— RISK-REWARD —\nATR14={atr_now:.6f} | "
+            f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
+            f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
+            f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
+            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"Verifikasi independen. Jawab hanya JSON: "
+            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+        )
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            max_tokens=200,
+            temperature=0.2,
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
+                {"role": "user",   "content": user_msg},
+            ],
+        )
+        raw = resp.choices[0].message.content.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip()
+        result = json.loads(raw)
+        result["confidence"] = int(result.get("confidence", 0))
+        result["decision"]   = result.get("decision", "HOLD").upper()
+        logger.info(f"OpenAI validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        return result
+    except Exception as e:
+        logger.error(f"OpenAI validator error ({symbol}): {e}")
+        return None
 
-        with history_lock:
-            conversation_history.append({"role": "user",     "content": user_msg})
-            conversation_history.append({"role": "assistant", "content": reply})
-            _trim_history()
 
-        return reply
+# ---------------------------------------------------------------------------
+# ─── VALIDATOR: Claude Sonnet (Anthropic direct API) ─────────────────────────
+# ---------------------------------------------------------------------------
+
+def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+                                    df_5m=None, df_15m=None, funding=None, oi_change=None):
+    """Validator: Claude via Anthropic direct API. Return dict atau None."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    try:
+        import anthropic as _anthropic
+        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        tf_blocks = (
+            _build_tf_block("1m — Primary", df_1m, 5)
+            + _build_tf_block("5m — Momentum", df_5m, 3)
+            + _build_tf_block("15m — Trend", df_15m, 3)
+        )
+        atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+        price_now = float(df_1m.iloc[-1]["close"])
+        user_msg = (
+            f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
+            f"\n— MULTI-TIMEFRAME —{tf_blocks}\n"
+            f"\n— RISK-REWARD —\nATR14={atr_now:.6f} | "
+            f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
+            f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
+            f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
+            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"Verifikasi independen. Jawab hanya JSON: "
+            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+        )
+        resp = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=200,
+            system=SYSTEM_PROMPT_VALIDATOR,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        raw = resp.content[0].text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip()
+        result = json.loads(raw)
+        result["confidence"] = int(result.get("confidence", 0))
+        result["decision"]   = result.get("decision", "HOLD").upper()
+        logger.info(f"Claude direct validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        return result
+    except Exception as e:
+        logger.error(f"Claude direct validator error ({symbol}): {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ─── VALIDATOR: Google Gemini ────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+                             df_5m=None, df_15m=None, funding=None, oi_change=None):
+    """Validator: Google Gemini Flash. Return dict atau None."""
+    if not GEMINI_API_KEY:
+        return None
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        tf_blocks = (
+            _build_tf_block("1m — Primary", df_1m, 5)
+            + _build_tf_block("5m — Momentum", df_5m, 3)
+            + _build_tf_block("15m — Trend", df_15m, 3)
+        )
+        atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+        price_now = float(df_1m.iloc[-1]["close"])
+        prompt = (
+            SYSTEM_PROMPT_VALIDATOR + "\n\n"
+            f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
+            f"\n— MULTI-TIMEFRAME —{tf_blocks}\n"
+            f"\n— RISK-REWARD —\nATR14={atr_now:.6f} | "
+            f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
+            f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
+            f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
+            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"Verifikasi independen. Jawab hanya JSON: "
+            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+        )
+        resp = model.generate_content(prompt)
+        raw = resp.text.strip()
+        if "```" in raw:
+            raw = raw.split("```")[1].lstrip("json").strip()
+        result = json.loads(raw)
+        result["confidence"] = int(result.get("confidence", 0))
+        result["decision"]   = result.get("decision", "HOLD").upper()
+        logger.info(f"Gemini validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        return result
+    except Exception as e:
+        logger.error(f"Gemini validator error ({symbol}): {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# ─── MULTI-AI CONSENSUS (Groq + Claude/OR + Claude/Direct + OpenAI + Gemini) ─
+# ---------------------------------------------------------------------------
+
+def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+                            df_5m=None, df_15m=None, funding=None, oi_change=None) -> dict:
+    """
+    Jalankan semua validator AI secara paralel.
+    Return: {
+      "decision": "BUY"|"SELL"|"HOLD",
+      "confidence": int (rata-rata dari model yang setuju),
+      "votes": { "BUY": n, "SELL": n, "HOLD": n },
+      "models": { "ModelName": {"decision": ..., "confidence": ..., "reason": ...} },
+      "total_responding": int,
+      "passed": bool  (True jika majority agree on BUY/SELL)
+    }
+    """
+    validators = {
+        "Claude/OpenRouter": lambda: ask_ai_openrouter(
+            symbol, df_1m, groq_signal,
+            df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
+        "Claude/Direct":     lambda: ask_ai_claude_direct_validator(
+            symbol, df_1m, groq_signal,
+            df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
+        "OpenAI/GPT-4o":     lambda: ask_ai_openai_validator(
+            symbol, df_1m, groq_signal,
+            df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
+        "Google/Gemini":     lambda: ask_ai_gemini_validator(
+            symbol, df_1m, groq_signal,
+            df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
+    }
+
+    results: dict = {}
+    threads = []
+
+    def _run(name, fn):
+        try:
+            results[name] = fn()
+        except Exception as e:
+            logger.error(f"Validator {name} crashed: {e}")
+            results[name] = None
+
+    for name, fn in validators.items():
+        t = threading.Thread(target=_run, args=(name, fn), daemon=True)
+        t.start()
+        threads.append(t)
+
+    for t in threads:
+        t.join(timeout=45)  # max 45 detik per validator
+
+    # Gabungkan dengan Groq sebagai suara pertama
+    all_models = {"Groq/Llama": groq_signal}
+    for name, res in results.items():
+        if res is not None:
+            all_models[name] = res
+
+    votes: dict = {"BUY": [], "SELL": [], "HOLD": []}
+    for name, res in all_models.items():
+        decision = res.get("decision", "HOLD").upper()
+        if decision not in votes:
+            decision = "HOLD"
+        votes[decision].append((name, res.get("confidence", 0)))
+
+    total = len(all_models)
+    n_buy  = len(votes["BUY"])
+    n_sell = len(votes["SELL"])
+
+    # Majority: lebih dari setengah model agree pada BUY atau SELL
+    majority_decision = "HOLD"
+    majority_confs    = []
+    if n_buy > total / 2:
+        majority_decision = "BUY"
+        majority_confs    = [c for _, c in votes["BUY"]]
+    elif n_sell > total / 2:
+        majority_decision = "SELL"
+        majority_confs    = [c for _, c in votes["SELL"]]
+
+    avg_conf = int(sum(majority_confs) / len(majority_confs)) if majority_confs else 0
+    passed   = majority_decision in ("BUY", "SELL")
+
+    return {
+        "decision":         majority_decision,
+        "confidence":       avg_conf,
+        "votes":            {k: len(v) for k, v in votes.items()},
+        "models":           all_models,
+        "total_responding": total,
+        "passed":           passed,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ─── CHART GENERATOR ─────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def generate_price_chart(symbol: str, interval: str = "1h", limit: int = 72) -> Optional[str]:
+    """
+    Ambil OHLCV dari Binance public API, buat chart candlestick gelap,
+    simpan ke temp PNG. Return path file atau None jika error.
+    """
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import tempfile
+
+        # Fetch OHLCV
+        r = requests.get(
+            "https://api.binance.com/api/v3/klines",
+            params={"symbol": symbol.upper(), "interval": interval, "limit": limit},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if not data or len(data) < 5:
+            return None
+
+        opens   = [float(c[1]) for c in data]
+        highs   = [float(c[2]) for c in data]
+        lows    = [float(c[3]) for c in data]
+        closes  = [float(c[4]) for c in data]
+        volumes = [float(c[5]) for c in data]
+        xs      = list(range(len(data)))
+
+        # Indikator sederhana
+        sma20 = [sum(closes[max(0, i-19):i+1]) / min(20, i+1) for i in range(len(closes))]
+        sma50 = [sum(closes[max(0, i-49):i+1]) / min(50, i+1) for i in range(len(closes))]
+
+        BG    = "#0f0f23"
+        GREEN = "#26a69a"
+        RED   = "#ef5350"
+
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(13, 8),
+            gridspec_kw={"height_ratios": [3, 1]},
+            facecolor=BG,
+        )
+        for ax in (ax1, ax2):
+            ax.set_facecolor(BG)
+            for spine in ax.spines.values():
+                spine.set_color("#2a2a3e")
+            ax.tick_params(colors="#777777", labelsize=8)
+
+        # Candlesticks
+        for i in xs:
+            col = GREEN if closes[i] >= opens[i] else RED
+            ax1.plot([i, i], [lows[i], highs[i]], color=col, linewidth=0.7, alpha=0.9)
+            ax1.bar(i, abs(closes[i] - opens[i]),
+                    bottom=min(opens[i], closes[i]),
+                    width=0.65, color=col, alpha=0.95)
+
+        # SMA
+        ax1.plot(xs, sma20, color="#ffa726", linewidth=1.3, label="SMA20", alpha=0.9)
+        ax1.plot(xs, sma50, color="#42a5f5", linewidth=1.3, label="SMA50", alpha=0.9)
+        ax1.legend(loc="upper left", facecolor="#1a1a2e", labelcolor="white",
+                   framealpha=0.8, fontsize=8)
+
+        # Harga terakhir
+        last_close  = closes[-1]
+        change_pct  = ((last_close - closes[0]) / closes[0]) * 100
+        sign        = "+" if change_pct >= 0 else ""
+        ax1.set_title(
+            f"{symbol}  ·  {last_close:.4f} USDT  ({sign}{change_pct:.2f}%)",
+            color="white", fontsize=13, pad=10, fontweight="bold",
+        )
+        ax1.set_ylabel("Harga (USDT)", color="#777777", fontsize=9)
+        ax1.tick_params(axis="x", labelbottom=False)
+        ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: f"{x:.4f}"))
+
+        # Harga line terakhir
+        ax1.axhline(last_close, color="#ffd54f", linewidth=0.8, linestyle="--", alpha=0.6)
+
+        # Volume
+        vol_colors = [GREEN if closes[i] >= opens[i] else RED for i in xs]
+        ax2.bar(xs, volumes, color=vol_colors, alpha=0.55, width=0.75)
+        ax2.set_ylabel("Volume", color="#777777", fontsize=8)
+        ax2.set_xlabel(
+            f"Interval: {interval}  ·  {limit} candle terakhir  ·  "
+            f"{datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}",
+            color="#555555", fontsize=7,
+        )
+
+        plt.tight_layout(pad=1.5)
+
+        tmp = tempfile.NamedTemporaryFile(
+            suffix=".png", delete=False, prefix=f"chart_{symbol}_"
+        )
+        plt.savefig(tmp.name, dpi=130, bbox_inches="tight",
+                    facecolor=BG, edgecolor="none")
+        plt.close(fig)
+        return tmp.name
 
     except Exception as e:
-        logger.error(f"ask_ai_chat error: {e}")
-        return f"Maaf, terjadi error saat memproses pertanyaan: {e}"
+        logger.error(f"generate_price_chart ({symbol}): {e}")
+        return None
+
+
+def send_telegram_photo(image_path: str, caption: str = "",
+                         topic_id=None, chat_id=None) -> Optional[dict]:
+    """Kirim gambar ke Telegram via sendPhoto."""
+    try:
+        url     = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+        payload = {"chat_id": chat_id or TELEGRAM_CHAT_ID}
+        if topic_id:
+            payload["message_thread_id"] = topic_id
+        if caption:
+            payload["caption"]    = caption
+            payload["parse_mode"] = "Markdown"
+        with open(image_path, "rb") as f:
+            resp = requests.post(url, data=payload, files={"photo": f}, timeout=30)
+        return resp.json() if resp.ok else None
+    except Exception as e:
+        logger.error(f"send_telegram_photo error: {e}")
+        return None
+    finally:
+        try:
+            import os as _os_tmp
+            _os_tmp.unlink(image_path)
+        except Exception:
+            pass
+
+
+def ask_ai_chat(user_text: str, user_name: str = "User") -> str:
+    """
+    Percakapan bebas — pakai OpenAI GPT-4o jika tersedia (lebih pintar),
+    fallback ke Claude Direct, lalu Groq Llama jika keduanya tidak ada.
+    """
+    global conversation_history
+    user_msg = f"[{user_name}]: {user_text}"
+
+    with history_lock:
+        messages = (
+            [{"role": "system", "content": SYSTEM_PROMPT_TRADING}]
+            + conversation_history
+            + [{"role": "user", "content": user_msg}]
+        )
+
+    reply = None
+
+    # ── Coba OpenAI GPT-4o dulu (paling pintar untuk chat) ──────────────────
+    if OPENAI_API_KEY and reply is None:
+        try:
+            import openai as _openai
+            client = _openai.OpenAI(api_key=OPENAI_API_KEY)
+            resp = client.chat.completions.create(
+                model="gpt-4o",
+                max_tokens=800,
+                temperature=0.7,
+                messages=messages,
+            )
+            reply = resp.choices[0].message.content.strip()
+            logger.debug(f"ask_ai_chat: replied via OpenAI GPT-4o")
+        except Exception as e:
+            logger.warning(f"ask_ai_chat OpenAI error: {e}")
+
+    # ── Fallback Claude Direct ────────────────────────────────────────────────
+    if ANTHROPIC_API_KEY and reply is None:
+        try:
+            import anthropic as _anthropic
+            client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+            resp = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=800,
+                system=SYSTEM_PROMPT_TRADING,
+                messages=[{"role": "user", "content": user_msg}],
+            )
+            reply = resp.content[0].text.strip()
+            logger.debug(f"ask_ai_chat: replied via Claude direct")
+        except Exception as e:
+            logger.warning(f"ask_ai_chat Claude error: {e}")
+
+    # ── Fallback Groq Llama ───────────────────────────────────────────────────
+    if reply is None:
+        try:
+            client = Groq(api_key=GROQ_API_KEY)
+            resp = client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                max_tokens=600,
+                temperature=0.6,
+                messages=messages,
+            )
+            reply = resp.choices[0].message.content.strip()
+            logger.debug(f"ask_ai_chat: replied via Groq Llama fallback")
+        except Exception as e:
+            logger.error(f"ask_ai_chat Groq fallback error: {e}")
+            return f"Maaf, semua AI sedang tidak bisa dihubungi: {e}"
+
+    with history_lock:
+        conversation_history.append({"role": "user",      "content": user_msg})
+        conversation_history.append({"role": "assistant",  "content": reply})
+        _trim_history()
+
+    return reply
 
 # ---------------------------------------------------------------------------
 # ─── 4. TELEGRAM ────────────────────────────────────────────────────────────
@@ -3369,28 +3781,33 @@ def handle_incoming_message(msg: dict) -> None:
             paused = bot_paused
         mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
         pause_note = "\n⏸ *BOT SEDANG DIPAUSE* — ketik `/start` untuk lanjut" if paused else ""
+        ai_count = sum(bool(k) for k in [GROQ_API_KEY, OPENROUTER_API_KEY,
+                                          ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
         send_telegram_message(
             f"🤖 *Trading Bot AI*{pause_note}\n\n"
             f"Mode  : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
             f"Pair  : `{n_pairs}` USDT tiap `{CANDLE_INTERVAL}`\n"
             f"Posisi: `{n_pos}/{MAX_CONCURRENT_POSITIONS}` terbuka\n"
-            f"AI    : Groq Llama 3\\.1 \\+ Claude Sonnet 5\n\n"
+            f"AI    : `{ai_count}` model \\(Groq \\+ Claude \\+ OpenAI \\+ Gemini\\)\n\n"
             "*⚡ Perintah utama:*\n"
-            "`/start`        — mulai/paksa analisis sekarang\n"
-            "`/stop`         — matikan bot sepenuhnya\n"
-            "`/pause`        — hentikan trading sementara \\(bot tetap jalan\\)\n"
-            "`/resume`       — lanjutkan trading setelah pause\n\n"
-            "*📊 Perintah trading:*\n"
-            "`/saldo`        — saldo & portfolio akun\n"
-            "`/posisi`       — daftar posisi terbuka\n"
-            "`/laporan`      — laporan P&L hari ini\n"
-            "`/tutup SYMBOL` — paksa tutup posisi \\(misal `/tutup BTCUSDT`\\)\n"
-            "`/tutupall`     — tutup semua posisi terbuka\n\n"
+            "`/start`         — paksa analisis sekarang\n"
+            "`/stop`          — matikan bot sepenuhnya\n"
+            "`/pause`         — hentikan trading sementara\n"
+            "`/resume`        — lanjutkan trading\n\n"
+            "*📊 Pantau dari sini:*\n"
+            "`/monitor`       — status bot, saldo, semua posisi\n"
+            "`/chart SYMBOL`  — grafik candlestick \\(misal `/chart BTCUSDT 4h`\\)\n"
+            "`/saldo`         — saldo & portfolio akun\n"
+            "`/posisi`        — daftar posisi terbuka\n"
+            "`/laporan`       — laporan P&L hari ini\n"
+            "`/tutup SYMBOL`  — tutup posisi \\(misal `/tutup BTCUSDT`\\)\n"
+            "`/tutupall`      — tutup semua posisi\n\n"
             "*💬 Perintah lain:*\n"
-            "`/berita`  — headline crypto terbaru\n"
-            "`/pairs`   — jumlah pair dipindai\n"
-            "`/history` — cek memory AI\n"
-            "`/reset`   — hapus memory AI",
+            "`/berita`   — headline crypto terbaru\n"
+            "`/pairs`    — jumlah pair dipindai\n"
+            "`/history`  — cek memory AI\n"
+            "`/reset`    — hapus memory AI\n\n"
+            "_💬 Chat bebas juga bisa — tanya apapun soal market atau minta chart_",
             topic_id=thread_id,
             chat_id=chat_id,
         )
@@ -3504,6 +3921,71 @@ def handle_incoming_message(msg: dict) -> None:
         ).start()
         return
 
+    if cmd in ("/chart", "/grafik"):
+        parts  = text.split()
+        symbol = parts[1].upper() if len(parts) >= 2 else "BTCUSDT"
+        if not symbol.endswith("USDT"):
+            symbol += "USDT"
+        interval = "1h"
+        if len(parts) >= 3 and parts[2] in ("1m","5m","15m","1h","4h","1d"):
+            interval = parts[2]
+        send_telegram_message(
+            f"📊 _Membuat chart `{symbol}` interval `{interval}`\\.\\.\\._",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        img_path = generate_price_chart(symbol, interval=interval, limit=80)
+        if img_path:
+            send_telegram_photo(
+                img_path,
+                caption=(
+                    f"📊 *{symbol}* — interval `{interval}`\n"
+                    f"_Data Binance · {datetime.now(timezone.utc).strftime('%d %b %Y %H:%M UTC')}_"
+                ),
+                topic_id=thread_id, chat_id=chat_id,
+            )
+        else:
+            send_telegram_message(
+                f"⚠️ Gagal buat chart `{symbol}`\\. Cek nama pair, contoh: `/chart BTCUSDT 1h`",
+                topic_id=thread_id, chat_id=chat_id,
+            )
+        return
+
+    if cmd == "/monitor":
+        with bot_paused_lock:
+            paused = bot_paused
+        with positions_lock:
+            snap = dict(open_positions)
+        with pairs_lock:
+            n_pairs = len(active_pairs)
+        mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
+        status_str = "⏸ DIPAUSE" if paused else "✅ Aktif"
+        ai_count = sum(bool(k) for k in [GROQ_API_KEY, OPENROUTER_API_KEY,
+                                          ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
+        lines_pos = []
+        for sym, p in snap.items():
+            entry  = p.get("entry_price", 0)
+            tp     = p.get("tp_price", 0)
+            sl     = p.get("sl_price", 0)
+            trail  = " 📈trail" if p.get("trailing_sl_active") else ""
+            lines_pos.append(f"  • `{sym}`{trail}: entry=`{entry}` TP=`{tp}` SL=`{sl}`")
+        pos_block = ("\n" + "\n".join(lines_pos)) if lines_pos else " _tidak ada_"
+        saldo_txt = ""
+        if LIVE_MODE and BINANCE_API_KEY:
+            eq = get_exchange_equity()
+            saldo_txt = f"\n💰 Saldo USDT   : `{eq:.4f}`"
+        send_telegram_message(
+            f"📡 *Status Bot — Real\\-time*\n\n"
+            f"Status   : {status_str}\n"
+            f"Mode     : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
+            f"AI aktif : `{ai_count}` model \\(Groq, Claude, OpenAI, Gemini\\)\n"
+            f"Pair     : memindai `{n_pairs}` pair"
+            f"{saldo_txt}\n\n"
+            f"📂 *Posisi terbuka \\({len(snap)}\\):*{pos_block}\n\n"
+            f"_Gunakan `/chart SYMBOL` untuk lihat grafik harga_",
+            topic_id=thread_id, chat_id=chat_id,
+        )
+        return
+
     if cmd == "/pairs":
         with pairs_lock:
             n_pairs = len(active_pairs)
@@ -3563,6 +4045,66 @@ def handle_incoming_message(msg: dict) -> None:
 
 
 def _reply_chat(text: str, user_name: str, chat_id: int, thread_id: Optional[int]):
+    """Handle chat — deteksi request chart dan kirim gambar, atau balas teks biasa."""
+    # ── Deteksi permintaan chart ──────────────────────────────────────────────
+    _CHART_KEYWORDS = ("chart", "grafik", "gambar", "candlestick", "candle",
+                       "lihat harga", "tampilkan harga", "harga sekarang")
+    lower_text = text.lower()
+    is_chart_request = any(kw in lower_text for kw in _CHART_KEYWORDS)
+
+    if is_chart_request:
+        # Coba ekstrak symbol dari teks (kata kapital berakhiran USDT, BTC, ETH, dll)
+        import re as _re
+        sym_match = _re.search(r'\b([A-Z]{2,10}USDT|[A-Z]{2,10}BTC|[A-Z]{2,10}ETH)\b', text.upper())
+        # Atau cari kata sembarang setelah keyword chart
+        if not sym_match:
+            # Coba cari pair apapun setelah kata kunci
+            after_kw = _re.search(
+                r'(?:chart|grafik|gambar|candle)\s+([a-zA-Z]{2,10})', lower_text
+            )
+            if after_kw:
+                raw_sym = after_kw.group(1).upper()
+                if not raw_sym.endswith("USDT"):
+                    raw_sym += "USDT"
+                sym_match = type("M", (), {"group": lambda s, n=1: raw_sym})()
+
+        if sym_match:
+            symbol = sym_match.group(1) if callable(sym_match.group) else sym_match.group(1)
+            # Tentukan interval — default 1h
+            interval = "1h"
+            if any(k in lower_text for k in ("15m", "15 menit")):
+                interval = "15m"
+            elif any(k in lower_text for k in ("4h", "4 jam")):
+                interval = "4h"
+            elif any(k in lower_text for k in ("1d", "harian", "daily")):
+                interval = "1d"
+
+            send_telegram_message(
+                f"📊 _Membuat chart {symbol} interval {interval}\\.\\.\\._",
+                chat_id=chat_id, topic_id=thread_id,
+            )
+            img_path = generate_price_chart(symbol, interval=interval, limit=80)
+            if img_path:
+                send_telegram_photo(
+                    img_path,
+                    caption=f"📊 *{symbol}* — interval `{interval}`\n_Data dari Binance Public API_",
+                    topic_id=thread_id, chat_id=chat_id,
+                )
+                return
+            else:
+                send_telegram_message(
+                    f"⚠️ Gagal buat chart untuk `{symbol}`\\. Coba lagi atau cek nama pair\\.",
+                    chat_id=chat_id, topic_id=thread_id,
+                )
+                return
+        else:
+            send_telegram_message(
+                "📊 Mau lihat chart pair apa? Contoh: _\"chart BTCUSDT\"_ atau _\"grafik ETHUSDT 4h\"_",
+                chat_id=chat_id, topic_id=thread_id,
+            )
+            return
+
+    # ── Balas teks biasa via AI ───────────────────────────────────────────────
     reply = ask_ai_chat(text, user_name)
     payload: dict = {
         "chat_id":    chat_id,
@@ -5112,57 +5654,68 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     from datetime import timedelta
     now_wib = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%H:%M WIB")
 
-    # ── Step 2: Validator Claude Sonnet 5 via OpenRouter ────────────────────
+    # ── Step 2: Jalankan semua validator AI secara paralel ──────────────────
+    ai_count = sum(bool(k) for k in [OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
     send_telegram_message(
         f"🔍 *Sinyal {decision} terdeteksi — {symbol}*\n\n"
         f"⏰ `{now_wib}` \\| Harga: `{current_price}`\n\n"
-        f"🤖 *Groq*: *{decision}* \\({confidence}%\\)\n"
+        f"🤖 *Groq/Llama*: *{decision}* \\({confidence}%\\)\n"
         f"💬 _{reason}_\n\n"
         f"📐 ATR14: `{atr:.6f}` \\({atr_pct:.3f}%\\)\n"
         f"🎯 TP: `{tp_preview}` \\(+`{potential_profit:.4f}` USDT\\)\n"
         f"🛡 SL: `{sl_preview}` \\(-`{potential_loss:.4f}` USDT\\)\n"
         f"💵 Est\\. modal: `{estimated_cost:.4f}` USDT\n"
         f"📊 Saldo terpakai: `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari akun\n\n"
-        f"⏳ _Meminta validasi Claude Sonnet 5\\.\\.\\._",
+        f"⏳ _Meminta validasi {ai_count} AI \\(Claude, OpenAI, Gemini\\)\\.\\.\\._",
         topic_id=_signal_topic(decision),
     )
 
-    claude_signal = ask_ai_openrouter(
+    consensus = run_multi_ai_consensus(
         symbol, df_1m, signal,
         df_5m=df_5m, df_15m=df_15m,
         funding=funding, oi_change=oi_change,
     )
-    claude_decision   = claude_signal["decision"]
-    claude_confidence = claude_signal["confidence"]
-    claude_reason     = claude_signal["reason"]
+    final_decision = consensus["decision"]
+    avg_confidence = consensus["confidence"]
+    votes          = consensus["votes"]
+    models_result  = consensus["models"]
+    n_total        = consensus["total_responding"]
 
-    # ── Step 3: Cek consensus ────────────────────────────────────────────────
-    both_agree = (decision == claude_decision and decision != "HOLD")
-    avg_confidence = (confidence + claude_confidence) // 2
+    # Baris voting per model
+    model_lines = ""
+    _icons = {"BUY": "🟢", "SELL": "🔴", "HOLD": "⏸"}
+    for mname, mres in models_result.items():
+        mdec = mres.get("decision", "HOLD")
+        mconf = mres.get("confidence", 0)
+        model_lines += f"\n{_icons.get(mdec,'⚪')} *{mname}*: {mdec} \\({mconf}%\\)"
 
-    if not both_agree:
+    # ── Step 3: Evaluasi majority vote ──────────────────────────────────────
+    if not consensus["passed"]:
         log_trade(symbol, decision, 0, current_price, confidence, reason, "CONSENSUS_FAIL")
+        vote_summary = f"BUY={votes['BUY']} SELL={votes['SELL']} HOLD={votes['HOLD']} dari {n_total} AI"
         send_telegram_message(
-            f"🤔 *Dua AI beda pendapat — {symbol} dilewati*\n\n"
-            f"Groq   : *{decision}* \\({confidence}%\\) — _{reason}_\n"
-            f"Claude : *{claude_decision}* \\({claude_confidence}%\\) — _{claude_reason}_\n\n"
-            f"⏸ _Tidak ada order — tunggu sinyal lebih jelas_",
+            f"🤔 *AI tidak sepakat — {symbol} dilewati*\n\n"
+            f"*Voting \\({n_total} AI\\):*{model_lines}\n\n"
+            f"📊 `{vote_summary}`\n"
+            f"⏸ _Majority belum tercapai — tunggu sinyal lebih jelas_",
             topic_id=_signal_topic(decision),
         )
         return
 
-    # ── Step 4: Keduanya sepakat → eksekusi otomatis ─────────────────────────
+    # ── Step 4: Majority sepakat → eksekusi ─────────────────────────────────
+    vote_summary = f"BUY={votes['BUY']} SELL={votes['SELL']} HOLD={votes['HOLD']} dari {n_total} AI"
+
     if not LIVE_MODE:
-        logger.info(f"[SIM] CONSENSUS {decision} {qty} {symbol} @ ~{current_price}")
-        log_trade(symbol, decision, qty, current_price, avg_confidence, reason, "SIMULATED")
+        logger.info(f"[SIM] MULTI-AI CONSENSUS {final_decision} {qty} {symbol} @ ~{current_price}")
+        log_trade(symbol, final_decision, qty, current_price, avg_confidence, reason, "SIMULATED")
         send_telegram_message(
-            f"🔵 *\\[SIMULASI\\] Konsensus 2 AI\\!*\n\n"
+            f"🔵 *\\[SIMULASI\\] Konsensus {n_total} AI — {final_decision}\\!*\n\n"
             f"Koin    : `{symbol}`\n"
-            f"Aksi    : *{'Beli' if decision=='BUY' else 'Jual'}*\n"
+            f"Aksi    : *{'Beli' if final_decision=='BUY' else 'Jual'}*\n"
             f"Volume  : `{qty}`\n"
-            f"Harga   : `~{current_price}`\n"
-            f"Groq    : `{confidence}%` — _{reason}_\n"
-            f"Claude  : `{claude_confidence}%` — _{claude_reason}_\n\n"
+            f"Harga   : `~{current_price}`\n\n"
+            f"*Voting AI:*{model_lines}\n\n"
+            f"📊 `{vote_summary}` → rata\\-rata yakin `{avg_confidence}%`\n"
             f"🎯 *R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)} \\(ATR\\-based\\)*\n"
             f"TP preview : `{tp_preview}`\n"
             f"SL preview : `{sl_preview}`",
@@ -5174,21 +5727,22 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         return
 
     # Kirim notif "sedang eksekusi" sebelum order masuk
-    arah_label = "BELI 🟢" if decision == "BUY" else "JUAL 🔴"
+    arah_label = "BELI 🟢" if final_decision == "BUY" else "JUAL 🔴"
     send_telegram_message(
-        f"⚡ *Konsensus 2 AI — Eksekusi {symbol}\\!*\n\n"
-        f"Arah          : *{arah_label}*\n"
-        f"Harga masuk   : `~{current_price}`\n"
-        f"Qty           : `{qty}`\n"
-        f"Est\\. biaya   : `{estimated_cost:.4f} USDT`\n"
-        f"Keyakinan     : Groq `{confidence}%` \\| Claude `{claude_confidence}%` → avg `{avg_confidence}%`\n\n"
+        f"⚡ *Konsensus {n_total} AI — Eksekusi {symbol}\\!*\n\n"
+        f"Arah        : *{arah_label}*\n"
+        f"Harga masuk : `~{current_price}`\n"
+        f"Qty         : `{qty}`\n"
+        f"Est\\. biaya : `{estimated_cost:.4f} USDT`\n"
+        f"Keyakinan   : rata\\-rata `{avg_confidence}%`\n\n"
+        f"*Voting:*{model_lines}\n\n"
         f"🔄 _Mengirim order ke Binance\\.\\.\\._",
         topic_id=_signal_topic(decision),
     )
 
     exchange_result, errors = {}, []
     try:
-        exchange_result = execute_exchange(symbol, decision, qty)
+        exchange_result = execute_exchange(symbol, final_decision, qty)
     except Exception as e:
         errors.append(f"{ACTIVE_EXCHANGE.upper()}: {e}")
 
@@ -5199,28 +5753,32 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     order_id   = str(exchange_result.get("orderId", "ERR"))
     status_str = "EXECUTED" if not errors else f"ERROR: {'; '.join(errors)}"
 
-    log_trade(symbol, decision, qty, fill_price, avg_confidence,
-              f"[Groq] {reason} | [Claude] {claude_reason}", status_str, order_id)
+    # Ringkasan alasan dari semua model
+    reasons_summary = " | ".join(
+        f"[{mn}] {mr.get('reason','')[:60]}"
+        for mn, mr in models_result.items()
+    )
+    log_trade(symbol, final_decision, qty, fill_price, avg_confidence,
+              reasons_summary, status_str, order_id)
 
     total_spent    = round(filled_qty * fill_price, 4)
     saldo_sekarang = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
     icon = "✅" if not errors else "⚠️"
     send_telegram_message(
         f"{icon} *Order {'masuk' if not errors else 'GAGAL'} — `{symbol}`*\n\n"
-        f"Aksi         : *{'🟢 BELI' if decision=='BUY' else '🔴 JUAL'}*\n"
+        f"Aksi         : *{'🟢 BELI' if final_decision=='BUY' else '🔴 JUAL'}*\n"
         f"Harga fill   : `{fill_price}`\n"
         f"Qty          : `{filled_qty}`\n"
         f"Total biaya  : `{total_spent:.4f} USDT`\n"
         f"Saldo USDT   : `{saldo_sekarang:.4f}`\n"
         f"ID Order     : `{order_id}`\n\n"
-        f"🤖 Groq `{confidence}%`: _{reason}_\n"
-        f"🤖 Claude `{claude_confidence}%`: _{claude_reason}_\n\n"
+        f"*Voting {n_total} AI:*{model_lines}\n\n"
         f"{'✅ Tereksekusi otomatis' if not errors else '⚠️ Error: ' + '; '.join(errors)}",
-        topic_id=_signal_topic(decision),
+        topic_id=_signal_topic(final_decision),
     )
 
     # Pasang TP/SL otomatis setelah BUY tereksekusi
-    if not errors and decision == "BUY" and filled_qty > 0:
+    if not errors and final_decision == "BUY" and filled_qty > 0:
         oco = place_exchange_tp_sl(symbol, filled_qty, fill_price, atr=atr)
         if oco:
             tp_price = oco.get("_tp_price", fill_price + atr_tp)
@@ -5246,13 +5804,13 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
                 f"✅ TP kena → saldo \\+`{usdt_tp_gain:.4f}` USDT → jadi `{saldo_if_tp:.4f}` USDT\n"
                 f"❌ SL kena → saldo \\-`{usdt_sl_loss:.4f}` USDT → jadi `{saldo_if_sl:.4f}` USDT\n\n"
                 f"⏳ _Menunggu harga menyentuh TP atau SL\\.\\.\\._",
-                topic_id=_signal_topic(decision),
+                topic_id=_signal_topic(final_decision),
             )
         else:
             send_telegram_message(
                 f"⚠️ *TP/SL gagal dipasang* untuk `{symbol}`\\. "
                 f"Posisi terbuka — pantau manual\\.",
-                topic_id=_signal_topic(decision),
+                topic_id=_signal_topic(final_decision),
             )
 
 # ---------------------------------------------------------------------------

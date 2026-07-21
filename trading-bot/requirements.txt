@@ -5,3 +5,8 @@ groq
 python-binance
 feedparser
 psutil
+anthropic
+openai
+google-generativeai
+matplotlib
+mplfinance
