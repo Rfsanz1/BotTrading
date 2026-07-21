@@ -64,7 +64,7 @@ def _cfg(key: str, default: str = "") -> str:
 # ─── KONFIGURASI ────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-LIVE_MODE: bool = True
+LIVE_MODE: bool = _cfg("LIVE_MODE", "true").lower() in ("1", "true", "yes")
 
 # Kosongkan / set "ALL" di TRADING_PAIRS env var untuk memindai SEMUA pair
 # spot USDT yang ada di Binance. Atau isi daftar spesifik, contoh:
