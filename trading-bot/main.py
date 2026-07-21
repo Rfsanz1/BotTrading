@@ -600,6 +600,9 @@ MAX_NEW_NEWS_PER_CYCLE = 6  # batasi spam kalau tiba-tiba banyak headline baru
 bot_paused: bool = False
 bot_paused_lock = threading.Lock()
 
+# Event untuk memaksa scan langsung (dipicu oleh /start)
+force_scan_event = threading.Event()
+
 # Tracking Binance API weight (dari response header x-mbx-used-weight-1m)
 _api_weight_1m: int = 0
 _api_weight_lock = threading.Lock()
@@ -3280,6 +3283,7 @@ def _is_allowed(chat_id: int) -> bool:
 
 def handle_incoming_message(msg: dict) -> None:
     """Proses pesan teks masuk dari Telegram (chat percakapan)."""
+    global bot_paused
     chat_id   = msg["chat"]["id"]
     thread_id = msg.get("message_thread_id")
     text      = msg.get("text", "").strip()
@@ -3322,7 +3326,41 @@ def handle_incoming_message(msg: dict) -> None:
     if TELEGRAM_CHAT_TOPIC_ID and thread_id != TELEGRAM_CHAT_TOPIC_ID:
         return
 
-    if cmd in ("/start", "/help"):
+    if cmd == "/start":
+        if not _is_allowed(chat_id):
+            return
+        with bot_paused_lock:
+            was_paused = bot_paused
+            bot_paused = False
+        force_scan_event.set()
+        with pairs_lock:
+            n_pairs = len(active_pairs)
+        resume_note = " \\(bot sudah di\\-unpause\\)" if was_paused else ""
+        send_telegram_message(
+            f"🚀 *Bot mulai analisis sekarang\\!*{resume_note}\n\n"
+            f"Memindai `{n_pairs}` pair USDT langsung saat ini\\.\n"
+            f"Sinyal buy/sell akan muncul jika AI menemukan peluang\\.\n\n"
+            f"_Gunakan `/stop` untuk mematikan bot sepenuhnya\\._",
+            topic_id=thread_id,
+            chat_id=chat_id,
+        )
+        return
+
+    if cmd == "/stop":
+        if not _is_allowed(chat_id):
+            return
+        send_telegram_message(
+            "🛑 *Bot dimatikan\\.*\n\nProses dihentikan sepenuhnya\\. "
+            "Restart bot secara manual untuk menghidupkan kembali\\.",
+            topic_id=thread_id,
+            chat_id=chat_id,
+        )
+        time.sleep(1)
+        import os as _os
+        _os._exit(0)
+        return
+
+    if cmd == "/help":
         with pairs_lock:
             n_pairs = len(active_pairs)
         with positions_lock:
@@ -3330,19 +3368,22 @@ def handle_incoming_message(msg: dict) -> None:
         with bot_paused_lock:
             paused = bot_paused
         mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
-        pause_note = "\n⏸ *BOT SEDANG DIPAUSE* — ketik `/resume` untuk lanjut" if paused else ""
+        pause_note = "\n⏸ *BOT SEDANG DIPAUSE* — ketik `/start` untuk lanjut" if paused else ""
         send_telegram_message(
             f"🤖 *Trading Bot AI*{pause_note}\n\n"
             f"Mode  : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
             f"Pair  : `{n_pairs}` USDT tiap `{CANDLE_INTERVAL}`\n"
             f"Posisi: `{n_pos}/{MAX_CONCURRENT_POSITIONS}` terbuka\n"
             f"AI    : Groq Llama 3\\.1 \\+ Claude Sonnet 5\n\n"
+            "*⚡ Perintah utama:*\n"
+            "`/start`        — mulai/paksa analisis sekarang\n"
+            "`/stop`         — matikan bot sepenuhnya\n"
+            "`/pause`        — hentikan trading sementara \\(bot tetap jalan\\)\n"
+            "`/resume`       — lanjutkan trading setelah pause\n\n"
             "*📊 Perintah trading:*\n"
             "`/saldo`        — saldo & portfolio akun\n"
             "`/posisi`       — daftar posisi terbuka\n"
             "`/laporan`      — laporan P&L hari ini\n"
-            "`/pause`        — hentikan trading sementara\n"
-            "`/resume`       — lanjutkan trading\n"
             "`/tutup SYMBOL` — paksa tutup posisi \\(misal `/tutup BTCUSDT`\\)\n"
             "`/tutupall`     — tutup semua posisi terbuka\n\n"
             "*💬 Perintah lain:*\n"
@@ -5192,13 +5233,18 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
                       "PLACED", str(oco.get("orderListId", "")))
             usdt_tp_gain = round(filled_qty * (tp_price - fill_price), 4)
             usdt_sl_loss = round(filled_qty * (fill_price - sl_price), 4)
+            saldo_if_tp = round(saldo_sekarang + usdt_tp_gain, 4)
+            saldo_if_sl = round(saldo_sekarang - usdt_sl_loss, 4)
             send_telegram_message(
                 f"🎯 *TP/SL terpasang — `{symbol}`*\n\n"
                 f"Entry      : `{fill_price}`\n"
-                f"Take Profit: `{tp_price}` \\(\\+{tp_pct_actual:.2f}% \\| \\+`{usdt_tp_gain:.4f}` USDT\\)\n"
-                f"Stop Loss  : `{sl_price}` \\(\\-{sl_pct_actual:.2f}% \\| \\-`{usdt_sl_loss:.4f}` USDT\\)\n"
+                f"Take Profit: `{tp_price}` \\(\\+{tp_pct_actual:.2f}%\\)\n"
+                f"Stop Loss  : `{sl_price}` \\(\\-{sl_pct_actual:.2f}%\\)\n"
                 f"R:R        : `1:{int(TP_ATR_MULT/SL_ATR_MULT)}` \\(ATR14={atr:.6f}\\)\n"
                 f"Qty        : `{filled_qty}` \\| Modal: `{total_spent:.4f}` USDT\n\n"
+                f"💰 *Proyeksi saldo:*\n"
+                f"✅ TP kena → saldo \\+`{usdt_tp_gain:.4f}` USDT → jadi `{saldo_if_tp:.4f}` USDT\n"
+                f"❌ SL kena → saldo \\-`{usdt_sl_loss:.4f}` USDT → jadi `{saldo_if_sl:.4f}` USDT\n\n"
                 f"⏳ _Menunggu harga menyentuh TP atau SL\\.\\.\\._",
                 topic_id=_signal_topic(decision),
             )
@@ -5447,7 +5493,7 @@ def main_loop():
         f"\\(aktif di \\+{TRAILING_SL_ACTIVATE_PCT}%, trail {TRAILING_SL_TRAIL_PCT}%\\)\n"
         f"Modal    : `{int(CAPITAL_ALLOCATION_PCT*100)}%` saldo \\| max `{MAX_CONCURRENT_POSITIONS}` posisi\n"
         f"Min yakin: `{CONFIDENCE_THRESHOLD}%`\n\n"
-        f"📊 *Perintah:* `/saldo` `/posisi` `/laporan` `/pause` `/resume` `/tutup SYMBOL`"
+        f"📊 *Perintah:* `/start` `/stop` `/pause` `/resume` `/saldo` `/posisi` `/laporan` `/tutup SYMBOL`"
         + portfolio_text
         + topic_info,
         topic_id=None,
@@ -5575,7 +5621,9 @@ def main_loop():
 
             elapsed = time.time() - cycle_start
             remaining = max(LOOP_SLEEP - elapsed, 5)
-            time.sleep(remaining)
+            # Tunggu sampai timer habis ATAU /start dipanggil dari Telegram
+            force_scan_event.wait(timeout=remaining)
+            force_scan_event.clear()
 
         except KeyboardInterrupt:
             logger.info("Bot dihentikan oleh user.")
