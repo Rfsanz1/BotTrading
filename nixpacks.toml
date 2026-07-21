@@ -8,5 +8,9 @@ cmds = [
     "cd trading-bot && .venv/bin/pip install -r requirements.txt"
 ]
 
+# Kosongkan build phase agar nixpacks tidak auto-detect pnpm build
+[phases.build]
+cmds = []
+
 [start]
 cmd = "cd trading-bot && .venv/bin/python3 main.py"
