@@ -1,8 +1,12 @@
 [phases.setup]
-nixPkgs = ["python312", "python312Packages.pip"]
+nixPkgs = ["python312"]
 
 [phases.install]
-cmds = ["cd trading-bot && pip install -r requirements.txt"]
+cmds = [
+    "cd trading-bot && python3 -m venv .venv",
+    "cd trading-bot && .venv/bin/pip install --upgrade pip",
+    "cd trading-bot && .venv/bin/pip install -r requirements.txt"
+]
 
 [start]
-cmd = "cd trading-bot && python3 main.py"
+cmd = "cd trading-bot && .venv/bin/python3 main.py"
