@@ -74,6 +74,12 @@ LIVE_MODE: bool = _cfg("LIVE_MODE", "true").lower() in ("1", "true", "yes")
 BINANCE_TESTNET: bool = _cfg("BINANCE_TESTNET", "false").lower() in ("1", "true", "yes")
 
 TRADING_PAIRS_ENV: str = _cfg("TRADING_PAIRS", "ALL").strip()
+# Pair yang selalu dipindai PERTAMA setiap siklus (pisah koma), misal: XAUTUSDT,BTCUSDT
+PRIORITY_PAIRS: list[str] = [
+    p.strip().upper()
+    for p in _cfg("PRIORITY_PAIRS", "").split(",")
+    if p.strip()
+]
 
 CANDLE_INTERVAL: str = "1m"
 CANDLE_LIMIT: int = 100
@@ -2487,6 +2493,15 @@ def _round_price(price: float, tick: float) -> float:
     return round(steps * tick, precision)
 
 
+def _apply_priority(pairs: list[str]) -> list[str]:
+    """Pindahkan PRIORITY_PAIRS ke depan, sisanya tetap urut di belakang."""
+    if not PRIORITY_PAIRS:
+        return pairs
+    priority = [p for p in PRIORITY_PAIRS if p in pairs]
+    rest     = [p for p in pairs if p not in set(PRIORITY_PAIRS)]
+    return priority + rest
+
+
 def refresh_pairs() -> None:
     """Refresh daftar pair yang dipindai — dipanggil di startup & tiap 1 jam."""
     global active_pairs
@@ -2498,19 +2513,24 @@ def refresh_pairs() -> None:
             fetched = fetch_usdt_pairs()
             exch_label = "Binance"
         if fetched:
+            ordered = _apply_priority(fetched)
             with pairs_lock:
-                active_pairs = fetched
-            logger.info(f"📈 Memindai SEMUA pair USDT {exch_label}: {len(fetched)} pair")
+                active_pairs = ordered
+            priority_note = (
+                f" (prioritas: {', '.join(PRIORITY_PAIRS)})" if PRIORITY_PAIRS else ""
+            )
+            logger.info(f"📈 Memindai SEMUA pair USDT {exch_label}: {len(ordered)} pair{priority_note}")
         else:
             logger.warning("⚠️ Gagal refresh daftar pair — pakai daftar lama/fallback")
             with pairs_lock:
                 if not active_pairs:
-                    active_pairs = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"]
+                    active_pairs = _apply_priority(["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"])
     else:
         explicit = [p.strip().upper() for p in TRADING_PAIRS_ENV.split(",") if p.strip()]
+        ordered  = _apply_priority(explicit)
         with pairs_lock:
-            active_pairs = explicit
-        logger.info(f"📈 Memindai pair dari TRADING_PAIRS: {', '.join(explicit)}")
+            active_pairs = ordered
+        logger.info(f"📈 Memindai pair dari TRADING_PAIRS: {', '.join(ordered)}")
 
 
 def pairs_refresher_loop() -> None:
