@@ -1,0 +1,297 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/.prisma/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Enums
+enum RoleName { USER ADMIN BOT }
+enum PermissionKey { READ WRITE TRADE ADMIN }
+enum OrderStatus { NEW PARTIALLY_FILLED FILLED CANCELED REJECTED }
+enum Side { BUY SELL }
+enum PositionStatus { OPEN CLOSED LIQUIDATED }
+
+// Users and RBAC
+model User {
+  id          String    @id @default(uuid())
+  email       String    @unique
+  name        String?
+  password    String?
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // relations
+  sessions       Session[]
+  apiKeys        ApiKey[]
+  portfolios     Portfolio[]
+  exchangeAccs   ExchangeAccount[]
+  auditLogs      AuditLog[]
+  subscriptions  Subscription[]
+  roles          UserRole[]
+}
+
+model Role {
+  id          String       @id @default(uuid())
+  name        RoleName     @unique
+  description String?
+  createdAt   DateTime     @default(now())
+  permissions RolePermission[]
+  users       UserRole[]
+}
+
+model Permission {
+  id        String         @id @default(uuid())
+  key       PermissionKey  @unique
+  name      String
+  createdAt DateTime       @default(now())
+  roles     RolePermission[]
+}
+
+model UserRole {
+  id      String @id @default(uuid())
+  user    User   @relation(fields: [userId], references: [id])
+  userId  String
+  role    Role   @relation(fields: [roleId], references: [id])
+  roleId  String
+  @@unique([userId, roleId])
+}
+
+model RolePermission {
+  id           String     @id @default(uuid())
+  role         Role       @relation(fields: [roleId], references: [id])
+  roleId       String
+  permission   Permission @relation(fields: [permissionId], references: [id])
+  permissionId String
+  @@unique([roleId, permissionId])
+}
+
+// Sessions (server sessions or web sessions)
+model Session {
+  id         String   @id @default(uuid())
+  user       User     @relation(fields: [userId], references: [id])
+  userId     String
+  ip         String?
+  userAgent  String?
+  data       Json?
+  createdAt  DateTime @default(now())
+  expiresAt  DateTime
+  @@index([userId])
+}
+
+// Exchange accounts and API keys
+model ExchangeAccount {
+  id          String   @id @default(uuid())
+  user        User     @relation(fields: [userId], references: [id])
+  userId      String
+  exchange    String
+  accountId   String
+  createdAt   DateTime @default(now())
+  isActive    Boolean  @default(true)
+  apiKeys     ApiKey[]
+  @@index([userId])
+  @@index([exchange])
+}
+
+model ApiKey {
+  id               String   @id @default(uuid())
+  user             User     @relation(fields: [userId], references: [id])
+  userId           String
+  exchangeAccount  ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
+  exchangeAccountId String?
+  keyHash          String   // store hashed/encrypted key
+  secretEncrypted  String?
+  permissions      String[]
+  createdAt        DateTime @default(now())
+  revoked          Boolean  @default(false)
+  @@index([userId])
+}
+
+// Portfolio and assets
+model Portfolio {
+  id         String    @id @default(uuid())
+  user       User      @relation(fields: [userId], references: [id])
+  userId     String
+  name       String
+  createdAt  DateTime  @default(now())
+  assets     PortfolioAsset[]
+  @@index([userId])
+}
+
+model Asset {
+  id        String   @id @default(uuid())
+  symbol    String   @unique
+  name      String?
+  metadata  Json?
+  createdAt DateTime @default(now())
+  portfolios PortfolioAsset[]
+  @@index([symbol])
+}
+
+model PortfolioAsset {
+  id           String   @id @default(uuid())
+  portfolio    Portfolio @relation(fields: [portfolioId], references: [id])
+  portfolioId  String
+  asset        Asset     @relation(fields: [assetId], references: [id])
+  assetId      String
+  quantity     Decimal   @db.Decimal(30, 12) @default(0)
+  avgPrice     Decimal?  @db.Decimal(30, 12)
+  updatedAt    DateTime  @updatedAt
+  @@unique([portfolioId, assetId])
+}
+
+// Orders / Trades / Positions
+model "Order" {
+  id            String     @id @default(uuid())
+  user          User       @relation(fields: [userId], references: [id])
+  userId        String
+  portfolio     Portfolio? @relation(fields: [portfolioId], references: [id])
+  portfolioId   String?
+  exchange      String
+  externalId    String?    // exchange order id
+  symbol        String
+  side          Side
+  price         Decimal?   @db.Decimal(30, 12)
+  quantity      Decimal    @db.Decimal(30, 12)
+  filled        Decimal    @db.Decimal(30, 12) @default(0)
+  status        OrderStatus @default(NEW)
+  meta          Json?
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+  trades        Trade[]
+  @@index([userId])
+  @@index([status])
+  @@index([symbol])
+}
+
+model Trade {
+  id         String   @id @default(uuid())
+  order      Order    @relation(fields: [orderId], references: [id])
+  orderId    String
+  price      Decimal  @db.Decimal(30, 12)
+  quantity   Decimal  @db.Decimal(30, 12)
+  fee        Decimal? @db.Decimal(30, 12)
+  side       Side
+  timestamp  DateTime @default(now())
+  @@index([orderId])
+}
+
+model Position {
+  id           String    @id @default(uuid())
+  user         User      @relation(fields: [userId], references: [id])
+  userId       String
+  portfolio    Portfolio? @relation(fields: [portfolioId], references: [id])
+  portfolioId  String?
+  symbol       String
+  side         Side
+  entryPrice   Decimal   @db.Decimal(30, 12)
+  quantity     Decimal   @db.Decimal(30, 12)
+  unrealizedPnL Decimal? @db.Decimal(30, 12)
+  realizedPnL  Decimal?  @db.Decimal(30, 12)
+  status       PositionStatus @default(OPEN)
+  openedAt     DateTime  @default(now())
+  closedAt     DateTime?
+  meta         Json?
+  @@index([userId])
+  @@index([symbol])
+}
+
+// Strategies and Signals
+model Strategy {
+  id         String   @id @default(uuid())
+  user       User     @relation(fields: [userId], references: [id])
+  userId     String
+  name       String
+  params     Json?
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  signals    Signal[]
+}
+
+model Signal {
+  id          String   @id @default(uuid())
+  strategy    Strategy? @relation(fields: [strategyId], references: [id])
+  strategyId  String?
+  symbol      String
+  confidence  Decimal? @db.Decimal(6,4)
+  riskLevel   String?
+  payload     Json?
+  createdAt   DateTime @default(now())
+  resolvedAt  DateTime?
+  @@index([symbol])
+}
+
+// Notifications, Subscriptions, Settings
+model Notification {
+  id        String   @id @default(uuid())
+  user      User?    @relation(fields: [userId], references: [id])
+  userId    String?
+  type      String
+  title     String
+  body      String?
+  data      Json?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  @@index([userId])
+}
+
+model Subscription {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  channel   String   // email/sms/app
+  topics    String[]
+  createdAt DateTime @default(now())
+  enabled   Boolean  @default(true)
+}
+
+model Setting {
+  id     String @id @default(uuid())
+  user   User?  @relation(fields: [userId], references: [id])
+  userId String?
+  key    String
+  value  Json
+  @@unique([userId, key])
+}
+
+// Audit logs
+model AuditLog {
+  id        String   @id @default(uuid())
+  user      User?    @relation(fields: [userId], references: [id])
+  userId    String?
+  action    String
+  resource  String?
+  meta      Json?
+  ip        String?
+  createdAt DateTime @default(now())
+  @@index([userId])
+  @@index([action])
+}
+
+// Misc: indexes and extension points
+
+// Conversation history for AI chat
+model Conversation {
+  id        String   @id @default(uuid())
+  ownerId   String?
+  title     String?
+  provider  String?
+  createdAt DateTime @default(now())
+  messages  Message[]
+}
+
+model Message {
+  id             String   @id @default(uuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id])
+  conversationId String
+  role           String
+  content        String   @db.Text
+  meta           Json?
+  createdAt      DateTime @default(now())
+  @@index([conversationId])
+}

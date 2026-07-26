@@ -1,0 +1,17 @@
+{
+  "name": "@rfsanz/admin",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "dev": "next dev -p 3003",
+    "build": "next build",
+    "start": "next start -p 3003"
+  },
+  "dependencies": {
+    "next": "^14.0.0",
+    "react": "19.1.0",
+    "react-dom": "19.1.0",
+    "tailwindcss": "^4.1.14",
+    "@shadcn/ui": "^0.0.0"
+  }
+}

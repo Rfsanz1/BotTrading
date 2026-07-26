@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Toggle } from '@/components/ui/toggle';
 import { Save, ShieldAlert, Database, History, Download } from 'lucide-react';
 import { toast } from 'sonner';
 
@@ -58,6 +59,7 @@ export default function Settings() {
 
       <Tabs defaultValue="general" className="w-full">
         <TabsList className="mb-4">
+          <TabsTrigger value="preferences">Preferences</TabsTrigger>
           <TabsTrigger value="general">General & Exchange</TabsTrigger>
           <TabsTrigger value="risk">Risk Management</TabsTrigger>
           <TabsTrigger value="data">Data & Backups</TabsTrigger>
@@ -99,6 +101,126 @@ export default function Settings() {
                   value={config.api_secret || ''}
                   onChange={(e) => setConfig({...config, api_secret: e.target.value})}
                 />
+              </div>
+            </CardContent>
+          </Card>
+        </TabsContent>
+
+        <TabsContent value="preferences" className="space-y-4">
+          <Card>
+            <CardHeader>
+              <CardTitle>Appearance & Locale</CardTitle>
+              <CardDescription>Language, timezone, and theme preferences.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-3">
+              <div className="space-y-2">
+                <Label>Language</Label>
+                <Select value={config.language || 'en'} onValueChange={(v) => setConfig({...config, language: v})}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="en">English</SelectItem>
+                    <SelectItem value="es">Español</SelectItem>
+                    <SelectItem value="pt">Português</SelectItem>
+                    <SelectItem value="zh">中文</SelectItem>
+                    <SelectItem value="de">Deutsch</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Timezone</Label>
+                <Input placeholder="Timezone (e.g. UTC, Europe/Berlin)" value={config.timezone || ''} onChange={(e) => setConfig({...config, timezone: e.target.value})} />
+              </div>
+              <div className="space-y-2">
+                <Label>Theme</Label>
+                <Select value={config.theme || 'system'} onValueChange={(v) => setConfig({...config, theme: v})}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="system">System</SelectItem>
+                    <SelectItem value="light">Light</SelectItem>
+                    <SelectItem value="dark">Dark</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Notifications</CardTitle>
+              <CardDescription>Control how you receive alerts and notifications.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-3">
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label>App Notifications</Label>
+                </div>
+                <Toggle pressed={!!config.notify_app} onPressedChange={(v) => setConfig({...config, notify_app: !!v})} />
+              </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label>Email Alerts</Label>
+                </div>
+                <Toggle pressed={!!config.notify_email} onPressedChange={(v) => setConfig({...config, notify_email: !!v})} />
+              </div>
+              <div className="flex items-center justify-between">
+                <div>
+                  <Label>SMS Alerts</Label>
+                </div>
+                <Toggle pressed={!!config.notify_sms} onPressedChange={(v) => setConfig({...config, notify_sms: !!v})} />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>AI Preferences</CardTitle>
+              <CardDescription>Configure AI behavior and models.</CardDescription>
+            </CardHeader>
+            <CardContent className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>Enable AI Signals</Label>
+                <Toggle pressed={!!config.ai_enabled} onPressedChange={(v) => setConfig({...config, ai_enabled: !!v})} />
+              </div>
+              <div className="space-y-2">
+                <Label>Preferred AI Model</Label>
+                <Select value={config.ai_model || 'ensemble'} onValueChange={(v) => setConfig({...config, ai_model: v})}>
+                  <SelectTrigger><SelectValue /></SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="ensemble">Ensemble</SelectItem>
+                    <SelectItem value="modelA">Model A</SelectItem>
+                    <SelectItem value="modelB">Model B</SelectItem>
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="space-y-2">
+                <Label>Ensemble Weight (%)</Label>
+                <Input type="number" value={config.ai_weight ?? 50} onChange={(e) => setConfig({...config, ai_weight: Number(e.target.value)})} />
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Privacy</CardTitle>
+              <CardDescription>Control telemetry and data sharing.</CardDescription>
+            </CardHeader>
+            <CardContent>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>Telemetry (usage data)</Label>
+                    <div className="text-muted-foreground text-sm">Send anonymous usage statistics to help improve the product.</div>
+                  </div>
+                  <Toggle pressed={!config.telemetry_opt_out} onPressedChange={(v) => setConfig({...config, telemetry_opt_out: !v})} />
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <div>
+                    <Label>Share data with third-parties</Label>
+                    <div className="text-muted-foreground text-sm">Allow sharing anonymized data for integrations and research.</div>
+                  </div>
+                  <Toggle pressed={!!config.data_sharing} onPressedChange={(v) => setConfig({...config, data_sharing: !!v})} />
+                </div>
               </div>
             </CardContent>
           </Card>

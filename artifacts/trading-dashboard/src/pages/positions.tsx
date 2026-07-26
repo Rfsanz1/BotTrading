@@ -9,6 +9,7 @@ import { Badge } from '@/components/ui/badge';
 import { Skeleton } from '@/components/ui/skeleton';
 import { XCircle, RefreshCw } from 'lucide-react';
 import { toast } from 'sonner';
+import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip';
 
 type Position = {
   symbol: string;
@@ -20,6 +21,11 @@ type Position = {
   trailing_active: boolean;
   breakeven_done: boolean;
   asset_group?: string;
+  leverage?: number;
+  liquidation_price?: number;
+  unrealized_pnl?: number;
+  realized_pnl?: number;
+  margin?: number;
 };
 
 export default function Positions() {
@@ -69,9 +75,13 @@ export default function Positions() {
                 <TableRow className="bg-muted/40">
                   <TableHead>Symbol</TableHead>
                   <TableHead className="text-right">Entry</TableHead>
+                  <TableHead className="text-right">Leverage</TableHead>
                   <TableHead className="text-right">Qty</TableHead>
+                  <TableHead className="text-right">Liquidation</TableHead>
                   <TableHead className="text-right">TP / SL</TableHead>
                   <TableHead className="text-right">Unrealized</TableHead>
+                  <TableHead className="text-right">Realized</TableHead>
+                  <TableHead className="text-center">Risk</TableHead>
                   <TableHead className="text-center">Flags</TableHead>
                   <TableHead className="text-right">Action</TableHead>
                 </TableRow>
@@ -87,7 +97,7 @@ export default function Positions() {
                   ))
                 ) : positions.length === 0 ? (
                   <TableRow>
-                    <TableCell colSpan={7} className="text-center py-12 text-muted-foreground">
+                    <TableCell colSpan={11} className="text-center py-12 text-muted-foreground">
                       No open positions right now
                     </TableCell>
                   </TableRow>
@@ -104,26 +114,51 @@ export default function Positions() {
                           )}
                         </div>
                       </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
-                        ${pos.entry_price?.toFixed(4)}
-                      </TableCell>
-                      <TableCell className="text-right font-mono text-sm">
-                        {pos.qty}
-                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm">${pos.entry_price?.toFixed(4)}</TableCell>
+                      <TableCell className="text-right font-mono text-sm">{pos.leverage ? `${pos.leverage}x` : '-'}</TableCell>
+                      <TableCell className="text-right font-mono text-sm">{pos.qty}</TableCell>
+                      <TableCell className="text-right font-mono text-sm">{pos.liquidation_price ? `$${pos.liquidation_price.toFixed(4)}` : '-'}</TableCell>
                       <TableCell className="text-right text-sm font-mono leading-5">
-                        <span className="text-success">${pos.tp_price?.toFixed(4)}</span>
+                        <span className="text-success">{pos.tp_price ? `$${pos.tp_price.toFixed(4)}` : '-'}</span>
                         <br />
-                        <span className="text-destructive">${pos.sl_price?.toFixed(4)}</span>
+                        <span className="text-destructive">{pos.sl_price ? `$${pos.sl_price.toFixed(4)}` : '-'}</span>
                       </TableCell>
                       <TableCell className="text-right">
-                        <span
-                          className={`font-semibold text-sm ${
-                            (pos.unrealized_pct ?? 0) >= 0 ? 'text-success' : 'text-destructive'
-                          }`}
-                        >
-                          {(pos.unrealized_pct ?? 0) >= 0 ? '+' : ''}
-                          {(pos.unrealized_pct ?? 0).toFixed(2)}%
-                        </span>
+                        <div>
+                          <div className={`font-semibold text-sm ${(pos.unrealized_pct ?? 0) >= 0 ? 'text-success' : 'text-destructive'}`}>
+                            {(pos.unrealized_pct ?? 0) >= 0 ? '+' : ''}{(pos.unrealized_pct ?? 0).toFixed(2)}%
+                          </div>
+                          <div className="text-sm text-muted-foreground">{typeof pos.unrealized_pnl === 'number' ? `${pos.unrealized_pnl >= 0 ? '+' : ''}${pos.unrealized_pnl.toFixed(2)}` : (pos.entry_price ? `${(((pos.unrealized_pct ?? 0)/100) * pos.entry_price * pos.qty).toFixed(2)}` : '-')}</div>
+                        </div>
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-sm">{typeof pos.realized_pnl === 'number' ? `${pos.realized_pnl >= 0 ? '+' : ''}${pos.realized_pnl.toFixed(2)}` : '-'}</TableCell>
+                      <TableCell className="text-center">
+                        <Tooltip>
+                          <TooltipTrigger asChild>
+                            <div className="cursor-help">
+                              {pos.sl_price ? (
+                                (() => {
+                                  const entry = pos.entry_price ?? 0;
+                                  const sl = pos.sl_price ?? 0;
+                                  const isBuy = true; // assume long by default
+                                  const riskPct = entry ? Math.abs((entry - sl) / entry) * 100 : 0;
+                                  const riskAmount = entry ? (riskPct / 100) * entry * pos.qty : 0;
+                                  return (
+                                    <div className="text-sm">
+                                      {riskPct.toFixed(2)}%<br />
+                                      <span className="text-muted-foreground">${riskAmount.toFixed(2)}</span>
+                                    </div>
+                                  );
+                                })()
+                              ) : (
+                                <div className="text-sm text-muted-foreground">-</div>
+                              )}
+                            </div>
+                          </TooltipTrigger>
+                          <TooltipContent>
+                            Estimated risk to stop loss (pct and amount)
+                          </TooltipContent>
+                        </Tooltip>
                       </TableCell>
                       <TableCell className="text-center">
                         <div className="flex gap-1 justify-center flex-wrap">

@@ -1,0 +1,15 @@
+{
+  "name": "@rfsanz/telegram",
+  "private": true,
+  "version": "0.1.0",
+  "scripts": {
+    "start": "ts-node src/index.ts",
+    "dev": "ts-node-dev --respawn src/index.ts"
+  },
+  "dependencies": {
+    "telegraf": "^4.12.2",
+    "ioredis": "^5.3.2",
+    "@types/node": "^20.0.0",
+    "typescript": "~5.9.3"
+  }
+}

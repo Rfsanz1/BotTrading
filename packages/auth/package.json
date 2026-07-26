@@ -1,0 +1,11 @@
+{
+  "name": "@rfsanz/auth",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "dependencies": {
+    "passport": "^0.6.0",
+    "passport-jwt": "^4.0.0",
+    "jsonwebtoken": "^9.0.0"
+  }
+}

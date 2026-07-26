@@ -1,0 +1,16 @@
+{
+  "name": "@rfsanz/database",
+  "version": "0.1.0",
+  "main": "src/index.ts",
+  "private": true,
+  "dependencies": {
+    "prisma": "^5.10.0",
+    "@prisma/client": "^5.10.0"
+  },
+  "scripts": {
+    "prisma:generate": "prisma generate --schema=prisma/schema.prisma",
+    "migrate:dev": "prisma migrate dev --schema=prisma/schema.prisma",
+    "migrate:deploy": "prisma migrate deploy --schema=prisma/schema.prisma",
+    "seed": "ts-node prisma/seed.ts"
+  }
+}

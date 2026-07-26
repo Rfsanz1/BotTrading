@@ -1,0 +1,29 @@
+{
+  "name": "@rfsanz/ai",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "mustache": "^4.2.0",
+    "eventemitter3": "^5.0.0",
+    "p-retry": "^5.0.0",
+    "@rfsanz/database": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "~5.9.3",
+    "@types/node": "^20.0.0",
+    "@types/mustache": "^4.1.1"
+  }
+}
+{
+  "name": "@rfsanz/ai",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "dependencies": {}
+}

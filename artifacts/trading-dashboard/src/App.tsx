@@ -11,10 +11,16 @@ import Positions from '@/pages/positions';
 import Analytics from '@/pages/analytics';
 import Backtest from '@/pages/backtest';
 import Trades from '@/pages/trades';
+import Signals from '@/pages/signals';
+import News from '@/pages/news';
+import Risk from '@/pages/risk';
+import Watchlist from '@/pages/watchlist';
+import Profile from '@/pages/profile';
 import DCAManager from '@/pages/dca';
 import System from '@/pages/system';
 import Schedule from '@/pages/schedule';
 import Settings from '@/pages/settings';
+import Orders from '@/pages/orders';
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -34,6 +40,12 @@ function Router() {
         <Route path="/analytics" component={Analytics} />
         <Route path="/backtest" component={Backtest} />
         <Route path="/trades" component={Trades} />
+        <Route path="/signals" component={Signals} />
+        <Route path="/news" component={News} />
+        <Route path="/watchlist" component={Watchlist} />
+        <Route path="/profile" component={Profile} />
+        <Route path="/risk" component={Risk} />
+        <Route path="/orders" component={Orders} />
         <Route path="/dca" component={DCAManager} />
         <Route path="/system" component={System} />
         <Route path="/schedule" component={Schedule} />

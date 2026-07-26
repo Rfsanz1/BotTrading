@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rfsanz
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+
+  api:
+    build: ./apps/api
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/rfsanz}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      NODE_ENV: production
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+
+volumes:
+  pgdata:

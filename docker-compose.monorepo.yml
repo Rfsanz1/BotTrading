@@ -1,0 +1,31 @@
+version: '3.8'
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: rfsanz
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build: ./apps/api
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@postgres:5432/rfsanz
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3001:3001"
+    depends_on:
+      - postgres
+      - redis
+
+volumes:
+  pgdata:

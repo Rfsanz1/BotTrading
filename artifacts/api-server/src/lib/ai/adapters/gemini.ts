@@ -1,0 +1,15 @@
+import ProviderBase from '../ProviderBase';
+import { Message, ChunkCallback } from '../IProvider';
+
+export class GeminiProvider extends ProviderBase {
+  name = 'gemini';
+  constructor(private apiKey?: string) { super(); }
+
+  async sendMessage(conversationId: string, messages: Message[], onChunk?: ChunkCallback): Promise<Message> {
+    const reply: Message = { id: `m-${Date.now()}`, role: 'assistant', content: 'Echo (Gemini): ' + messages.map(m => m.content).join('\n'), timestamp: Date.now() };
+    if (onChunk) { onChunk(reply.content); }
+    return reply;
+  }
+}
+
+export default GeminiProvider;
