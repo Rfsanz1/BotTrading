@@ -42,7 +42,7 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
-packages = ["glibcLocales", "nano"]
+packages = ["cairo", "ffmpeg-full", "freetype", "ghostscript", "glibcLocales", "gobject-introspection", "gtk3", "nano", "pkg-config", "qhull", "tcl", "tk"]
 
 [userenv]
 
