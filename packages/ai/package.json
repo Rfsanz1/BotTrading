@@ -6,7 +6,12 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "example": "node -r ts-node/register src/trading-brain/example.ts",
+    "orchestrator:example": "node -r ts-node/register src/orchestrator/example.ts",
+    "decision:example": "node -r ts-node/register src/decision-engine/example.ts",
+    "strategy:example": "node -r ts-node/register src/strategy-engine/example.ts",
+    "portfolio:example": "node -r ts-node/register src/portfolio-intelligence/example.ts"
   },
   "dependencies": {
     "mustache": "^4.2.0",
@@ -17,13 +22,7 @@
   "devDependencies": {
     "typescript": "~5.9.3",
     "@types/node": "^20.0.0",
-    "@types/mustache": "^4.1.1"
+    "@types/mustache": "^4.1.1",
+    "ts-node": "^10.9.1"
   }
-}
-{
-  "name": "@rfsanz/ai",
-  "version": "0.1.0",
-  "private": true,
-  "main": "src/index.ts",
-  "dependencies": {}
 }

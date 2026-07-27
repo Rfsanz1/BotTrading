@@ -26,6 +26,7 @@
     "zod": "^3.21.4",
     "helmet": "^7.0.0",
     "compression": "^1.7.4",
+    "@nestjs/schedule": "^4.0.0",
     "prom-client": "^14.0.1",
     "pino-http": "^8.7.0",
     "rate-limiter-flexible": "^2.3.6"

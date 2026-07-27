@@ -2,3 +2,8 @@ export * from './types';
 export * from './factory';
 export * from './prompt/templates';
 export * from './ai.service';
+export * from './trading-brain';
+export * from './orchestrator';
+export * from './decision-engine';
+export * from './strategy-engine';
+export * from './portfolio-intelligence';

@@ -4,6 +4,7 @@ import GeminiProvider from './providers/adapters/gemini.provider';
 import GroqProvider from './providers/adapters/groq.provider';
 import DeepSeekProvider from './providers/adapters/deepseek.provider';
 import FutureProvider from './providers/adapters/future.provider';
+import OllamaProvider from './providers/adapters/ollama.provider';
 import type { ProviderName } from './types';
 
 const map: Record<string, any> = {
@@ -12,6 +13,7 @@ const map: Record<string, any> = {
   gemini: GeminiProvider,
   groq: GroqProvider,
   deepseek: DeepSeekProvider,
+  ollama: OllamaProvider,
   future: FutureProvider,
 };
 

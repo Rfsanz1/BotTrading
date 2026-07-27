@@ -17,4 +17,4 @@ export type Conversation = {
   messages: Message[];
 };
 
-export type ProviderName = 'openai' | 'claude' | 'gemini' | 'groq' | 'deepseek' | 'future';
+export type ProviderName = 'openai' | 'claude' | 'gemini' | 'groq' | 'deepseek' | 'ollama' | 'future';
