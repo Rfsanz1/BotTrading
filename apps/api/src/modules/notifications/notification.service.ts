@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { NotificationSentEvent } from '../../domain/exceptions';
 import { NotificationSendFailedException } from '../../domain/exceptions';
-import prisma from '../../../packages/database/src/client';
+import prisma from '@rfsanz/database/src/client';
 import { ITelegramNotifier } from '../../domain/interfaces';
 
 @Injectable()

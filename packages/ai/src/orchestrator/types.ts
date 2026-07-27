@@ -93,6 +93,8 @@ export interface ConsensusResult {
   timestamp: number;
 }
 
+import type { ServiceHealthCheckMap, WorkerRestarterMap, SupervisorAlert } from './supervisor-types';
+
 export interface OrchestratorConfig {
   providers?: OrchestratorProvider[];
   defaultProvider?: OrchestratorProvider;
@@ -104,4 +106,8 @@ export interface OrchestratorConfig {
   enableFallback?: boolean;
   enableHealthChecks?: boolean;
   healthCheckIntervalMs?: number;
+  serviceHealthChecks?: ServiceHealthCheckMap;
+  workerRestarters?: WorkerRestarterMap;
+  alertHandler?: (alerts: SupervisorAlert[]) => Promise<void>;
+  providerFailureThreshold?: number;
 }

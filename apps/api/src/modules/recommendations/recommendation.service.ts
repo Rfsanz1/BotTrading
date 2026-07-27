@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { RecommendationGeneratedEvent, RecommendationApprovedEvent, RecommendationRejectedEvent } from '../../domain/events';
 import { RecommendationNotFoundException, InvalidRecommendationStatusException } from '../../domain/exceptions';
-import prisma from '../../../packages/database/src/client';
+import prisma from '@rfsanz/database/src/client';
 import { IRecommendationGenerator } from '../../domain/interfaces';
 
 @Injectable()

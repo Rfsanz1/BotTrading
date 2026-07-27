@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
+import prisma from '@rfsanz/database/src/client';
 import {
   OrderValidationStartedEvent,
   PositionSizeCalculatedEvent,
@@ -16,7 +17,6 @@ import {
   PositionSizeCalculationFailedException,
   RiskLimitExceededException,
 } from '../../domain/exceptions';
-import prisma from '../../../packages/database/src/client';
 
 @Injectable()
 export class TradingService {

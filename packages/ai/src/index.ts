@@ -3,6 +3,7 @@ export * from './factory';
 export * from './prompt/templates';
 export * from './ai.service';
 export * from './trading-brain';
+export * from './trading-planner';
 export * from './orchestrator';
 export * from './decision-engine';
 export * from './strategy-engine';

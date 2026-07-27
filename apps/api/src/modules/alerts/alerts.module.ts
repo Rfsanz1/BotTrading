@@ -6,7 +6,7 @@ import { AlertRepository } from './repositories/alert.repository';
 
 @Module({
   imports: [EventEmitterModule.forRoot()],
-  services: [AlertService, AlertRepository],
+  providers: [AlertService, AlertRepository],
   controllers: [AlertController],
   exports: [AlertService],
 })

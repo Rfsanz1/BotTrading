@@ -4,7 +4,23 @@
     "outDir": "dist",
     "rootDir": "src",
     "composite": false,
-    "types": ["node"]
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@rfsanz/database": ["../../packages/database/src/index.ts"],
+      "@rfsanz/database/*": ["../../packages/database/src/*"],
+      "@rfsanz/tradingview": ["../../packages/tradingview/src/index.ts"],
+      "@rfsanz/tradingview/*": ["../../packages/tradingview/src/*"]
+    },
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "strict": false,
+    "noImplicitAny": false,
+    "strictPropertyInitialization": false,
+    "isolatedModules": false,
+    "useUnknownInCatchVariables": false,
+    "skipLibCheck": true
   },
-  "include": ["src/**/*"]
+  "include": ["src/**/*"],
+  "exclude": ["src/**/*.spec.ts", "src/**/*.test.ts"]
 }

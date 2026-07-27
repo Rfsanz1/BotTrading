@@ -2,7 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { EventEmitter2 } from '@nestjs/event-emitter';
 import { AuditLogRecordedEvent, TradingStatisticsUpdatedEvent, AIPerformanceRecordedEvent } from '../../domain/events';
 import { AuditLogRecordingFailedException } from '../../domain/exceptions';
-import prisma from '../../../packages/database/src/client';
+import prisma from '@rfsanz/database/src/client';
 import { IAuditLogger } from '../../domain/interfaces';
 
 @Injectable()

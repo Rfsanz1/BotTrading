@@ -12,6 +12,6 @@
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "tailwindcss": "^4.1.14",
-    "@shadcn/ui": "^0.0.0"
+    "@shadcn/ui": "^0.0.4"
   }
 }

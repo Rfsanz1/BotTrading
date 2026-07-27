@@ -17,7 +17,9 @@
     "mustache": "^4.2.0",
     "eventemitter3": "^5.0.0",
     "p-retry": "^5.0.0",
-    "@rfsanz/database": "workspace:*"
+    "@rfsanz/database": "workspace:*",
+    "node-fetch": "^3.3.2",
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
     "typescript": "~5.9.3",

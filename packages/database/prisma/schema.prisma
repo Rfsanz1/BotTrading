@@ -18,6 +18,19 @@ enum AlertStatus { RECEIVED VALIDATED PROCESSING ANALYZED RECOMMENDED EXECUTED C
 enum RecommendationType { BUY SELL HOLD }
 enum AIProvider { OPENAI CLAUDE GEMINI GROQ DEEPSEEK OLLAMA }
 
+enum MemoryType {
+  TRADE
+  SIGNAL
+  PROFIT
+  LOSS
+  STRATEGY
+  CONVERSATION
+  RESPONSE
+  MARKET
+  SESSION
+  NOTE
+}
+
 // Users and RBAC
 model User {
   id          String    @id @default(uuid())
@@ -306,6 +319,25 @@ model Message {
   meta           Json?
   createdAt      DateTime @default(now())
   @@index([conversationId])
+}
+
+model MemoryItem {
+  id             String     @id @default(uuid())
+  user           User?      @relation(fields: [userId], references: [id])
+  userId         String?
+  type           MemoryType
+  source         String
+  title          String?
+  content        String     @db.Text
+  metadata       Json?
+  embedding      Float[]?
+  conversationId String?
+  createdAt      DateTime   @default(now())
+
+  @@index([userId])
+  @@index([type])
+  @@index([conversationId])
+  @@index([createdAt])
 }
 
 // ============ TRADING WORKFLOW MODELS ============

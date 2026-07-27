@@ -7,8 +7,11 @@ import { AIMemory } from './ai-memory';
 import { ConsensusEngine } from './consensus-engine';
 import { FallbackEngine } from './fallback-engine';
 import { HealthChecker } from './health-checker';
+import { SupervisorService } from './supervisor-service';
 import { RoutingEngine } from './routing-engine';
 import { DashboardService } from './dashboard';
+import { AgentEventBus } from './agents/agent-event-bus';
+import { AgentManager } from './agents/agent-manager';
 import { AIRequest, OrchestratorConfig } from './types';
 
 export class AIOrchestrator {
@@ -23,6 +26,9 @@ export class AIOrchestrator {
   public healthChecker: HealthChecker;
   public routingEngine: RoutingEngine;
   public dashboard: DashboardService;
+  public supervisor: SupervisorService;
+  public agentBus: AgentEventBus;
+  public agentManager: AgentManager;
 
   constructor(config: OrchestratorConfig = {}) {
     this.registry = new ProviderRegistry();
@@ -45,7 +51,22 @@ export class AIOrchestrator {
       this.fallbackEngine,
       this.healthChecker,
     );
+    this.agentBus = new AgentEventBus();
+    this.agentManager = new AgentManager(
+      this.agentBus,
+      this.memory,
+      this.providerManager,
+      this.promptManager,
+      this.modelManager,
+      this.conversationManager,
+    );
     this.dashboard = new DashboardService(this.memory, this.registry);
+    this.supervisor = new SupervisorService(this.registry, this.providerManager, this.dashboard, {
+      serviceHealthChecks: config.serviceHealthChecks || {},
+      workerRestarters: config.workerRestarters || {},
+      alertHandler: config.alertHandler,
+      providerFailureThreshold: config.providerFailureThreshold,
+    });
   }
 
   async execute(request: AIRequest) {
@@ -53,8 +74,33 @@ export class AIOrchestrator {
     return this.routingEngine.route(request);
   }
 
+  async executeMultiAgent(request: AIRequest, metadata?: Record<string, any>) {
+    await this.healthChecker.runAll();
+    return this.agentManager.execute(request, metadata);
+  }
+
   getDashboard() {
     return this.dashboard.getSummary();
+  }
+
+  async runSupervisor(): Promise<ReturnType<SupervisorService['runHealthChecks']>> {
+    return this.supervisor.runHealthChecks();
+  }
+
+  async restartWorkers(): Promise<Record<string, boolean>> {
+    return this.supervisor.attemptRestarts();
+  }
+
+  async switchProvider(from: OrchestratorProvider, to: OrchestratorProvider): Promise<boolean> {
+    return this.supervisor.switchProvider(from, to);
+  }
+
+  getSupervisorReport() {
+    return this.supervisor.getLastReport();
+  }
+
+  async getSupervisorArchitecturePlan() {
+    return this.supervisor.getArchitecturePlan();
   }
 }
 

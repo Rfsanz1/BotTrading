@@ -24,7 +24,16 @@ export class RoutingEngine {
 
   async route(request: AIRequest): Promise<AIResponse | { consensus: any; responses: AIResponse[] }> {
     this.conversationManager.createConversation(request.conversationId);
-    this.conversationManager.append(request.conversationId, { role: 'user', content: request.messages[0]?.content || '' });
+    const userMessage = { role: 'user', content: request.messages[0]?.content || '' };
+    this.conversationManager.append(request.conversationId, userMessage);
+    this.memory.appendContext(request.conversationId, {
+      type: 'CONVERSATION',
+      title: `User message in ${request.conversationId}`,
+      content: userMessage.content,
+      source: 'routing-engine',
+      conversationId: request.conversationId,
+      createdAt: Date.now(),
+    });
 
     const prompt = this.promptManager.render('analysis', {
       symbol: request.metadata?.symbol || 'unknown',
@@ -40,7 +49,7 @@ export class RoutingEngine {
 
     try {
       const response = await this.providerManager.execute({ ...request, messages: [{ role: 'system', content: prompt }, ...request.messages] }, primaryProvider);
-      this.memory.store(response);
+      await this.memory.storeResponse(response, request.conversationId, request.metadata?.userId);
       if (!request.requireConsensus) return response;
 
       const others = [] as AIResponse[];
@@ -48,7 +57,7 @@ export class RoutingEngine {
         try {
           const other = await this.providerManager.execute({ ...request, messages: [{ role: 'system', content: prompt }, ...request.messages] }, provider);
           others.push(other);
-          this.memory.store(other);
+          await this.memory.storeResponse(other, request.conversationId, request.metadata?.userId);
         } catch (error) {
           this.fallbackEngine.handle(provider, String(error));
         }
@@ -61,7 +70,7 @@ export class RoutingEngine {
       const fallback = this.fallbackEngine.getFallback(primaryProvider);
       if (fallback && request.allowFallback !== false) {
         const fallbackResponse = await this.providerManager.execute({ ...request, messages: [{ role: 'system', content: prompt }, ...request.messages] }, fallback);
-        this.memory.store(fallbackResponse);
+        await this.memory.storeResponse(fallbackResponse, request.conversationId, request.metadata?.userId);
         return fallbackResponse;
       }
       throw error;

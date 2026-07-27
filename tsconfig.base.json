@@ -5,6 +5,8 @@
     "lib": ["es2022"],
     "module": "esnext",
     "moduleResolution": "bundler",
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
     "noEmitOnError": true,
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": false,
@@ -19,6 +21,7 @@
     "useUnknownInCatchVariables": true,
     "alwaysStrict": true,
     "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
     "target": "es2022",
     "types": [],
     "customConditions": ["workspace"]
