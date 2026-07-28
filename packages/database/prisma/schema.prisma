@@ -1,6 +1,5 @@
 generator client {
   provider = "prisma-client-js"
-  output   = "../node_modules/.prisma/client"
 }
 
 datasource db {
@@ -8,15 +7,65 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-// Enums
-enum RoleName { USER ADMIN BOT }
-enum PermissionKey { READ WRITE TRADE ADMIN }
-enum OrderStatus { NEW PARTIALLY_FILLED FILLED CANCELED REJECTED }
-enum Side { BUY SELL }
-enum PositionStatus { OPEN CLOSED LIQUIDATED }
-enum AlertStatus { RECEIVED VALIDATED PROCESSING ANALYZED RECOMMENDED EXECUTED COMPLETED REJECTED }
-enum RecommendationType { BUY SELL HOLD }
-enum AIProvider { OPENAI CLAUDE GEMINI GROQ DEEPSEEK OLLAMA }
+// ─── Enums ───────────────────────────────────────────────────────────────────
+
+enum RoleName {
+  USER
+  ADMIN
+  BOT
+}
+
+enum PermissionKey {
+  READ
+  WRITE
+  TRADE
+  ADMIN
+}
+
+enum OrderStatus {
+  NEW
+  PARTIALLY_FILLED
+  FILLED
+  CANCELED
+  REJECTED
+}
+
+enum Side {
+  BUY
+  SELL
+}
+
+enum PositionStatus {
+  OPEN
+  CLOSED
+  LIQUIDATED
+}
+
+enum AlertStatus {
+  RECEIVED
+  VALIDATED
+  PROCESSING
+  ANALYZED
+  RECOMMENDED
+  EXECUTED
+  COMPLETED
+  REJECTED
+}
+
+enum RecommendationType {
+  BUY
+  SELL
+  HOLD
+}
+
+enum AIProvider {
+  OPENAI
+  CLAUDE
+  GEMINI
+  GROQ
+  DEEPSEEK
+  OLLAMA
+}
 
 enum MemoryType {
   TRADE
@@ -31,21 +80,21 @@ enum MemoryType {
   NOTE
 }
 
-// Users and RBAC
-model User {
-  id          String    @id @default(uuid())
-  email       String    @unique
-  name        String?
-  password    String?
-  isActive    Boolean   @default(true)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+// ─── Users & RBAC ────────────────────────────────────────────────────────────
 
-  // relations
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  name      String?
+  password  String?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   sessions           Session[]
   apiKeys            ApiKey[]
   portfolios         Portfolio[]
-  exchangeAccs       ExchangeAccount[]
+  exchangeAccounts   ExchangeAccount[]
   auditLogs          AuditLog[]
   subscriptions      Subscription[]
   roles              UserRole[]
@@ -57,31 +106,38 @@ model User {
   promptTemplates    PromptTemplate[]
   strategyTemplates  StrategyTemplate[]
   improvementLogs    ImprovementLog[]
+  notifications      Notification[]
+  strategies         Strategy[]
+  settings           Setting[]
+  memoryItems        MemoryItem[]
+  positions          Position[]
+  orders             Order[]
 }
 
 model Role {
-  id          String       @id @default(uuid())
-  name        RoleName     @unique
+  id          String           @id @default(uuid())
+  name        RoleName         @unique
   description String?
-  createdAt   DateTime     @default(now())
+  createdAt   DateTime         @default(now())
   permissions RolePermission[]
   users       UserRole[]
 }
 
 model Permission {
-  id        String         @id @default(uuid())
-  key       PermissionKey  @unique
+  id        String           @id @default(uuid())
+  key       PermissionKey    @unique
   name      String
-  createdAt DateTime       @default(now())
+  createdAt DateTime         @default(now())
   roles     RolePermission[]
 }
 
 model UserRole {
-  id      String @id @default(uuid())
-  user    User   @relation(fields: [userId], references: [id])
-  userId  String
-  role    Role   @relation(fields: [roleId], references: [id])
-  roleId  String
+  id     String @id @default(uuid())
+  user   User   @relation(fields: [userId], references: [id])
+  userId String
+  role   Role   @relation(fields: [roleId], references: [id])
+  roleId String
+
   @@unique([userId, roleId])
 }
 
@@ -91,167 +147,186 @@ model RolePermission {
   roleId       String
   permission   Permission @relation(fields: [permissionId], references: [id])
   permissionId String
+
   @@unique([roleId, permissionId])
 }
 
-// Sessions (server sessions or web sessions)
+// ─── Sessions ────────────────────────────────────────────────────────────────
+
 model Session {
-  id         String   @id @default(uuid())
-  user       User     @relation(fields: [userId], references: [id])
-  userId     String
-  ip         String?
-  userAgent  String?
-  data       Json?
-  createdAt  DateTime @default(now())
-  expiresAt  DateTime
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  ip        String?
+  userAgent String?
+  data      Json?
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+
   @@index([userId])
 }
 
-// Exchange accounts and API keys
+// ─── Exchange Accounts & API Keys ────────────────────────────────────────────
+
 model ExchangeAccount {
-  id          String   @id @default(uuid())
-  user        User     @relation(fields: [userId], references: [id])
-  userId      String
-  exchange    String
-  accountId   String
-  createdAt   DateTime @default(now())
-  isActive    Boolean  @default(true)
-  apiKeys     ApiKey[]
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  exchange  String
+  accountId String
+  createdAt DateTime @default(now())
+  isActive  Boolean  @default(true)
+  apiKeys   ApiKey[]
+
   @@index([userId])
   @@index([exchange])
 }
 
 model ApiKey {
-  id               String   @id @default(uuid())
-  user             User     @relation(fields: [userId], references: [id])
-  userId           String
-  exchangeAccount  ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
+  id                String          @id @default(uuid())
+  user              User            @relation(fields: [userId], references: [id])
+  userId            String
+  exchangeAccount   ExchangeAccount? @relation(fields: [exchangeAccountId], references: [id])
   exchangeAccountId String?
-  keyHash          String   // store hashed/encrypted key
-  secretEncrypted  String?
-  permissions      String[]
-  createdAt        DateTime @default(now())
-  revoked          Boolean  @default(false)
+  keyHash           String
+  secretEncrypted   String?
+  permissions       String[]
+  createdAt         DateTime        @default(now())
+  revoked           Boolean         @default(false)
+
   @@index([userId])
 }
 
-// Portfolio and assets
+// ─── Portfolios & Assets ─────────────────────────────────────────────────────
+
 model Portfolio {
-  id         String    @id @default(uuid())
-  user       User      @relation(fields: [userId], references: [id])
-  userId     String
-  name       String
-  createdAt  DateTime  @default(now())
-  assets     PortfolioAsset[]
+  id        String           @id @default(uuid())
+  user      User             @relation(fields: [userId], references: [id])
+  userId    String
+  name      String
+  createdAt DateTime         @default(now())
+  assets    PortfolioAsset[]
+  orders    Order[]
+  positions Position[]
+
   @@index([userId])
 }
 
 model Asset {
-  id        String   @id @default(uuid())
-  symbol    String   @unique
-  name      String?
-  metadata  Json?
-  createdAt DateTime @default(now())
+  id         String           @id @default(uuid())
+  symbol     String           @unique
+  name       String?
+  metadata   Json?
+  createdAt  DateTime         @default(now())
   portfolios PortfolioAsset[]
+
   @@index([symbol])
 }
 
 model PortfolioAsset {
-  id           String   @id @default(uuid())
-  portfolio    Portfolio @relation(fields: [portfolioId], references: [id])
-  portfolioId  String
-  asset        Asset     @relation(fields: [assetId], references: [id])
-  assetId      String
-  quantity     Decimal   @db.Decimal(30, 12) @default(0)
-  avgPrice     Decimal?  @db.Decimal(30, 12)
-  updatedAt    DateTime  @updatedAt
+  id          String    @id @default(uuid())
+  portfolio   Portfolio @relation(fields: [portfolioId], references: [id])
+  portfolioId String
+  asset       Asset     @relation(fields: [assetId], references: [id])
+  assetId     String
+  quantity    Decimal   @default(0) @db.Decimal(30, 12)
+  avgPrice    Decimal?  @db.Decimal(30, 12)
+  updatedAt   DateTime  @updatedAt
+
   @@unique([portfolioId, assetId])
 }
 
-// Orders / Trades / Positions
-model "Order" {
-  id               String     @id @default(uuid())
-  user             User       @relation(fields: [userId], references: [id])
-  userId           String
-  portfolio        Portfolio? @relation(fields: [portfolioId], references: [id])
-  portfolioId      String?
-  exchange         String
-  externalId       String?    // exchange order id
-  symbol           String
-  side             Side
-  price            Decimal?   @db.Decimal(30, 12)
-  quantity         Decimal    @db.Decimal(30, 12)
-  filled           Decimal    @db.Decimal(30, 12) @default(0)
-  status           OrderStatus @default(NEW)
-  meta             Json?
-  createdAt        DateTime   @default(now())
-  updatedAt        DateTime   @updatedAt
-  trades           Trade[]
-  analysisLinks    OrderAnalysisLink[]
+// ─── Orders, Trades, Positions ───────────────────────────────────────────────
+
+model Order {
+  id          String    @id @default(uuid())
+  user        User      @relation(fields: [userId], references: [id])
+  userId      String
+  portfolio   Portfolio? @relation(fields: [portfolioId], references: [id])
+  portfolioId String?
+  exchange    String
+  externalId  String?
+  symbol      String
+  side        Side
+  price       Decimal?  @db.Decimal(30, 12)
+  quantity    Decimal   @db.Decimal(30, 12)
+  filled      Decimal   @default(0) @db.Decimal(30, 12)
+  status      OrderStatus @default(NEW)
+  meta        Json?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  trades      Trade[]
+  analysisLinks OrderAnalysisLink[]
+
   @@index([userId])
   @@index([status])
   @@index([symbol])
 }
 
 model Trade {
-  id         String   @id @default(uuid())
-  order      Order    @relation(fields: [orderId], references: [id])
-  orderId    String
-  price      Decimal  @db.Decimal(30, 12)
-  quantity   Decimal  @db.Decimal(30, 12)
-  fee        Decimal? @db.Decimal(30, 12)
-  side       Side
-  timestamp  DateTime @default(now())
+  id        String   @id @default(uuid())
+  order     Order    @relation(fields: [orderId], references: [id])
+  orderId   String
+  price     Decimal  @db.Decimal(30, 12)
+  quantity  Decimal  @db.Decimal(30, 12)
+  fee       Decimal? @db.Decimal(30, 12)
+  side      Side
+  timestamp DateTime @default(now())
+
   @@index([orderId])
 }
 
 model Position {
-  id           String    @id @default(uuid())
-  user         User      @relation(fields: [userId], references: [id])
-  userId       String
-  portfolio    Portfolio? @relation(fields: [portfolioId], references: [id])
-  portfolioId  String?
-  symbol       String
-  side         Side
-  entryPrice   Decimal   @db.Decimal(30, 12)
-  quantity     Decimal   @db.Decimal(30, 12)
-  unrealizedPnL Decimal? @db.Decimal(30, 12)
-  realizedPnL  Decimal?  @db.Decimal(30, 12)
-  status       PositionStatus @default(OPEN)
-  openedAt     DateTime  @default(now())
-  closedAt     DateTime?
-  meta         Json?
+  id            String         @id @default(uuid())
+  user          User           @relation(fields: [userId], references: [id])
+  userId        String
+  portfolio     Portfolio?     @relation(fields: [portfolioId], references: [id])
+  portfolioId   String?
+  symbol        String
+  side          Side
+  entryPrice    Decimal        @db.Decimal(30, 12)
+  quantity      Decimal        @db.Decimal(30, 12)
+  unrealizedPnL Decimal?       @db.Decimal(30, 12)
+  realizedPnL   Decimal?       @db.Decimal(30, 12)
+  status        PositionStatus @default(OPEN)
+  openedAt      DateTime       @default(now())
+  closedAt      DateTime?
+  meta          Json?
+
   @@index([userId])
   @@index([symbol])
 }
 
-// Strategies and Signals
+// ─── Strategies & Signals ────────────────────────────────────────────────────
+
 model Strategy {
-  id         String   @id @default(uuid())
-  user       User     @relation(fields: [userId], references: [id])
-  userId     String
-  name       String
-  params     Json?
-  isActive   Boolean  @default(true)
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  signals    Signal[]
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+  name      String
+  params    Json?
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  signals   Signal[]
 }
 
 model Signal {
-  id          String   @id @default(uuid())
-  strategy    Strategy? @relation(fields: [strategyId], references: [id])
-  strategyId  String?
-  symbol      String
-  confidence  Decimal? @db.Decimal(6,4)
-  riskLevel   String?
-  payload     Json?
-  createdAt   DateTime @default(now())
-  resolvedAt  DateTime?
+  id         String    @id @default(uuid())
+  strategy   Strategy? @relation(fields: [strategyId], references: [id])
+  strategyId String?
+  symbol     String
+  confidence Decimal?  @db.Decimal(6, 4)
+  riskLevel  String?
+  payload    Json?
+  createdAt  DateTime  @default(now())
+  resolvedAt DateTime?
+
   @@index([symbol])
 }
 
-// Notifications, Subscriptions, Settings
+// ─── Notifications, Subscriptions, Settings ──────────────────────────────────
+
 model Notification {
   id        String   @id @default(uuid())
   user      User?    @relation(fields: [userId], references: [id])
@@ -262,6 +337,7 @@ model Notification {
   data      Json?
   read      Boolean  @default(false)
   createdAt DateTime @default(now())
+
   @@index([userId])
 }
 
@@ -269,22 +345,24 @@ model Subscription {
   id        String   @id @default(uuid())
   user      User     @relation(fields: [userId], references: [id])
   userId    String
-  channel   String   // email/sms/app
+  channel   String
   topics    String[]
   createdAt DateTime @default(now())
   enabled   Boolean  @default(true)
 }
 
 model Setting {
-  id     String @id @default(uuid())
-  user   User?  @relation(fields: [userId], references: [id])
+  id     String  @id @default(uuid())
+  user   User?   @relation(fields: [userId], references: [id])
   userId String?
   key    String
   value  Json
+
   @@unique([userId, key])
 }
 
-// Audit logs
+// ─── Audit Logs ──────────────────────────────────────────────────────────────
+
 model AuditLog {
   id        String   @id @default(uuid())
   user      User?    @relation(fields: [userId], references: [id])
@@ -294,30 +372,31 @@ model AuditLog {
   meta      Json?
   ip        String?
   createdAt DateTime @default(now())
+
   @@index([userId])
   @@index([action])
 }
 
-// Misc: indexes and extension points
+// ─── Conversations & Memory ───────────────────────────────────────────────────
 
-// Conversation history for AI chat
 model Conversation {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   ownerId   String?
   title     String?
   provider  String?
-  createdAt DateTime @default(now())
+  createdAt DateTime  @default(now())
   messages  Message[]
 }
 
 model Message {
-  id             String   @id @default(uuid())
+  id             String       @id @default(uuid())
   conversation   Conversation @relation(fields: [conversationId], references: [id])
   conversationId String
   role           String
-  content        String   @db.Text
+  content        String       @db.Text
   meta           Json?
-  createdAt      DateTime @default(now())
+  createdAt      DateTime     @default(now())
+
   @@index([conversationId])
 }
 
@@ -330,7 +409,7 @@ model MemoryItem {
   title          String?
   content        String     @db.Text
   metadata       Json?
-  embedding      Float[]?
+  embedding      Float[]    @default([])
   conversationId String?
   createdAt      DateTime   @default(now())
 
@@ -340,242 +419,246 @@ model MemoryItem {
   @@index([createdAt])
 }
 
-// ============ TRADING WORKFLOW MODELS ============
+// ─── Trading Workflow ─────────────────────────────────────────────────────────
 
-// TradingView Alerts
 model Alert {
-  id              String    @id @default(uuid())
-  user            User      @relation(fields: [userId], references: [id])
-  userId          String
-  symbol          String
-  webhookSource   String?   // webhook source identifier
-  webhookPayload  Json?     // raw webhook payload
-  status          AlertStatus @default(RECEIVED)
-  receivedAt      DateTime  @default(now())
-  validatedAt     DateTime?
-  analyses        Analysis[]
-  consensus       Consensus?
+  id             String      @id @default(uuid())
+  user           User        @relation(fields: [userId], references: [id])
+  userId         String
+  symbol         String
+  webhookSource  String?
+  webhookPayload Json?
+  status         AlertStatus @default(RECEIVED)
+  receivedAt     DateTime    @default(now())
+  validatedAt    DateTime?
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  analyses       Analysis[]
+  consensus      Consensus?
   recommendations Recommendation[]
-  orderLinks      OrderAnalysisLink[]
+  orderLinks     OrderAnalysisLink[]
+
   @@index([userId])
   @@index([symbol])
   @@index([status])
   @@index([createdAt])
 }
 
-// AI Analysis Results
 model Analysis {
-  id              String    @id @default(uuid())
-  alert           Alert     @relation(fields: [alertId], references: [id])
-  alertId         String
-  symbol          String
-  provider        AIProvider
-  analysis        String    @db.Text
-  confidence      Decimal   @db.Decimal(6,4) // 0.0000 - 1.0000
-  riskLevel       String    // LOW, MEDIUM, HIGH
-  sentiment       String?   // BULLISH, BEARISH, NEUTRAL
-  keyPoints       String[]
-  metadata        Json?
-  createdAt       DateTime  @default(now())
+  id         String     @id @default(uuid())
+  alert      Alert      @relation(fields: [alertId], references: [id])
+  alertId    String
+  symbol     String
+  provider   AIProvider
+  analysis   String     @db.Text
+  confidence Decimal    @db.Decimal(6, 4)
+  riskLevel  String
+  sentiment  String?
+  keyPoints  String[]
+  metadata   Json?
+  createdAt  DateTime   @default(now())
+
   @@index([alertId])
   @@index([provider])
   @@index([symbol])
 }
 
-// AI Consensus and Scoring
 model Consensus {
-  id              String    @id @default(uuid())
-  alert           Alert     @relation(fields: [alertId], references: [id])
-  alertId         String    @unique
+  id              String             @id @default(uuid())
+  alert           Alert              @relation(fields: [alertId], references: [id])
+  alertId         String             @unique
   symbol          String
   recommendation  RecommendationType
-  confidenceScore Decimal   @db.Decimal(6,4)
-  riskScore       Decimal   @db.Decimal(6,4)
+  confidenceScore Decimal            @db.Decimal(6, 4)
+  riskScore       Decimal            @db.Decimal(6, 4)
   bulletPoints    String[]
-  analysis        String    @db.Text
-  providerVotes   Json      // { OPENAI: BUY, CLAUDE: BUY, GEMINI: HOLD, ... }
-  createdAt       DateTime  @default(now())
+  analysis        String             @db.Text
+  providerVotes   Json
+  createdAt       DateTime           @default(now())
+  recommendations Recommendation[]
+
   @@index([alertId])
   @@index([symbol])
 }
 
-// Trading Recommendations
 model Recommendation {
-  id              String    @id @default(uuid())
-  consensus       Consensus @relation(fields: [consensusId], references: [id])
-  consensusId     String    @unique
-  alert           Alert     @relation(fields: [alertId], references: [id])
-  alertId         String
-  user            User      @relation(fields: [userId], references: [id])
-  userId          String
-  symbol          String
-  recommendationType RecommendationType
-  entryPrice      Decimal?  @db.Decimal(30, 12)
-  targetPrice     Decimal?  @db.Decimal(30, 12)
-  stopLoss        Decimal?  @db.Decimal(30, 12)
-  riskReward      Decimal?  @db.Decimal(10, 4)
-  positionSizePercentage Decimal? @db.Decimal(6, 4)
-  urgency         String    // LOW, MEDIUM, HIGH
-  reasoning       String    @db.Text
-  createdAt       DateTime  @default(now())
-  expiresAt       DateTime?
-  status          String    @default("PENDING") // PENDING, APPROVED, REJECTED, EXECUTED
-  tradeRecord     TradeRecord?
+  id                     String             @id @default(uuid())
+  consensus              Consensus          @relation(fields: [consensusId], references: [id])
+  consensusId            String             @unique
+  alert                  Alert              @relation(fields: [alertId], references: [id])
+  alertId                String
+  user                   User               @relation(fields: [userId], references: [id])
+  userId                 String
+  symbol                 String
+  recommendationType     RecommendationType
+  entryPrice             Decimal?           @db.Decimal(30, 12)
+  targetPrice            Decimal?           @db.Decimal(30, 12)
+  stopLoss               Decimal?           @db.Decimal(30, 12)
+  riskReward             Decimal?           @db.Decimal(10, 4)
+  positionSizePercentage Decimal?           @db.Decimal(6, 4)
+  urgency                String
+  reasoning              String             @db.Text
+  createdAt              DateTime           @default(now())
+  expiresAt              DateTime?
+  status                 String             @default("PENDING")
+  tradeRecord            TradeRecord?
+  orderLinks             OrderAnalysisLink[]
+
   @@index([userId])
   @@index([alertId])
   @@index([symbol])
   @@index([status])
 }
 
-// Link Orders to Alerts and Analysis
 model OrderAnalysisLink {
-  id              String    @id @default(uuid())
-  order           Order     @relation(fields: [orderId], references: [id])
-  orderId         String
-  alert           Alert     @relation(fields: [alertId], references: [id])
-  alertId         String
-  recommendation  Recommendation? @relation(fields: [recommendationId], references: [id])
+  id               String          @id @default(uuid())
+  order            Order           @relation(fields: [orderId], references: [id])
+  orderId          String
+  alert            Alert           @relation(fields: [alertId], references: [id])
+  alertId          String
+  recommendation   Recommendation? @relation(fields: [recommendationId], references: [id])
   recommendationId String?
-  createdAt       DateTime  @default(now())
+  createdAt        DateTime        @default(now())
+
   @@index([orderId])
   @@index([alertId])
 }
 
-// AI Performance Metrics
+// ─── AI Performance & Learning ───────────────────────────────────────────────
+
 model AIPerformance {
-  id              String    @id @default(uuid())
-  provider        AIProvider
-  symbol          String
-  recommendation  RecommendationType
-  actualOutcome   String    // BUY, SELL, NEUTRAL
-  accuracy        Decimal?  @db.Decimal(6, 4)
-  profitLoss      Decimal?  @db.Decimal(30, 12)
-  isCorrect       Boolean?
-  createdAt       DateTime  @default(now())
+  id             String             @id @default(uuid())
+  provider       AIProvider
+  symbol         String
+  recommendation RecommendationType
+  actualOutcome  String
+  accuracy       Decimal?           @db.Decimal(6, 4)
+  profitLoss     Decimal?           @db.Decimal(30, 12)
+  isCorrect      Boolean?
+  createdAt      DateTime           @default(now())
+
   @@index([provider])
   @@index([symbol])
   @@index([createdAt])
 }
 
-// Trading Statistics
 model TradingStatistics {
-  id              String    @id @default(uuid())
-  user            User      @relation(fields: [userId], references: [id])
-  userId          String    @unique
-  totalTrades     Int       @default(0)
-  winningTrades   Int       @default(0)
-  losingTrades    Int       @default(0)
-  winRate         Decimal?  @db.Decimal(6, 4)
-  totalProfit     Decimal?  @db.Decimal(30, 12)
-  totalLoss       Decimal?  @db.Decimal(30, 12)
-  avgWin          Decimal?  @db.Decimal(30, 12)
-  avgLoss         Decimal?  @db.Decimal(30, 12)
-  profitFactor    Decimal?  @db.Decimal(10, 4)
-  maxDrawdown     Decimal?  @db.Decimal(6, 4)
-  sharpeRatio     Decimal?  @db.Decimal(10, 4)
-  updatedAt       DateTime  @updatedAt
+  id            String   @id @default(uuid())
+  user          User     @relation(fields: [userId], references: [id])
+  userId        String   @unique
+  totalTrades   Int      @default(0)
+  winningTrades Int      @default(0)
+  losingTrades  Int      @default(0)
+  winRate       Decimal? @db.Decimal(6, 4)
+  totalProfit   Decimal? @db.Decimal(30, 12)
+  totalLoss     Decimal? @db.Decimal(30, 12)
+  avgWin        Decimal? @db.Decimal(30, 12)
+  avgLoss       Decimal? @db.Decimal(30, 12)
+  profitFactor  Decimal? @db.Decimal(10, 4)
+  maxDrawdown   Decimal? @db.Decimal(6, 4)
+  sharpeRatio   Decimal? @db.Decimal(10, 4)
+  updatedAt     DateTime @updatedAt
+
   @@index([userId])
 }
 
-// ============ AI LEARNING SYSTEM ============
-
-// Trade History and Results
 model TradeRecord {
-  id                String    @id @default(uuid())
-  user              User      @relation(fields: [userId], references: [id])
-  userId            String
-  recommendation    Recommendation @relation(fields: [recommendationId], references: [id])
-  recommendationId  String
-  symbol            String
-  executedAction    String?   // BUY, SELL, HOLD, NONE
-  executedPrice     Decimal?  @db.Decimal(30, 12)
-  executedSize      Decimal?  @db.Decimal(30, 12)
-  entryPrice        Decimal?  @db.Decimal(30, 12)
-  exitPrice         Decimal?  @db.Decimal(30, 12)
-  pnl               Decimal?  @db.Decimal(30, 12)
-  pnlPercentage     Decimal?  @db.Decimal(10, 4)
-  duration          Int?      // milliseconds
-  exitReason        String?
-  slippage          Decimal?  @db.Decimal(10, 4)
-  outcome           String    // win, loss, neutral, pending
-  lessons           String[]
-  createdAt         DateTime  @default(now())
-  completedAt       DateTime?
+  id               String         @id @default(uuid())
+  user             User           @relation(fields: [userId], references: [id])
+  userId           String
+  recommendation   Recommendation @relation(fields: [recommendationId], references: [id])
+  recommendationId String         @unique
+  symbol           String
+  executedAction   String?
+  executedPrice    Decimal?       @db.Decimal(30, 12)
+  executedSize     Decimal?       @db.Decimal(30, 12)
+  entryPrice       Decimal?       @db.Decimal(30, 12)
+  exitPrice        Decimal?       @db.Decimal(30, 12)
+  pnl              Decimal?       @db.Decimal(30, 12)
+  pnlPercentage    Decimal?       @db.Decimal(10, 4)
+  duration         Int?
+  exitReason       String?
+  slippage         Decimal?       @db.Decimal(10, 4)
+  outcome          String
+  lessons          String[]
+  createdAt        DateTime       @default(now())
+  completedAt      DateTime?
+
   @@index([userId])
   @@index([symbol])
   @@index([outcome])
   @@index([createdAt])
 }
 
-// Learning Records - aggregated learning by period
 model LearningRecord {
-  id              String    @id @default(uuid())
-  user            User      @relation(fields: [userId], references: [id])
-  userId          String
-  period          String    // YYYY-MM format
-  symbol          String
-  successRate     Decimal   @db.Decimal(6, 4)
-  avgWin          Decimal?  @db.Decimal(30, 12)
-  avgLoss         Decimal?  @db.Decimal(30, 12)
-  profitFactor    Decimal?  @db.Decimal(10, 4)
-  totalTrades     Int
-  insights        Json      // Array of insight objects
-  improvements    String[]
-  lastUpdated     DateTime  @default(now())
+  id           String   @id @default(uuid())
+  user         User     @relation(fields: [userId], references: [id])
+  userId       String
+  period       String
+  symbol       String
+  successRate  Decimal  @db.Decimal(6, 4)
+  avgWin       Decimal? @db.Decimal(30, 12)
+  avgLoss      Decimal? @db.Decimal(30, 12)
+  profitFactor Decimal? @db.Decimal(10, 4)
+  totalTrades  Int
+  insights     Json
+  improvements String[]
+  lastUpdated  DateTime @default(now())
+
   @@unique([userId, period, symbol])
   @@index([userId])
   @@index([period])
 }
 
-// AI Prompt Templates
 model PromptTemplate {
-  id              String    @id @default(uuid())
-  user            User?     @relation(fields: [userId], references: [id])
-  userId          String?
-  name            String
-  description     String?
-  category        String    // analysis, recommendation, explanation, learning
-  template        String    @db.Text
-  variables       Json      // Array of variable definitions
-  examples        Json?     // Array of examples
-  isCustom        Boolean   @default(true)
-  isActive        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id          String   @id @default(uuid())
+  user        User?    @relation(fields: [userId], references: [id])
+  userId      String?
+  name        String
+  description String?
+  category    String
+  template    String   @db.Text
+  variables   Json
+  examples    Json?
+  isCustom    Boolean  @default(true)
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
   @@index([userId])
   @@index([category])
 }
 
-// Strategy Templates
 model StrategyTemplate {
-  id              String    @id @default(uuid())
-  user            User?     @relation(fields: [userId], references: [id])
-  userId          String?
-  name            String
-  description     String?
-  rules           Json      // Array of strategy rules
-  parameters      Json      // Array of parameters
-  indicators      String[]  // List of required indicators
-  riskManagement  Json      // Risk management rules
-  backtest        Json?     // Backtest results
-  isActive        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id             String   @id @default(uuid())
+  user           User?    @relation(fields: [userId], references: [id])
+  userId         String?
+  name           String
+  description    String?
+  rules          Json
+  parameters     Json
+  indicators     String[]
+  riskManagement Json
+  backtest       Json?
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
   @@index([userId])
 }
 
-// Analysis Improvement History
 model ImprovementLog {
   id              String    @id @default(uuid())
   user            User      @relation(fields: [userId], references: [id])
   userId          String
   symbol          String?
-  improvementType String    // feature_added, parameter_tuned, rule_updated
+  improvementType String
   description     String    @db.Text
-  metrics         Json      // Before and after metrics
+  metrics         Json
   applied         Boolean   @default(false)
   appliedAt       DateTime?
   createdAt       DateTime  @default(now())
+
   @@index([userId])
   @@index([symbol])
   @@index([improvementType])

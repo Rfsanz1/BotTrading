@@ -15,6 +15,34 @@ trading-bot/
 artifacts/trading-dashboard/   # React/Vite frontend (proxies /bot/* → localhost:3000)
 artifacts/api-server/          # Node.js/Express backend (auth, notifications, AI routes)
 lib/db/                        # Drizzle ORM + Replit PostgreSQL schema
+
+packages/
+├── database/   @rfsanz/database  — Prisma client singleton + all model/enum re-exports
+├── shared/     @rfsanz/shared    — Enums, DTOs, interfaces, pagination & response utils
+├── config/     @rfsanz/config    — Typed env config (getConfig()), validated at startup
+├── logger/     @rfsanz/logger    — Pino logger + createLogger(context) child factory
+└── auth/       @rfsanz/auth      — JWT sign/verify, bcrypt helpers, role/permission guards
+```
+
+### Package usage
+
+```ts
+// Typed config
+import { getConfig } from '@rfsanz/config';
+const { jwtSecret, databaseUrl } = getConfig();
+
+// Logger
+import { createLogger } from '@rfsanz/logger';
+const log = createLogger('AuthService');
+
+// Auth
+import { signTokens, hashPassword, hasPermission } from '@rfsanz/auth';
+
+// Shared DTOs / enums / utils
+import { RoleName, Side, paginate, ok } from '@rfsanz/shared';
+
+// Database (Prisma + all types)
+import { prisma, type User, RoleName } from '@rfsanz/database';
 ```
 
 ## How to run

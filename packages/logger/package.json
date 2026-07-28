@@ -1,17 +1,14 @@
 {
-  "name": "@rfsanz/auth",
+  "name": "@rfsanz/logger",
   "version": "0.1.0",
   "private": true,
   "main": "src/index.ts",
   "types": "src/index.ts",
   "dependencies": {
-    "@rfsanz/shared": "workspace:*",
-    "jsonwebtoken": "^9.0.0",
-    "bcryptjs": "^2.4.3"
+    "pino": "^8.0.0",
+    "pino-pretty": "^11.0.0"
   },
   "devDependencies": {
-    "@types/jsonwebtoken": "^9.0.0",
-    "@types/bcryptjs": "^2.4.2",
     "@types/node": "^20.0.0",
     "typescript": "~5.9.3"
   }
