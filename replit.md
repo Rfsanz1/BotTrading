@@ -1,58 +1,60 @@
 # AI Trading Bot
 
-Automated crypto trading bot with dual-AI signals, Binance execution, and Telegram notifications.
+Automated crypto trading bot with multi-AI consensus, real-time Telegram integration, and a full-featured React dashboard.
 
-## Stack
-- **Backend**: Python 3 + Flask (single file: `trading-bot/main.py`)
-- **Primary AI**: Groq – Llama 3.1-8b-instant
-- **Validator AI**: Claude Sonnet 5 via OpenRouter (optional — bot falls back to Groq if key missing)
-- **Exchange**: Binance Spot (testnet or live)
-- **Notifications**: Telegram (group topics support)
-- **Database**: SQLite (`trading-bot/trades.db`)
-- **State**: `trading-bot/bot_state.json` (open positions persisted across restarts)
+## Architecture
 
-## Running on Replit
+```
+trading-bot/
+├── main.py              # Python/Flask backend — all bot logic + REST API (port 3000)
+├── config.json          # API keys and settings (config.json takes priority over env vars)
+├── trades.db            # SQLite: trades, equity snapshots, audit log
+├── trades.log           # JSONL trade log (backward compat)
+└── bot_state.json       # Open positions (persisted across restarts)
 
-Workflow: **Trading Bot** — `cd trading-bot && python3 main.py`
+artifacts/trading-dashboard/   # React/Vite frontend (proxies /bot/* → localhost:3000)
+artifacts/api-server/          # Node.js/Express backend (auth, notifications, AI routes)
+lib/db/                        # Drizzle ORM + Replit PostgreSQL schema
+```
 
-Flask API runs on port `3000` (or `$PORT` env var). Endpoints:
-- `GET /api/status` — bot status
-- `GET /api/positions` — open positions
-- `GET /api/daily` — daily P&L
-- `GET /api/healthz` — health check
-- `GET /dashboard` — legacy HTML dashboard
+## How to run
 
-## Required Secrets (Replit Secrets)
+All services start automatically via workflows:
+- **Trading Bot**: `cd trading-bot && python3 main.py`
+- **Trading Dashboard**: `pnpm --filter @workspace/trading-dashboard run dev`
+- **API Server**: `pnpm --filter @workspace/api-server run dev`
 
-| Secret | Description |
-|--------|-------------|
-| `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `TELEGRAM_CHAT_ID` | Group chat ID |
-| `BINANCE_API_KEY` | Binance API key |
-| `BINANCE_API_SECRET` | Binance API secret |
-| `GROQ_API_KEY` | From console.groq.com |
-| `OPENROUTER_API_KEY` | Optional — enables Claude Sonnet 5 validator |
+## Configuring API keys
 
-## Config File
+API keys can be set two ways:
+1. **Via the bot config page** at `/config` (saves to `trading-bot/config.json`) — easiest
+2. **Via Replit Secrets** — env vars are read as fallback when config.json doesn't have a value
 
-`trading-bot/config.json` — bot reads this first, then falls back to env vars.
-Currently set to `BINANCE_TESTNET: true` (virtual money). Change to `false` for live trading.
+Required keys:
+| Key | Purpose |
+|-----|---------|
+| `BINANCE_API_KEY` | Binance trading (testnet or live) |
+| `BINANCE_API_SECRET` | Binance trading (testnet or live) |
+| `TELEGRAM_BOT_TOKEN` | Telegram bot for commands & alerts |
+| `GROQ_API_KEY` | Primary AI model (Llama 3.1) |
+| `ANTHROPIC_API_KEY` | AI consensus (Claude Sonnet) |
+| `OPENAI_API_KEY` | AI consensus (GPT-4) |
+| `GEMINI_API_KEY` | AI consensus (Gemini) |
 
-## Railway Deployment
+## Key settings (config.json)
 
-1. Push to GitHub
-2. Connect repo to Railway
-3. Railway picks up `railway.json` (root) and `trading-bot/nixpacks.toml` automatically
-4. Set the same env vars in Railway → Variables tab
-5. Deploy
+- `BINANCE_TESTNET: "true"` — safe testnet mode (default)
+- `LIVE_MODE: "false"` — no real trades until explicitly enabled
+- `VACATION_MODE: "false"` — allow trading (set true to pause all trades)
 
-## AI Models Used
+## Dashboard
 
-| Role | Model | Provider |
-|------|-------|----------|
-| Primary analyst | `llama-3.1-8b-instant` | Groq |
-| Validator (optional) | `anthropic/claude-sonnet-5` | OpenRouter |
+The React dashboard at `/trading-dashboard/` connects to the Python Flask bot and shows:
+- Real-time overview (P&L, positions, win rate)
+- AI signals, trade history, analytics
+- Backtest runner, DCA manager, system monitor
+- Settings panel (configure everything via UI)
 
-## User Preferences
-- Keep all bot logic in the single `trading-bot/main.py` file (existing architecture)
-- Use `config.json` as primary config source, env vars as fallback
+## User preferences
+
+- Keep existing project structure — do not restructure or migrate
