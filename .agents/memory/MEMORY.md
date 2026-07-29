@@ -1,3 +1,4 @@
+- [AI Engine 9Router](ai-engine-9router.md) — semua AI traffic wajib via 9Router; AIEngineService (bukan AIService) untuk hindari clash legacy
 - [Bot architecture](bot-arch.md) — trading bot standalone di trading-bot/main.py, semua fitur dalam satu file Python
 - [Multi-AI consensus](multi-ai-consensus.md) — 4 model (Groq+Claude/OR+Claude/Direct+OpenAI+Gemini) dijalankan paralel; majority vote >50%; handle_incoming_message wajib global bot_paused
 - [Equity basis rule](equity-basis.md) — daily_start_equity HANYA dari USDT (get_binance_equity), default 0.0 bukan 10000

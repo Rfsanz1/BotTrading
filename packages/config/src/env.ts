@@ -17,7 +17,21 @@ export interface AppConfig {
   jwtSecret:    string;
   jwtExpiresIn: string;
 
-  // External AI
+  // ── 9Router AI Gateway ────────────────────────────────────────────────────
+  /** Always '9router' — signals all AI traffic must go via 9Router. */
+  aiProvider:  string;
+  /** Base URL of the running 9Router instance.  ENV: AI_BASE_URL */
+  aiBaseUrl:   string;
+  /** Bearer token for the 9Router instance.     ENV: AI_API_KEY  */
+  aiApiKey:    string;
+  /** Default model forwarded to 9Router.        ENV: AI_MODEL    */
+  aiModel:     string;
+  /** Per-request timeout (ms).                  ENV: AI_TIMEOUT_MS */
+  aiTimeoutMs: number;
+  /** Max retries per request.                   ENV: AI_MAX_RETRIES */
+  aiMaxRetries: number;
+
+  // Legacy direct-SDK keys (kept for backward compatibility — prefer 9Router)
   openaiApiKey?:  string;
   anthropicKey?:  string;
   geminiApiKey?:  string;
@@ -70,11 +84,20 @@ function loadConfig(): AppConfig {
     jwtSecret:    required('JWT_SECRET'),
     jwtExpiresIn: optional('JWT_EXPIRES_IN', '1d'),
 
-    openaiApiKey:  optional('OPENAI_API_KEY')  || undefined,
+    // 9Router AI Gateway
+    aiProvider:   optional('AI_PROVIDER', '9router'),
+    aiBaseUrl:    optional('AI_BASE_URL', 'http://localhost:20128/v1').replace(/\/$/, ''),
+    aiApiKey:     optional('AI_API_KEY', ''),
+    aiModel:      optional('AI_MODEL', 'google/gemini-2.5-pro'),
+    aiTimeoutMs:  optionalInt('AI_TIMEOUT_MS', 30_000),
+    aiMaxRetries: optionalInt('AI_MAX_RETRIES', 3),
+
+    // Legacy direct-SDK keys (kept for backward compat — prefer 9Router)
+    openaiApiKey:  optional('OPENAI_API_KEY')    || undefined,
     anthropicKey:  optional('ANTHROPIC_API_KEY') || undefined,
-    geminiApiKey:  optional('GOOGLE_API_KEY')  || undefined,
-    groqApiKey:    optional('GROQ_API_KEY')    || undefined,
-    deepseekKey:   optional('DEEPSEEK_API_KEY') || undefined,
+    geminiApiKey:  optional('GOOGLE_API_KEY')    || undefined,
+    groqApiKey:    optional('GROQ_API_KEY')      || undefined,
+    deepseekKey:   optional('DEEPSEEK_API_KEY')  || undefined,
 
     telegramBotToken: optional('TELEGRAM_BOT_TOKEN') || undefined,
 
