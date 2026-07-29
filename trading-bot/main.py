@@ -31,7 +31,6 @@ from email.mime.text import MIMEText
 import pandas as pd
 import psutil
 import requests
-from groq import Groq
 from flask import Flask, request as flask_request
 
 # ---------------------------------------------------------------------------
@@ -247,11 +246,25 @@ DB_FILE: str = os.getenv("DB_FILE", "trades.db")
 # ─── ENVIRONMENT VARIABLES (dibaca dari config.json atau env var) ────────────
 # ---------------------------------------------------------------------------
 
-GROQ_API_KEY        = _cfg("GROQ_API_KEY")
-OPENROUTER_API_KEY  = _cfg("OPENROUTER_API_KEY")
-ANTHROPIC_API_KEY   = _cfg("ANTHROPIC_API_KEY")
-OPENAI_API_KEY      = _cfg("OPENAI_API_KEY")
-GEMINI_API_KEY      = _cfg("GEMINI_API_KEY")
+# ─── 9Router AI Gateway ───────────────────────────────────────────────────────
+# Semua traffic AI dirouting lewat 9Router (OpenAI-compatible proxy).
+# Set AI_BASE_URL ke URL 9Router kamu, contoh: https://9router.domain.com/v1
+AI_BASE_URL:         str = _cfg("AI_BASE_URL",        "http://localhost:20128/v1").rstrip("/")
+AI_API_KEY:          str = _cfg("AI_API_KEY",         "")
+AI_MODEL:            str = _cfg("AI_MODEL",            "google/gemini-2.5-pro")
+AI_VALIDATOR_MODEL:  str = _cfg("AI_VALIDATOR_MODEL",  "anthropic/claude-sonnet-5")
+AI_VALIDATOR_MODEL2: str = _cfg("AI_VALIDATOR_MODEL2", "openai/gpt-4o")
+AI_VALIDATOR_MODEL3: str = _cfg("AI_VALIDATOR_MODEL3", "google/gemini-1.5-flash")
+AI_CODING_MODEL:     str = _cfg("AI_CODING_MODEL",     "anthropic/claude-opus-4-5")
+AI_TIMEOUT_MS:       int = int(_cfg("AI_TIMEOUT_MS",   "30000"))
+
+# Legacy keys — disimpan agar config.json lama tidak error, tapi tidak dipakai
+GROQ_API_KEY        = _cfg("GROQ_API_KEY",       "")  # deprecated → pakai 9Router
+OPENROUTER_API_KEY  = _cfg("OPENROUTER_API_KEY", "")  # deprecated
+ANTHROPIC_API_KEY   = _cfg("ANTHROPIC_API_KEY",  "")  # deprecated
+OPENAI_API_KEY      = _cfg("OPENAI_API_KEY",     "")  # deprecated
+GEMINI_API_KEY      = _cfg("GEMINI_API_KEY",     "")  # deprecated
+
 TELEGRAM_BOT_TOKEN  = _cfg("TELEGRAM_BOT_TOKEN")
 
 _raw_chat_id = _cfg("TELEGRAM_CHAT_ID", "0")
@@ -276,14 +289,18 @@ def _parse_topic(env_key: str) -> Optional[int]:
     v = _cfg(env_key, "").strip()
     return int(v) if v.isdigit() else None
 
-TELEGRAM_BUY_TOPIC_ID:  Optional[int] = _parse_topic("TELEGRAM_BUY_TOPIC_ID")
-TELEGRAM_SELL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_SELL_TOPIC_ID")
-TELEGRAM_BULL_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BULL_TOPIC_ID")
-TELEGRAM_BEAR_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_BEAR_TOPIC_ID")
-TELEGRAM_CHAT_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
-TELEGRAM_REPORT_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID")
-TELEGRAM_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
-TELEGRAM_HOLD_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_HOLD_TOPIC_ID")
+TELEGRAM_BUY_TOPIC_ID:      Optional[int] = _parse_topic("TELEGRAM_BUY_TOPIC_ID")
+TELEGRAM_SELL_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_SELL_TOPIC_ID")
+TELEGRAM_BULL_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_BULL_TOPIC_ID")
+TELEGRAM_BEAR_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_BEAR_TOPIC_ID")
+TELEGRAM_CHAT_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_CHAT_TOPIC_ID")
+TELEGRAM_REPORT_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_ID")
+TELEGRAM_NEWS_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
+TELEGRAM_HOLD_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_HOLD_TOPIC_ID")
+# Topik tambahan — isi di config.json setelah buat topik di grup Telegram kamu
+TELEGRAM_ALERTS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_ALERTS_TOPIC_ID")    # notifikasi sistem (health, error)
+TELEGRAM_ANALYSIS_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_ANALYSIS_TOPIC_ID")  # detail analisis AI per pair
+TELEGRAM_CODING_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_CODING_TOPIC_ID")    # log AI coding updates
 
 # Binance credentials
 BINANCE_API_KEY    = _cfg("BINANCE_API_KEY")
@@ -1104,17 +1121,40 @@ _CONFIG_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="card">
-      <h2>🤖 AI — Groq</h2>
+      <h2>🤖 AI — 9Router Gateway</h2>
+      <div class="hint" style="margin-bottom:12px;color:#ffa726">Semua AI traffic dirouting lewat 9Router (OpenAI-compatible proxy). Set URL 9Router kamu di bawah.</div>
       <div class="field">
-        <label>Groq API Key</label>
-        <input type="password" name="GROQ_API_KEY" id="GROQ_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
-        <div class="hint" id="groq_key_status"></div>
-        <div class="hint">Gratis di console.groq.com → API Keys</div>
+        <label>AI Base URL (9Router)</label>
+        <input type="text" name="AI_BASE_URL" id="AI_BASE_URL" placeholder="http://localhost:20128/v1">
+        <div class="hint">URL 9Router kamu, contoh: https://9router.domain.com/v1</div>
       </div>
       <div class="field">
-        <label>OpenRouter API Key (opsional — untuk Claude validator)</label>
-        <input type="password" name="OPENROUTER_API_KEY" id="OPENROUTER_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
-        <div class="hint" id="openrouter_key_status"></div>
+        <label>AI API Key (Bearer Token)</label>
+        <input type="password" name="AI_API_KEY" id="AI_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="ai_key_status"></div>
+        <div class="hint">Kosongkan jika 9Router tidak butuh autentikasi (local instance)</div>
+      </div>
+      <div class="field">
+        <label>Model Utama (AI_MODEL)</label>
+        <input type="text" name="AI_MODEL" id="AI_MODEL" placeholder="google/gemini-2.5-pro">
+        <div class="hint">Model untuk analisis trading utama</div>
+      </div>
+      <div class="field">
+        <label>Model Validator-1 (AI_VALIDATOR_MODEL)</label>
+        <input type="text" name="AI_VALIDATOR_MODEL" id="AI_VALIDATOR_MODEL" placeholder="anthropic/claude-sonnet-5">
+      </div>
+      <div class="field">
+        <label>Model Validator-2 (AI_VALIDATOR_MODEL2)</label>
+        <input type="text" name="AI_VALIDATOR_MODEL2" id="AI_VALIDATOR_MODEL2" placeholder="openai/gpt-4o">
+      </div>
+      <div class="field">
+        <label>Model Validator-3 (AI_VALIDATOR_MODEL3)</label>
+        <input type="text" name="AI_VALIDATOR_MODEL3" id="AI_VALIDATOR_MODEL3" placeholder="google/gemini-1.5-flash">
+      </div>
+      <div class="field">
+        <label>Model AI Coding (AI_CODING_MODEL)</label>
+        <input type="text" name="AI_CODING_MODEL" id="AI_CODING_MODEL" placeholder="anthropic/claude-opus-4-5">
+        <div class="hint">Dipakai endpoint /api/ai/code untuk auto-update bot</div>
       </div>
     </div>
 
@@ -1231,8 +1271,11 @@ loadCurrentConfig();
 _SENSITIVE_KEYS = {
     "BINANCE_API_KEY", "BINANCE_API_SECRET",
     "MEXC_API_KEY", "MEXC_API_SECRET",
-    "GROQ_API_KEY", "OPENROUTER_API_KEY",
+    "AI_API_KEY",
     "TELEGRAM_BOT_TOKEN",
+    # Legacy — tetap disembunyikan jika ada di config lama
+    "GROQ_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY", "GEMINI_API_KEY",
 }
 
 @flask_app.route("/config")
@@ -1994,6 +2037,74 @@ def api_trades_all():
         return json.dumps({"error": str(e)}), 500, {"Content-Type": "application/json"}
 
 
+@flask_app.route("/api/ai/code", methods=["POST"])
+def api_ai_code():
+    """
+    AI Coding endpoint via 9Router.
+    Bot bisa minta AI untuk membaca, menjelaskan, atau menyarankan perubahan kode.
+
+    Body JSON:
+      { "task": "deskripsi task coding",
+        "context": "snippet kode yang relevan (opsional)",
+        "model": "model override (opsional)" }
+
+    Return:
+      { "result": "...", "model": "...", "tokens_used": N }
+
+    Contoh pakai dari Telegram: /code <deskripsi>
+    """
+    try:
+        body    = flask_request.get_json(force=True, silent=True) or {}
+        task    = str(body.get("task", "")).strip()
+        context = str(body.get("context", "")).strip()
+        model   = str(body.get("model", AI_CODING_MODEL)).strip() or AI_CODING_MODEL
+
+        if not task:
+            return json.dumps({"error": "Field 'task' wajib diisi"}), 400, \
+                   {"Content-Type": "application/json"}
+
+        system_prompt = (
+            "Kamu adalah AI engineer ahli Python dan sistem trading. "
+            "Bantu pengguna dengan task coding yang diberikan. "
+            "Berikan kode yang bersih, lengkap, dan siap pakai. "
+            "Kalau diminta review/explain, jelaskan secara ringkas dan tepat sasaran."
+        )
+        user_msg = f"TASK: {task}"
+        if context:
+            user_msg += f"\n\nKONTEKS KODE:\n```python\n{context}\n```"
+
+        result = _call_9router(
+            [{"role": "system", "content": system_prompt},
+             {"role": "user",   "content": user_msg}],
+            model=model,
+            max_tokens=4096,
+            temperature=0.2,
+        )
+
+        # Kirim notif ke Telegram (topik CODING jika ada)
+        if TELEGRAM_CODING_TOPIC_ID:
+            _tg_send(
+                f"🤖 *AI Coding Task*\n"
+                f"Model: `{model}`\n"
+                f"Task: {task[:200]}",
+                topic_id=TELEGRAM_CODING_TOPIC_ID,
+            )
+
+        return json.dumps({"result": result, "model": model}), 200, \
+               {"Content-Type": "application/json"}
+
+    except Exception as e:
+        logger.error(f"api_ai_code error: {e}")
+        return json.dumps({"error": str(e)}), 500, \
+               {"Content-Type": "application/json"}
+
+
+@flask_app.route("/api/ai/fear-greed")
+def api_fear_greed():
+    """Return Fear & Greed Index saat ini (cached 1 jam)."""
+    return json.dumps(get_fear_greed_index()), 200, {"Content-Type": "application/json"}
+
+
 @flask_app.route("/api/news")
 def api_news_endpoint():
     symbol = flask_request.args.get("symbol", "")
@@ -2656,10 +2767,17 @@ def _is_position_allowed(symbol: str) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Hitung indikator teknikal. Gunakan pandas-ta untuk indikator tambahan
+    (Bollinger Bands, Supertrend, Williams %R, VWAP, Stochastic).
+    Kolom lama (sma20/sma50/rsi14/macd_hist/atr14) tetap dipertahankan
+    agar kode downstream tidak rusak.
+    """
     close = df["close"]
     high  = df["high"]
     low   = df["low"]
 
+    # ── Indikator dasar (manual, tetap untuk backward compat) ─────────────────
     df["sma20"] = close.rolling(20).mean()
     df["sma50"] = close.rolling(50).mean()
 
@@ -2683,6 +2801,37 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         (low  - close.shift()).abs(),
     ], axis=1).max(axis=1)
     df["atr14"] = tr.rolling(14).mean()
+
+    # ── Indikator tambahan via pandas-ta ─────────────────────────────────────
+    try:
+        import pandas_ta as ta  # type: ignore
+
+        # Bollinger Bands (20, 2σ)
+        bb = ta.bbands(close, length=20, std=2)
+        if bb is not None and not bb.empty:
+            df["bb_upper"] = bb.get("BBU_20_2.0", float("nan"))
+            df["bb_mid"]   = bb.get("BBM_20_2.0", float("nan"))
+            df["bb_lower"] = bb.get("BBL_20_2.0", float("nan"))
+            df["bb_width"] = (df["bb_upper"] - df["bb_lower"]) / df["bb_mid"]
+
+        # Williams %R (oversold <-80, overbought >-20)
+        df["willr14"] = ta.willr(high, low, close, length=14)
+
+        # Stochastic K/D
+        stoch = ta.stoch(high, low, close)
+        if stoch is not None and not stoch.empty:
+            df["stoch_k"] = stoch.get("STOCHk_14_3_3", float("nan"))
+            df["stoch_d"] = stoch.get("STOCHd_14_3_3", float("nan"))
+
+        # EMA 200 (tren jangka panjang)
+        df["ema200"] = ta.ema(close, length=200)
+
+        # VWAP (jika ada kolom volume)
+        if "volume" in df.columns:
+            df["vwap"] = ta.vwap(high, low, close, df["volume"])
+
+    except Exception as _ta_err:
+        logger.debug(f"pandas-ta indikator tambahan dilewati: {_ta_err}")
 
     return df
 
@@ -2852,17 +3001,100 @@ def _build_tf_block(label: str, df: Optional[pd.DataFrame], n_rows: int = 5) -> 
     return f"\n[{label}]\n" + "\n".join(rows) + "\n" + summary
 
 
+# ---------------------------------------------------------------------------
+# ─── FEAR & GREED INDEX (alternative.me — gratis, tanpa API key) ─────────────
+# ---------------------------------------------------------------------------
+
+_fear_greed_cache: dict = {}
+_fear_greed_lock  = threading.Lock()
+
+def get_fear_greed_index() -> dict:
+    """
+    Ambil Crypto Fear & Greed Index dari alternative.me.
+    Di-cache 1 jam. Return: {"value": 0-100, "label": "Extreme Fear/Fear/Neutral/Greed/Extreme Greed"}
+    """
+    with _fear_greed_lock:
+        now = time.time()
+        if _fear_greed_cache and now - _fear_greed_cache.get("_ts", 0) < 3600:
+            return _fear_greed_cache
+    try:
+        r = requests.get("https://api.alternative.me/fng/", timeout=10)
+        r.raise_for_status()
+        data = r.json()["data"][0]
+        result = {
+            "value": int(data["value"]),
+            "label": data["value_classification"],
+            "_ts":   time.time(),
+        }
+        with _fear_greed_lock:
+            _fear_greed_cache.update(result)
+        return result
+    except Exception as e:
+        logger.debug(f"Fear & Greed fetch error: {e}")
+        return {"value": 50, "label": "Neutral", "_ts": 0}
+
+
+# ---------------------------------------------------------------------------
+# ─── VADER SENTIMENT SCORING ─────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _score_news_sentiment(headlines: list) -> float:
+    """
+    Hitung skor sentimen headline berita pakai VADER.
+    Return: -1.0 (sangat negatif) s.d. +1.0 (sangat positif).
+    Fallback 0.0 jika library tidak tersedia.
+    """
+    try:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer  # type: ignore
+        analyzer = SentimentIntensityAnalyzer()
+        scores = [analyzer.polarity_scores(h)["compound"] for h in headlines if h]
+        return round(sum(scores) / len(scores), 4) if scores else 0.0
+    except Exception:
+        return 0.0
+
+
+# ---------------------------------------------------------------------------
+# ─── 9ROUTER GATEWAY HELPER ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _call_9router(
+    messages: list,
+    model: str = "",
+    max_tokens: int = 350,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Kirim request ke 9Router (OpenAI-compatible gateway).
+    Semua AI traffic harus lewat fungsi ini — jangan panggil SDK
+    groq/anthropic/openai/gemini langsung.
+    Return: string response mentah; raise Exception jika error.
+    """
+    url     = f"{AI_BASE_URL}/chat/completions"
+    headers = {"Content-Type": "application/json"}
+    if AI_API_KEY:
+        headers["Authorization"] = f"Bearer {AI_API_KEY}"
+    payload: dict = {
+        "model":       model or AI_MODEL,
+        "messages":    messages,
+        "max_tokens":  max_tokens,
+        "temperature": temperature,
+    }
+    resp = requests.post(url, headers=headers, json=payload,
+                         timeout=AI_TIMEOUT_MS / 1000)
+    resp.raise_for_status()
+    return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 def ask_ai(symbol: str, df_1m: pd.DataFrame,
            df_5m: Optional[pd.DataFrame] = None,
            df_15m: Optional[pd.DataFrame] = None,
            funding: Optional[dict] = None,
            oi_change: Optional[dict] = None) -> dict:
     """
-    Kirim data multi-TF + futures data + berita ke Groq dengan conversation history.
+    Kirim data multi-TF + futures data + berita ke 9Router.
     Return: { "decision": "BUY"|"SELL"|"HOLD", "reason": str, "confidence": int }
     """
     global conversation_history
-    client = Groq(api_key=GROQ_API_KEY)
 
     # ── Blok multi-timeframe ────────────────────────────────────────────────
     tf_blocks = (
@@ -2900,18 +3132,34 @@ def ask_ai(symbol: str, df_1m: pd.DataFrame,
     if not futures_block:
         futures_block = "\nFutures Data: tidak tersedia untuk pair ini (spot-only)"
 
-    # ── Berita ──────────────────────────────────────────────────────────────
+    # ── Berita + Sentimen VADER ──────────────────────────────────────────────
     news_items = get_relevant_news(symbol)
     news_block = ""
     if news_items:
-        headlines = "\n".join(f"  - {n['title']} ({n['source']})" for n in news_items)
-        news_block = f"\nBerita/sentimen pasar terkini:\n{headlines}"
+        headlines = [n["title"] for n in news_items]
+        sentiment_score = _score_news_sentiment(headlines)
+        sentiment_label = (
+            "📈 Positif" if sentiment_score > 0.05 else
+            "📉 Negatif" if sentiment_score < -0.05 else "😐 Netral"
+        )
+        news_block = (
+            f"\nBerita terkini (VADER skor: {sentiment_score:+.2f} {sentiment_label}):\n"
+            + "\n".join(f"  - {n['title']} ({n['source']})" for n in news_items)
+        )
+
+    # ── Fear & Greed Index ───────────────────────────────────────────────────
+    fg = get_fear_greed_index()
+    fg_block = (
+        f"\nFear & Greed Index: {fg['value']}/100 → {fg['label']}\n"
+        f"  (< 25 = Extreme Fear, > 75 = Extreme Greed — perhatikan kontrarian!)"
+    )
 
     user_msg = (
         f"=== ANALISIS {symbol} [{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}] ===\n"
         f"\n— MULTI-TIMEFRAME OHLCV + INDIKATOR —{tf_blocks}"
         f"\n\n— RISK-REWARD SETUP —{rr_block}"
         f"\n\n— FUTURES DATA —{futures_block}"
+        f"\n\n— MARKET SENTIMENT —{fg_block}"
         + (f"\n\n— BERITA —{news_block}" if news_block else "")
         + "\n\nBerikan analisis lengkap dan keputusan trading (JSON)."
     )
@@ -2926,13 +3174,7 @@ def ask_ai(symbol: str, df_1m: pd.DataFrame,
                     + [{"role": "user", "content": user_msg}]
                 )
 
-            response = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                max_tokens=350,
-                temperature=0.2,
-                messages=messages,
-            )
-            raw = response.choices[0].message.content.strip()
+            raw = _call_9router(messages, model=AI_MODEL, max_tokens=350, temperature=0.2)
             if raw.startswith("```"):
                 raw = raw.split("```")[1].lstrip("json").strip()
 
@@ -2950,7 +3192,7 @@ def ask_ai(symbol: str, df_1m: pd.DataFrame,
         except json.JSONDecodeError:
             logger.warning(f"AI response bukan JSON valid ({symbol}, attempt {attempt+1}): {raw}")
         except Exception as e:
-            logger.error(f"Groq API error ({symbol}, attempt {attempt+1}): {e}")
+            logger.error(f"9Router AI error ({symbol}, attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)
 
     return {"decision": "HOLD", "reason": "Analisis AI gagal", "confidence": 0}
@@ -2983,13 +3225,10 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
                        funding: Optional[dict] = None,
                        oi_change: Optional[dict] = None) -> dict:
     """
-    Validator kedua menggunakan Claude Sonnet 5 via OpenRouter.
-    Menerima data market multi-TF + futures data + sinyal Groq, lalu memverifikasi
-    secara independen. Return: { decision, reason, confidence }
+    Validator-1 via 9Router (model: AI_VALIDATOR_MODEL, default Claude Sonnet).
     """
-    if not OPENROUTER_API_KEY:
-        logger.warning("OPENROUTER_API_KEY belum diisi — validator dilewati")
-        return groq_signal  # fallback: percaya Groq saja
+    if not AI_BASE_URL:
+        return groq_signal
 
     # ── Blok multi-timeframe ────────────────────────────────────────────────
     tf_blocks = (
@@ -2997,95 +3236,66 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         + _build_tf_block("5m — Momentum Confirmation", df_5m, 3)
         + _build_tf_block("15m — Trend Direction", df_15m, 3)
     )
-
-    # ── ATR + R:R info ──────────────────────────────────────────────────────
     atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
     price_now = float(df_1m.iloc[-1]["close"])
-    rr_block  = (
-        f"\nR:R Setup (ATR-based):\n"
-        f"  ATR14(1m) = {atr_now:.6f}\n"
-        f"  SL target = {price_now - SL_ATR_MULT * atr_now:.6f} (entry − {SL_ATR_MULT}×ATR)\n"
-        f"  TP target = {price_now + TP_ATR_MULT * atr_now:.6f} (entry + {TP_ATR_MULT}×ATR)\n"
-        f"  R:R ratio = 1:{int(TP_ATR_MULT / SL_ATR_MULT)}"
-    )
-
-    # ── Futures data ────────────────────────────────────────────────────────
     futures_block = ""
     if funding:
-        futures_block += (
-            f"\nFutures Data:\n"
-            f"  Funding Rate : {funding['funding_rate_pct']:+.4f}% → {funding['sentiment']}\n"
-            f"  Mark Price   : {funding['mark_price']}"
-        )
+        futures_block = f"\nFutures: FR={funding['funding_rate_pct']:+.4f}% → {funding['sentiment']}"
     if oi_change:
-        futures_block += (
-            f"\n  OI trend     : {oi_change['oi_change_pct']:+.3f}% ({oi_change['trend']})"
-        )
+        futures_block += f" | OI {oi_change['oi_change_pct']:+.3f}% ({oi_change['trend']})"
     if not futures_block:
-        futures_block = "\nFutures Data: tidak tersedia (spot-only pair)"
+        futures_block = "\nFutures: tidak tersedia (spot-only)"
 
-    # ── Berita ──────────────────────────────────────────────────────────────
     news_items = get_relevant_news(symbol)
     news_block = ""
     if news_items:
-        headlines = "\n".join(f"  - {n['title']} ({n['source']})" for n in news_items)
-        news_block = f"\nBerita:\n{headlines}"
+        score = _score_news_sentiment([n["title"] for n in news_items])
+        news_block = (
+            f"\nBerita (VADER {score:+.2f}):\n"
+            + "\n".join(f"  - {n['title']}" for n in news_items[:3])
+        )
 
+    fg = get_fear_greed_index()
     user_msg = (
         f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
         f"\n— MULTI-TIMEFRAME —{tf_blocks}"
-        f"\n\n— RISK-REWARD —{rr_block}"
-        f"\n\n— FUTURES DATA —{futures_block}"
+        f"\n\n— RISK-REWARD —\nATR14={atr_now:.6f} | "
+        f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
+        f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
+        f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}"
+        f"\n\n— FUTURES —{futures_block}"
+        f"\n\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})"
         + (f"\n\n— BERITA —{news_block}" if news_block else "")
-        + f"\n\n— SINYAL AI PERTAMA (Groq) —\n"
+        + f"\n\n— SINYAL AI PERTAMA —\n"
         f"  Keputusan : {groq_signal['decision']} ({groq_signal['confidence']}%)\n"
         f"  Alasan    : {groq_signal['reason']}\n\n"
-        f"Verifikasi secara independen. Apakah kamu setuju? Berikan analisismu (JSON)."
+        f"Verifikasi independen. Jawab hanya JSON."
     )
 
     raw = ""
     for attempt in range(3):
         try:
-            resp = requests.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://replit.com",
-                    "X-Title": "Trading Bot Validator",
-                },
-                json={
-                    "model": "anthropic/claude-sonnet-5",
-                    "messages": [
-                        {"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
-                        {"role": "user",   "content": user_msg},
-                    ],
-                    "max_tokens": 250,
-                    "temperature": 0.2,
-                },
-                timeout=30,
+            raw = _call_9router(
+                [{"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
+                 {"role": "user",   "content": user_msg}],
+                model=AI_VALIDATOR_MODEL,
+                max_tokens=250,
+                temperature=0.2,
             )
-            resp.raise_for_status()
-            raw = resp.json()["choices"][0]["message"]["content"].strip()
             if raw.startswith("```"):
                 raw = raw.split("```")[1].lstrip("json").strip()
-
             result = json.loads(raw)
             result["confidence"] = int(result.get("confidence", 0))
             result["decision"]   = result.get("decision", "HOLD").upper()
-            logger.info(
-                f"Claude validator → {symbol} {result['decision']} "
-                f"({result['confidence']}%) | {result['reason']}"
-            )
+            logger.info(f"Validator-1 ({AI_VALIDATOR_MODEL}) → {symbol} {result['decision']} ({result['confidence']}%)")
             return result
-
         except json.JSONDecodeError:
-            logger.warning(f"OpenRouter response bukan JSON ({symbol}, attempt {attempt+1}): {raw}")
+            logger.warning(f"Validator-1 bukan JSON ({symbol}, attempt {attempt+1}): {raw}")
         except Exception as e:
-            logger.error(f"OpenRouter error ({symbol}, attempt {attempt+1}): {e}")
+            logger.error(f"Validator-1 9Router error ({symbol}, attempt {attempt+1}): {e}")
             time.sleep(2 ** attempt)
 
-    return {"decision": "HOLD", "reason": "Validator AI gagal", "confidence": 0}
+    return {"decision": "HOLD", "reason": "Validator-1 gagal", "confidence": 0}
 
 
 # ---------------------------------------------------------------------------
@@ -3093,13 +3303,11 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
 # ---------------------------------------------------------------------------
 
 def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
-                             df_5m=None, df_15m=None, funding=None, oi_change=None):
-    """Validator: OpenAI GPT-4o. Return dict atau None jika error/key kosong."""
-    if not OPENAI_API_KEY:
+                              df_5m=None, df_15m=None, funding=None, oi_change=None):
+    """Validator-2 via 9Router (model: AI_VALIDATOR_MODEL2, default GPT-4o)."""
+    if not AI_BASE_URL:
         return None
     try:
-        import openai as _openai
-        client = _openai.OpenAI(api_key=OPENAI_API_KEY)
         tf_blocks = (
             _build_tf_block("1m — Primary", df_1m, 5)
             + _build_tf_block("5m — Momentum", df_5m, 3)
@@ -3107,6 +3315,7 @@ def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         )
         atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
         price_now = float(df_1m.iloc[-1]["close"])
+        fg = get_fear_greed_index()
         user_msg = (
             f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
             f"\n— MULTI-TIMEFRAME —{tf_blocks}\n"
@@ -3114,30 +3323,27 @@ def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
             f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
             f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
-            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})\n"
+            f"\n— SINYAL AI PERTAMA —\n"
             f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
-            f"Verifikasi independen. Jawab hanya JSON: "
-            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+            f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
-        resp = client.chat.completions.create(
-            model="gpt-4o",
+        raw = _call_9router(
+            [{"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
+             {"role": "user",   "content": user_msg}],
+            model=AI_VALIDATOR_MODEL2,
             max_tokens=200,
             temperature=0.2,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
-                {"role": "user",   "content": user_msg},
-            ],
         )
-        raw = resp.choices[0].message.content.strip()
         if "```" in raw:
             raw = raw.split("```")[1].lstrip("json").strip()
         result = json.loads(raw)
         result["confidence"] = int(result.get("confidence", 0))
         result["decision"]   = result.get("decision", "HOLD").upper()
-        logger.info(f"OpenAI validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        logger.info(f"Validator-2 ({AI_VALIDATOR_MODEL2}) → {symbol} {result['decision']} ({result['confidence']}%)")
         return result
     except Exception as e:
-        logger.error(f"OpenAI validator error ({symbol}): {e}")
+        logger.error(f"Validator-2 9Router error ({symbol}): {e}")
         return None
 
 
@@ -3147,12 +3353,10 @@ def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
 
 def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
                                     df_5m=None, df_15m=None, funding=None, oi_change=None):
-    """Validator: Claude via Anthropic direct API. Return dict atau None."""
-    if not ANTHROPIC_API_KEY:
+    """Validator-3 via 9Router (AI_VALIDATOR_MODEL second pass, news-focused)."""
+    if not AI_BASE_URL:
         return None
     try:
-        import anthropic as _anthropic
-        client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         tf_blocks = (
             _build_tf_block("1m — Primary", df_1m, 5)
             + _build_tf_block("5m — Momentum", df_5m, 3)
@@ -3160,34 +3364,40 @@ def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal
         )
         atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
         price_now = float(df_1m.iloc[-1]["close"])
+        fg = get_fear_greed_index()
+        news_items = get_relevant_news(symbol)
+        sentiment_note = ""
+        if news_items:
+            score = _score_news_sentiment([n["title"] for n in news_items])
+            sentiment_note = f"\nNews VADER skor: {score:+.2f}"
         user_msg = (
-            f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
+            f"=== VALIDASI INDEPENDEN {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
             f"\n— MULTI-TIMEFRAME —{tf_blocks}\n"
             f"\n— RISK-REWARD —\nATR14={atr_now:.6f} | "
             f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
             f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
-            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']}){sentiment_note}\n"
+            f"\n— SINYAL AI PERTAMA —\n"
             f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
-            f"Verifikasi independen. Jawab hanya JSON: "
-            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+            f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
-        resp = client.messages.create(
-            model="claude-opus-4-5",
+        raw = _call_9router(
+            [{"role": "system", "content": SYSTEM_PROMPT_VALIDATOR},
+             {"role": "user",   "content": user_msg}],
+            model=AI_VALIDATOR_MODEL,
             max_tokens=200,
-            system=SYSTEM_PROMPT_VALIDATOR,
-            messages=[{"role": "user", "content": user_msg}],
+            temperature=0.35,
         )
-        raw = resp.content[0].text.strip()
         if "```" in raw:
             raw = raw.split("```")[1].lstrip("json").strip()
         result = json.loads(raw)
         result["confidence"] = int(result.get("confidence", 0))
         result["decision"]   = result.get("decision", "HOLD").upper()
-        logger.info(f"Claude direct validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        logger.info(f"Validator-3 ({AI_VALIDATOR_MODEL} pass-2) → {symbol} {result['decision']} ({result['confidence']}%)")
         return result
     except Exception as e:
-        logger.error(f"Claude direct validator error ({symbol}): {e}")
+        logger.error(f"Validator-3 9Router error ({symbol}): {e}")
         return None
 
 
@@ -3197,13 +3407,10 @@ def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal
 
 def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
                              df_5m=None, df_15m=None, funding=None, oi_change=None):
-    """Validator: Google Gemini Flash. Return dict atau None."""
-    if not GEMINI_API_KEY:
+    """Validator-4 via 9Router (model: AI_VALIDATOR_MODEL3, default Gemini Flash)."""
+    if not AI_BASE_URL:
         return None
     try:
-        import google.generativeai as genai
-        genai.configure(api_key=GEMINI_API_KEY)
-        model = genai.GenerativeModel("gemini-1.5-flash")
         tf_blocks = (
             _build_tf_block("1m — Primary", df_1m, 5)
             + _build_tf_block("5m — Momentum", df_5m, 3)
@@ -3211,6 +3418,7 @@ def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         )
         atr_now   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
         price_now = float(df_1m.iloc[-1]["close"])
+        fg = get_fear_greed_index()
         prompt = (
             SYSTEM_PROMPT_VALIDATOR + "\n\n"
             f"=== VALIDASI {symbol} [{datetime.now(timezone.utc).strftime('%H:%M UTC')}] ===\n"
@@ -3219,22 +3427,26 @@ def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
             f"TP={price_now + TP_ATR_MULT*atr_now:.6f} | "
             f"SL={price_now - SL_ATR_MULT*atr_now:.6f} | "
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
-            f"\n— SINYAL GROQ (untuk referensi) —\n"
+            f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})\n"
+            f"\n— SINYAL AI PERTAMA —\n"
             f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
-            f"Verifikasi independen. Jawab hanya JSON: "
-            f'{{\"decision\":\"BUY|SELL|HOLD\",\"confidence\":0-100,\"reason\":\"...\"}}'
+            f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
-        resp = model.generate_content(prompt)
-        raw = resp.text.strip()
+        raw = _call_9router(
+            [{"role": "user", "content": prompt}],
+            model=AI_VALIDATOR_MODEL3,
+            max_tokens=200,
+            temperature=0.2,
+        )
         if "```" in raw:
             raw = raw.split("```")[1].lstrip("json").strip()
         result = json.loads(raw)
         result["confidence"] = int(result.get("confidence", 0))
         result["decision"]   = result.get("decision", "HOLD").upper()
-        logger.info(f"Gemini validator → {symbol} {result['decision']} ({result['confidence']}%)")
+        logger.info(f"Validator-4 ({AI_VALIDATOR_MODEL3}) → {symbol} {result['decision']} ({result['confidence']}%)")
         return result
     except Exception as e:
-        logger.error(f"Gemini validator error ({symbol}): {e}")
+        logger.error(f"Validator-4 9Router error ({symbol}): {e}")
         return None
 
 
@@ -3256,16 +3468,16 @@ def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
     }
     """
     validators = {
-        "Claude/OpenRouter": lambda: ask_ai_openrouter(
+        "9Router/Validator-1": lambda: ask_ai_openrouter(
             symbol, df_1m, groq_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
-        "Claude/Direct":     lambda: ask_ai_claude_direct_validator(
+        "9Router/Validator-3": lambda: ask_ai_claude_direct_validator(
             symbol, df_1m, groq_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
-        "OpenAI/GPT-4o":     lambda: ask_ai_openai_validator(
+        "9Router/Validator-2": lambda: ask_ai_openai_validator(
             symbol, df_1m, groq_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
-        "Google/Gemini":     lambda: ask_ai_gemini_validator(
+        "9Router/Validator-4": lambda: ask_ai_gemini_validator(
             symbol, df_1m, groq_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
     }
@@ -3289,7 +3501,7 @@ def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         t.join(timeout=45)  # max 45 detik per validator
 
     # Gabungkan dengan Groq sebagai suara pertama
-    all_models = {"Groq/Llama": groq_signal}
+    all_models = {"9Router/Primary": groq_signal}
     for name, res in results.items():
         if res is not None:
             all_models[name] = res
@@ -3461,8 +3673,8 @@ def send_telegram_photo(image_path: str, caption: str = "",
 
 def ask_ai_chat(user_text: str, user_name: str = "User") -> str:
     """
-    Percakapan bebas — pakai OpenAI GPT-4o jika tersedia (lebih pintar),
-    fallback ke Claude Direct, lalu Groq Llama jika keduanya tidak ada.
+    Percakapan bebas via 9Router (AI_MODEL).
+    Support history conversation untuk konteks multi-turn.
     """
     global conversation_history
     user_msg = f"[{user_name}]: {user_text}"
@@ -3474,55 +3686,12 @@ def ask_ai_chat(user_text: str, user_name: str = "User") -> str:
             + [{"role": "user", "content": user_msg}]
         )
 
-    reply = None
-
-    # ── Coba OpenAI GPT-4o dulu (paling pintar untuk chat) ──────────────────
-    if OPENAI_API_KEY and reply is None:
-        try:
-            import openai as _openai
-            client = _openai.OpenAI(api_key=OPENAI_API_KEY)
-            resp = client.chat.completions.create(
-                model="gpt-4o",
-                max_tokens=800,
-                temperature=0.7,
-                messages=messages,
-            )
-            reply = resp.choices[0].message.content.strip()
-            logger.debug(f"ask_ai_chat: replied via OpenAI GPT-4o")
-        except Exception as e:
-            logger.warning(f"ask_ai_chat OpenAI error: {e}")
-
-    # ── Fallback Claude Direct ────────────────────────────────────────────────
-    if ANTHROPIC_API_KEY and reply is None:
-        try:
-            import anthropic as _anthropic
-            client = _anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-            resp = client.messages.create(
-                model="claude-opus-4-5",
-                max_tokens=800,
-                system=SYSTEM_PROMPT_TRADING,
-                messages=[{"role": "user", "content": user_msg}],
-            )
-            reply = resp.content[0].text.strip()
-            logger.debug(f"ask_ai_chat: replied via Claude direct")
-        except Exception as e:
-            logger.warning(f"ask_ai_chat Claude error: {e}")
-
-    # ── Fallback Groq Llama ───────────────────────────────────────────────────
-    if reply is None:
-        try:
-            client = Groq(api_key=GROQ_API_KEY)
-            resp = client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                max_tokens=600,
-                temperature=0.6,
-                messages=messages,
-            )
-            reply = resp.choices[0].message.content.strip()
-            logger.debug(f"ask_ai_chat: replied via Groq Llama fallback")
-        except Exception as e:
-            logger.error(f"ask_ai_chat Groq fallback error: {e}")
-            return f"Maaf, semua AI sedang tidak bisa dihubungi: {e}"
+    try:
+        reply = _call_9router(messages, model=AI_MODEL, max_tokens=800, temperature=0.7)
+        logger.debug(f"ask_ai_chat: replied via 9Router ({AI_MODEL})")
+    except Exception as e:
+        logger.error(f"ask_ai_chat 9Router error: {e}")
+        return f"Maaf, AI (9Router) sedang tidak bisa dihubungi: {e}"
 
     with history_lock:
         conversation_history.append({"role": "user",      "content": user_msg})
@@ -6199,7 +6368,7 @@ def main_loop():
 if __name__ == "__main__":
     # ── Cek config kosong — beri tahu user untuk isi via /config ─────────────
     missing = [k for k, v in {
-        "GROQ_API_KEY":       GROQ_API_KEY,
+        "AI_BASE_URL":        AI_BASE_URL,
         "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
         "TELEGRAM_CHAT_ID":   str(TELEGRAM_CHAT_ID),
     }.items() if not v or v == "0"]

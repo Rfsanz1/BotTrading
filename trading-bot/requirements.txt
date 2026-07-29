@@ -1,12 +1,13 @@
 requests
 pandas
+pandas-ta
 flask
-groq
 python-binance
 feedparser
 psutil
-anthropic
-openai
-google-generativeai
 matplotlib
 mplfinance
+vaderSentiment
+aiohttp
+tenacity
+websocket-client

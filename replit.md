@@ -64,10 +64,47 @@ Required keys:
 | `BINANCE_API_KEY` | Binance trading (testnet or live) |
 | `BINANCE_API_SECRET` | Binance trading (testnet or live) |
 | `TELEGRAM_BOT_TOKEN` | Telegram bot for commands & alerts |
-| `GROQ_API_KEY` | Primary AI model (Llama 3.1) |
-| `ANTHROPIC_API_KEY` | AI consensus (Claude Sonnet) |
-| `OPENAI_API_KEY` | AI consensus (GPT-4) |
-| `GEMINI_API_KEY` | AI consensus (Gemini) |
+| `AI_BASE_URL` | 9Router gateway URL (e.g. `http://localhost:20128/v1`) |
+| `AI_API_KEY` | 9Router bearer token (leave empty for unauthenticated local) |
+
+> **All AI traffic goes through 9Router.** No Groq/Claude/OpenAI/Gemini keys needed.
+> Legacy keys (`GROQ_API_KEY`, `ANTHROPIC_API_KEY`, etc.) are kept in config for backward compat but unused.
+
+## AI Model Config (9Router)
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `AI_MODEL` | `google/gemini-2.5-pro` | Primary trading analysis |
+| `AI_VALIDATOR_MODEL` | `anthropic/claude-sonnet-5` | Validators 1 & 3 |
+| `AI_VALIDATOR_MODEL2` | `openai/gpt-4o` | Validator 2 |
+| `AI_VALIDATOR_MODEL3` | `google/gemini-1.5-flash` | Validator 4 |
+| `AI_CODING_MODEL` | `anthropic/claude-opus-4-5` | `/api/ai/code` endpoint |
+
+## Smart Trading Features Added
+
+- **Fear & Greed Index** — fetched from alternative.me every hour, passed to all AI analyses
+- **VADER Sentiment Scoring** — news headlines scored (-1.0 to +1.0) before AI sees them
+- **pandas-ta indicators** — Bollinger Bands, Williams %R, Stochastic, EMA200, VWAP added on top of existing RSI/MACD/ATR
+- **AI Coding endpoint** — `POST /api/ai/code` lets bot auto-suggest dependency/code changes via 9Router
+
+## Telegram Group Topics
+
+Current topics in `config.json`:
+| Topic | ID | Purpose |
+|-------|----|---------|
+| BUY | 5 | BUY signals |
+| SELL | 6 | SELL signals |
+| BULL | 4 | Bull market alerts |
+| BEAR | 3 | Bear market alerts |
+| HOLD | 294 | HOLD signals |
+| REPORT | 8 | Daily P&L report |
+| NEWS | 9 | Crypto news |
+| CHAT | 7 | Free chat with AI |
+| **ALERTS** | _set ID_ | System health & errors |
+| **ANALYSIS** | _set ID_ | Detailed AI analysis per pair |
+| **CODING** | _set ID_ | AI coding update log |
+
+Rekomendasi topik baru yang bisa ditambah ke grup: **ALERTS** (untuk health monitor & error bot), **ANALYSIS** (detail analisis multi-timeframe per pair), **CODING** (log auto-update dari endpoint /api/ai/code).
 
 ## Key settings (config.json)
 

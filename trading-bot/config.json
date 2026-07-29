@@ -12,4 +12,15 @@
   "TELEGRAM_REPORT_TOPIC_ID": "8",
   "TELEGRAM_NEWS_TOPIC_ID": "9",
   "TELEGRAM_CHAT_TOPIC_ID": "7",
+  "TELEGRAM_ALERTS_TOPIC_ID": "",
+  "TELEGRAM_ANALYSIS_TOPIC_ID": "",
+  "TELEGRAM_CODING_TOPIC_ID": "",
+  "AI_BASE_URL": "http://localhost:20128/v1",
+  "AI_API_KEY": "",
+  "AI_MODEL": "google/gemini-2.5-pro",
+  "AI_VALIDATOR_MODEL": "anthropic/claude-sonnet-5",
+  "AI_VALIDATOR_MODEL2": "openai/gpt-4o",
+  "AI_VALIDATOR_MODEL3": "google/gemini-1.5-flash",
+  "AI_CODING_MODEL": "anthropic/claude-opus-4-5",
+  "AI_TIMEOUT_MS": "30000"
 }
