@@ -2903,6 +2903,277 @@ def is_trending(df: pd.DataFrame) -> bool:
 
     return True
 
+
+# ---------------------------------------------------------------------------
+# ─── REGIME DETECTION ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def detect_market_regime(df_1m: pd.DataFrame,
+                         df_5m: Optional[pd.DataFrame] = None,
+                         df_15m: Optional[pd.DataFrame] = None) -> dict:
+    """
+    Deteksi regime pasar: BULL / BEAR / SIDEWAYS / HIGH_VOL.
+
+    Pakai TF tertinggi yang tersedia (15m > 5m > 1m) sebagai acuan tren utama.
+    HIGH_VOL override semua kalau ATR% ekstrem (sinyal sering jadi noise).
+
+    Return:
+        regime      : "BULL" | "BEAR" | "SIDEWAYS" | "HIGH_VOL"
+        strength    : "strong" | "moderate" | "weak"
+        conf_adjust : int  — tambah ke threshold (positif=lebih ketat, negatif=lebih longgar)
+        description : str  — ringkasan untuk prompt AI
+    """
+    df = (df_15m if (df_15m is not None and len(df_15m) >= 50) else
+          df_5m  if (df_5m  is not None and len(df_5m)  >= 50) else df_1m)
+
+    last  = df.iloc[-1]
+    close = float(last.get("close", 0) or 0)
+    if close <= 0:
+        return {"regime": "SIDEWAYS", "strength": "weak",
+                "conf_adjust": 12, "description": "↔️ SIDEWAYS: data tidak valid"}
+
+    rsi    = float(last.get("rsi14",    50)    or 50)
+    sma20  = float(last.get("sma20",    close) or close)
+    sma50  = float(last.get("sma50",    close) or close)
+    ema200 = float(last.get("ema200",   0)     or 0)
+    atr    = float(last.get("atr14",    0)     or 0)
+    macd_h = float(last.get("macd_hist", 0)   or 0)
+
+    # ── HIGH_VOL: ATR > 2.5% dari harga ──────────────────────────────────
+    atr_pct = (atr / close * 100) if close > 0 else 0
+    if atr_pct > 2.5:
+        strength = "strong" if atr_pct > 4.0 else "moderate"
+        return {
+            "regime":      "HIGH_VOL",
+            "strength":    strength,
+            "conf_adjust": 10,
+            "description": f"⚡ HIGH_VOL: ATR {atr_pct:.1f}% — volatilitas ekstrem, noise tinggi",
+        }
+
+    # ── Hitung sinyal bull vs bear ────────────────────────────────────────
+    bull = 0; bear = 0; total = 0
+
+    total += 1
+    if sma20 > sma50 * 1.001:   bull += 1
+    elif sma20 < sma50 * 0.999: bear += 1
+
+    total += 1
+    if rsi > 55:    bull += 1
+    elif rsi < 45:  bear += 1
+
+    total += 1
+    if macd_h > 0:   bull += 1
+    elif macd_h < 0: bear += 1
+
+    if ema200 > 0:
+        total += 1
+        if close > ema200 * 1.005:   bull += 1
+        elif close < ema200 * 0.995: bear += 1
+
+    bull_ratio = bull / total if total else 0.5
+    bear_ratio = bear / total if total else 0.5
+
+    if bull_ratio >= 0.70:
+        strength = "strong" if bull_ratio >= 0.85 else "moderate"
+        return {
+            "regime":      "BULL",
+            "strength":    strength,
+            "conf_adjust": -5 if strength == "strong" else 0,
+            "description": (
+                f"🟢 BULL {strength}: {bull}/{total} sinyal bullish | "
+                f"RSI={rsi:.0f} SMA20{'>'if sma20>sma50 else '<'}SMA50"
+            ),
+        }
+    elif bear_ratio >= 0.70:
+        strength = "strong" if bear_ratio >= 0.85 else "moderate"
+        return {
+            "regime":      "BEAR",
+            "strength":    strength,
+            "conf_adjust": +10,
+            "description": (
+                f"🔴 BEAR {strength}: {bear}/{total} sinyal bearish | "
+                f"RSI={rsi:.0f} SMA20{'<'if sma20<sma50 else '>'}SMA50"
+            ),
+        }
+    else:
+        return {
+            "regime":      "SIDEWAYS",
+            "strength":    "weak",
+            "conf_adjust": +12,
+            "description": (
+                f"↔️ SIDEWAYS: sinyal mixed ({bull}B/{bear}S/{total}T) | RSI={rsi:.0f}"
+            ),
+        }
+
+
+# ---------------------------------------------------------------------------
+# ─── MULTI-TIMEFRAME CONFLUENCE SCORE ────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def calc_confluence_score(df_1m: pd.DataFrame,
+                          df_5m: Optional[pd.DataFrame] = None,
+                          df_15m: Optional[pd.DataFrame] = None) -> dict:
+    """
+    Hitung skor konfluensi arah sinyal antar timeframe (0–100%).
+
+    Bobot TF: 15m=3, 5m=2, 1m=1 (total max 6 poin).
+    Tiap TF voting BULLISH / BEARISH / NEUTRAL berdasarkan RSI, MACD, SMA.
+
+    Return:
+        score     : float 0.0–1.0  — seberapa kompak semua TF sepakat
+        direction : "BULLISH" | "BEARISH" | "MIXED"
+        boost     : int  — langsung ditambahkan ke confidence AI
+        detail    : str  — ringkasan per-TF untuk prompt
+    """
+    def _tf_vote(df: Optional[pd.DataFrame], label: str) -> tuple:
+        if df is None or len(df) < 3:
+            return "NEUTRAL", f"[{label}] no data"
+        last = df.iloc[-1]; prev = df.iloc[-2]
+        rsi    = float(last.get("rsi14",    50) or 50)
+        macd_h = float(last.get("macd_hist", 0) or 0)
+        prev_h = float(prev.get("macd_hist", 0) or 0)
+        sma20  = float(last.get("sma20", 0) or 0)
+        sma50  = float(last.get("sma50", 0) or 0)
+
+        b = 0; s = 0
+        if rsi < 45:                              b += 1
+        elif rsi > 55:                            s += 1
+        if macd_h > 0 and macd_h >= prev_h:      b += 1
+        elif macd_h < 0 and macd_h <= prev_h:    s += 1
+        if sma20 > 0 and sma50 > 0:
+            if sma20 > sma50:                    b += 1
+            elif sma20 < sma50:                  s += 1
+
+        if b > s:
+            return "BULLISH",  f"[{label}] BULLISH ({b}B/{s}S) RSI={rsi:.0f}"
+        elif s > b:
+            return "BEARISH",  f"[{label}] BEARISH ({b}B/{s}S) RSI={rsi:.0f}"
+        else:
+            return "NEUTRAL",  f"[{label}] NEUTRAL RSI={rsi:.0f}"
+
+    tfs = [("15m", df_15m, 3), ("5m", df_5m, 2), ("1m", df_1m, 1)]
+    w_bull = 0; w_bear = 0; w_total = 0; notes = []
+
+    for label, df, w in tfs:
+        direction, note = _tf_vote(df, label)
+        notes.append(note)
+        if direction == "BULLISH":   w_bull += w
+        elif direction == "BEARISH": w_bear += w
+        w_total += w
+
+    dominant = max(w_bull, w_bear)
+    score    = dominant / w_total if w_total > 0 else 0.5
+    direction = ("BULLISH" if w_bull > w_bear else
+                 "BEARISH" if w_bear > w_bull else "MIXED")
+
+    if score >= 0.85:   boost = +8    # semua TF kompak → bonus confidence
+    elif score >= 0.67: boost = +3    # mayoritas sepakat
+    elif score >= 0.50: boost = 0
+    else:               boost = -15   # TF berlawanan → penalty confidence
+
+    detail = " | ".join(notes) + f" | Konfluensi: {score*100:.0f}% {direction}"
+    return {
+        "score":     round(score, 2),
+        "direction": direction,
+        "boost":     boost,
+        "detail":    detail,
+    }
+
+
+# ---------------------------------------------------------------------------
+# ─── FEEDBACK LOOP: PERFORMA PER-PAIR ────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_pair_feedback_cache: dict = {}
+_pair_feedback_lock  = threading.Lock()
+PAIR_FEEDBACK_LOOKBACK = 15   # analisis N trade closed terakhir per pair
+PAIR_FEEDBACK_TTL      = 3600  # cache 1 jam supaya tidak query SQLite tiap detik
+
+
+def db_get_pair_trades(symbol: str, n: int = 20) -> list:
+    """Ambil N trade closed terakhir untuk simbol tertentu dari SQLite."""
+    try:
+        with _db_lock:
+            with sqlite3.connect(DB_FILE) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute("""
+                    SELECT result, pnl, confidence FROM trades
+                    WHERE symbol = ?
+                      AND result IN ('CLOSED_TP','CLOSED_SL','EARLY_EXIT')
+                    ORDER BY id DESC LIMIT ?
+                """, (symbol, n)).fetchall()
+        return [dict(r) for r in rows]
+    except Exception as e:
+        logger.warning(f"SQLite get_pair_trades gagal ({symbol}): {e}")
+        return []
+
+
+def get_pair_feedback(symbol: str) -> dict:
+    """
+    Analisis performa historis pair ini dari trade database.
+
+    Bot belajar dari hasil trade sendiri:
+    - Pair konsisten profit → confidence boost kecil
+    - Pair konsisten rugi   → confidence penalty (threshold lebih ketat)
+    - Belum cukup data      → tidak ada adjustment
+
+    Return:
+        win_rate    : float 0.0–1.0
+        trade_count : int
+        adj         : int  — tambahkan ke confidence (negatif = lebih ketat)
+        label       : "outperforming" | "normal" | "underperforming" | "unknown"
+        description : str
+    """
+    with _pair_feedback_lock:
+        cached = _pair_feedback_cache.get(symbol, {})
+        if cached and (time.time() - cached.get("_ts", 0)) < PAIR_FEEDBACK_TTL:
+            return {k: v for k, v in cached.items() if not k.startswith("_")}
+
+    trades = db_get_pair_trades(symbol, PAIR_FEEDBACK_LOOKBACK)
+    count  = len(trades)
+
+    if count < 3:
+        result = {
+            "win_rate":    0.5,
+            "trade_count": count,
+            "adj":         0,
+            "label":       "unknown",
+            "description": f"📊 {symbol}: data belum cukup ({count} trade) — confidence normal",
+        }
+    else:
+        wins = sum(
+            1 for t in trades
+            if t.get("result") == "CLOSED_TP"
+            or (t.get("result") == "EARLY_EXIT" and (t.get("pnl") or 0) >= 0)
+        )
+        wr = wins / count
+
+        if wr >= 0.65:
+            adj, label = +5,  "outperforming"
+            desc = f"🌟 {symbol}: WR {wr*100:.0f}% dari {count} trade → confidence +{adj}"
+        elif wr >= 0.45:
+            adj, label = 0,   "normal"
+            desc = f"📊 {symbol}: WR {wr*100:.0f}% dari {count} trade → normal"
+        elif wr >= 0.30:
+            adj, label = -10, "underperforming"
+            desc = f"⚠️ {symbol}: WR {wr*100:.0f}% dari {count} trade → confidence {adj}"
+        else:
+            adj, label = -20, "underperforming"
+            desc = f"🔴 {symbol}: WR {wr*100:.0f}% — sangat jelek → confidence {adj}"
+
+        result = {
+            "win_rate":    round(wr, 3),
+            "trade_count": count,
+            "adj":         adj,
+            "label":       label,
+            "description": desc,
+        }
+
+    with _pair_feedback_lock:
+        _pair_feedback_cache[symbol] = {**result, "_ts": time.time()}
+    return result
+
+
 # ---------------------------------------------------------------------------
 # ─── 3. ANALISIS AI (GROQ – conversational, ingat history) ──────────────────
 # ---------------------------------------------------------------------------
@@ -3089,9 +3360,12 @@ def ask_ai(symbol: str, df_1m: pd.DataFrame,
            df_5m: Optional[pd.DataFrame] = None,
            df_15m: Optional[pd.DataFrame] = None,
            funding: Optional[dict] = None,
-           oi_change: Optional[dict] = None) -> dict:
+           oi_change: Optional[dict] = None,
+           regime: Optional[dict] = None,
+           confluence: Optional[dict] = None,
+           feedback: Optional[dict] = None) -> dict:
     """
-    Kirim data multi-TF + futures data + berita ke 9Router.
+    Kirim data multi-TF + futures data + berita + regime + confluence + feedback ke 9Router.
     Return: { "decision": "BUY"|"SELL"|"HOLD", "reason": str, "confidence": int }
     """
     global conversation_history
@@ -3154,12 +3428,38 @@ def ask_ai(symbol: str, df_1m: pd.DataFrame,
         f"  (< 25 = Extreme Fear, > 75 = Extreme Greed — perhatikan kontrarian!)"
     )
 
+    # ── Regime Pasar ─────────────────────────────────────────────────────────
+    regime_block = ""
+    if regime:
+        regime_block = (
+            f"\nRegime Pasar: {regime['description']}\n"
+            f"  Adjustment threshold: {regime['conf_adjust']:+d} poin confidence"
+        )
+
+    # ── Konfluensi Multi-Timeframe ────────────────────────────────────────────
+    confluence_block = ""
+    if confluence:
+        confluence_block = (
+            f"\nKonfluensi TF: {confluence['detail']}\n"
+            f"  Skor: {confluence['score']*100:.0f}% → boost confidence {confluence['boost']:+d}"
+        )
+
+    # ── Feedback Loop: Performa Pair Ini ─────────────────────────────────────
+    feedback_block = ""
+    if feedback:
+        feedback_block = (
+            f"\nFeedback Historis: {feedback['description']}"
+        )
+
     user_msg = (
         f"=== ANALISIS {symbol} [{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}] ===\n"
         f"\n— MULTI-TIMEFRAME OHLCV + INDIKATOR —{tf_blocks}"
         f"\n\n— RISK-REWARD SETUP —{rr_block}"
         f"\n\n— FUTURES DATA —{futures_block}"
         f"\n\n— MARKET SENTIMENT —{fg_block}"
+        + (f"\n\n— REGIME PASAR —{regime_block}" if regime_block else "")
+        + (f"\n\n— KONFLUENSI TIMEFRAME —{confluence_block}" if confluence_block else "")
+        + (f"\n\n— FEEDBACK HISTORIS PAIR —{feedback_block}" if feedback_block else "")
         + (f"\n\n— BERITA —{news_block}" if news_block else "")
         + "\n\nBerikan analisis lengkap dan keputusan trading (JSON)."
     )
@@ -6294,6 +6594,17 @@ def main_loop():
                             f"({oi_change['trend']})"
                         )
 
+                    # ── 🧠 Smart analysis: Regime + Confluence + Feedback ──
+                    regime     = detect_market_regime(df_1m, df_5m, df_15m)
+                    confluence = calc_confluence_score(df_1m, df_5m, df_15m)
+                    feedback   = get_pair_feedback(symbol)
+
+                    logger.debug(
+                        f"Smart {symbol}: {regime['regime']}({regime['strength']}) "
+                        f"confluence={confluence['score']*100:.0f}%({confluence['direction']}) "
+                        f"feedback={feedback['label']}(WR={feedback['win_rate']*100:.0f}%)"
+                    )
+
                     last = df_1m.iloc[-1]
                     current_price = float(last["close"])
                     atr = float(last["atr14"]) if not pd.isna(last["atr14"]) else 0.0
@@ -6302,6 +6613,7 @@ def main_loop():
                         symbol, df_1m,
                         df_5m=df_5m, df_15m=df_15m,
                         funding=funding, oi_change=oi_change,
+                        regime=regime, confluence=confluence, feedback=feedback,
                     )
                     ai_calls_this_cycle += 1
                     # Perbarui timestamp sinyal terakhir (untuk health monitor)
@@ -6311,21 +6623,37 @@ def main_loop():
                     confidence = signal["confidence"]
                     reason     = signal["reason"]
 
-                    # Ringkasan futures untuk log
+                    # ── Hitung effective threshold dinamis ────────────────
+                    # conf_adjust dari regime  : positif = lebih ketat
+                    # boost dari confluence    : positif = lebih longgar
+                    # adj dari feedback        : positif = lebih longgar
+                    effective_threshold = int(
+                        CONFIDENCE_THRESHOLD
+                        + regime["conf_adjust"]
+                        - confluence["boost"]
+                        - feedback["adj"]
+                    )
+                    # Clamp 50–90 supaya tidak ekstrem
+                    effective_threshold = max(50, min(90, effective_threshold))
+
+                    # Ringkasan untuk log
                     fr_str = f" FR={funding['funding_rate_pct']:+.4f}%" if funding else ""
                     oi_str = f" OI={oi_change['trend']}" if oi_change else ""
                     logger.info(
-                        f"AI → {symbol} {decision} ({confidence}%){fr_str}{oi_str} | {reason}"
+                        f"AI → {symbol} {decision} ({confidence}% / threshold={effective_threshold}%)"
+                        f"{fr_str}{oi_str} | regime={regime['regime']} | {reason}"
                     )
 
-                    if confidence < CONFIDENCE_THRESHOLD:
+                    if confidence < effective_threshold:
                         log_trade(symbol, decision, 0, current_price, confidence, reason, "HOLD")
                         send_trend_message(
                             f"📊 *Update {symbol}*\n\n"
-                            f"Sinyal  : *{decision}*\n"
-                            f"Yakin   : `{confidence}%` — belum cukup buat order\n\n"
+                            f"Sinyal    : *{decision}*\n"
+                            f"Yakin     : `{confidence}%` — threshold `{effective_threshold}%`\n"
+                            f"Regime    : `{regime['regime']}` ({regime['strength']})\n"
+                            f"Konfluensi: `{confluence['score']*100:.0f}%` {confluence['direction']}\n\n"
                             f"💬 _{reason}_\n\n"
-                            f"⏸ _Nunggu dulu, belum ada yang dieksekusi_",
+                            f"⏸ _Nunggu dulu, belum cukup yakin_",
                             decision=decision,
                         )
                         continue
