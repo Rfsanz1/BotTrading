@@ -1,6 +1,35 @@
 # AI Trading Bot
 
-Automated crypto trading bot with multi-AI consensus, real-time Telegram integration, and a full-featured React dashboard.
+Automated crypto trading bot with multi-AI consensus (via 9Router gateway), real-time Telegram integration, and support for multiple exchanges (Binance, MEXC, Bybit).
+
+## How to run
+
+The main bot runs via the **Trading Bot** workflow (`cd trading-bot && python3 main.py`).
+
+On first start, if API keys are missing, the bot serves a config page at `http://localhost:3000/config`.
+Fill in the required keys there, then restart the workflow.
+
+### Required config keys (set in `trading-bot/config.json` or via `/config` dashboard)
+
+| Key | Description |
+|-----|-------------|
+| `TELEGRAM_BOT_TOKEN` | From @BotFather |
+| `TELEGRAM_CHAT_ID` | Your Telegram group/chat ID |
+| `BINANCE_API_KEY` + `BINANCE_API_SECRET` | Only if `ACTIVE_EXCHANGE=binance` |
+| `MEXC_API_KEY` + `MEXC_API_SECRET` | Only if `ACTIVE_EXCHANGE=mexc` |
+| `BYBIT_API_KEY` + `BYBIT_API_SECRET` | Only if `ACTIVE_EXCHANGE=bybit` |
+| `AI_BASE_URL` | 9Router URL, e.g. `http://localhost:20128/v1` |
+
+### Webhook endpoints (TradingView / MetaTrader 5)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/tradingview/webhook` | POST | TradingView Pine Script alert → bot trade |
+| `/api/mt5/webhook` | POST | MT5 Expert Advisor signal → bot trade |
+
+TradingView alert JSON: `{ "symbol": "BTCUSDT", "action": "BUY", "price": {{close}}, "confidence": 80, "reason": "..." }`
+
+MT5 EA JSON: `{ "symbol": "BTCUSD", "action": "BUY", "price": 65000, "confidence": 75 }` — simbol otomatis dikonversi ke USDT pair.
 
 ## Architecture
 

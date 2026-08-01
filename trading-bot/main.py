@@ -310,7 +310,11 @@ BINANCE_API_SECRET = _cfg("BINANCE_API_SECRET")
 MEXC_API_KEY    = _cfg("MEXC_API_KEY")
 MEXC_API_SECRET = _cfg("MEXC_API_SECRET")
 
-# Exchange aktif: "binance" (default) atau "mexc"
+# Bybit credentials
+BYBIT_API_KEY    = _cfg("BYBIT_API_KEY")
+BYBIT_API_SECRET = _cfg("BYBIT_API_SECRET")
+
+# Exchange aktif: "binance" (default), "mexc", atau "bybit"
 # Set lewat config.json (halaman /config) atau env var ACTIVE_EXCHANGE
 ACTIVE_EXCHANGE: str = _cfg("ACTIVE_EXCHANGE", "binance").lower()
 
@@ -710,7 +714,7 @@ def api_positions():
 def api_daily():
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily = compute_daily_report(today_str)
-    equity = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+    equity = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
     daily["current_equity"] = equity
     daily["start_equity"]   = daily_start_equity
     daily["net_change"]     = round(equity - daily_start_equity, 4) if daily_start_equity else 0
@@ -1081,6 +1085,7 @@ _CONFIG_HTML = """<!DOCTYPE html>
         <select name="ACTIVE_EXCHANGE" id="ACTIVE_EXCHANGE">
           <option value="binance">Binance</option>
           <option value="mexc">MEXC</option>
+          <option value="bybit">Bybit</option>
         </select>
         <div class="hint">Bot hanya mengeksekusi order di exchange yang dipilih.</div>
       </div>
@@ -1117,6 +1122,20 @@ _CONFIG_HTML = """<!DOCTYPE html>
       <div class="field">
         <label>API Secret</label>
         <input type="password" name="MEXC_API_SECRET" id="MEXC_API_SECRET" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+      </div>
+    </div>
+
+    <div class="card" id="bybitCard" style="display:none">
+      <h2>🟠 Bybit</h2>
+      <div class="hint" style="margin-bottom:12px;color:#ffa726">Buat API key di <a href="https://www.bybit.com/app/user/api-management" target="_blank">bybit.com → API Management</a>. Aktifkan izin: Spot Trading.</div>
+      <div class="field">
+        <label>API Key</label>
+        <input type="password" name="BYBIT_API_KEY" id="BYBIT_API_KEY" placeholder="Kosongkan = tidak diubah" autocomplete="off">
+        <div class="hint" id="bybit_key_status"></div>
+      </div>
+      <div class="field">
+        <label>API Secret</label>
+        <input type="password" name="BYBIT_API_SECRET" id="BYBIT_API_SECRET" placeholder="Kosongkan = tidak diubah" autocomplete="off">
       </div>
     </div>
 
@@ -1214,17 +1233,17 @@ async function loadCurrentConfig() {
     document.querySelector('[name=TELEGRAM_REPORT_TOPIC_ID]').value = d.TELEGRAM_REPORT_TOPIC_ID || '';
     document.querySelector('[name=TELEGRAM_NEWS_TOPIC_ID]').value = d.TELEGRAM_NEWS_TOPIC_ID || '';
     // Status badge untuk key yang sudah terisi
-    if (d.has_BINANCE_API_KEY)   document.getElementById('binance_key_status').textContent = '✅ Sudah terisi';
-    if (d.has_MEXC_API_KEY)      document.getElementById('mexc_key_status').textContent    = '✅ Sudah terisi';
-    if (d.has_GROQ_API_KEY)      document.getElementById('groq_key_status').textContent    = '✅ Sudah terisi';
-    if (d.has_OPENROUTER_API_KEY) document.getElementById('openrouter_key_status').textContent = '✅ Sudah terisi';
-    if (d.has_TELEGRAM_BOT_TOKEN) document.getElementById('tg_token_status').textContent   = '✅ Sudah terisi';
+    if (d.has_BINANCE_API_KEY)    document.getElementById('binance_key_status').textContent  = '✅ Sudah terisi';
+    if (d.has_MEXC_API_KEY)       document.getElementById('mexc_key_status').textContent     = '✅ Sudah terisi';
+    if (d.has_BYBIT_API_KEY)      document.getElementById('bybit_key_status').textContent    = '✅ Sudah terisi';
+    if (d.has_TELEGRAM_BOT_TOKEN) document.getElementById('tg_token_status').textContent     = '✅ Sudah terisi';
   } catch(e) { console.warn('Gagal load config:', e); }
 }
 
 function toggleExchangeCards(val) {
   document.getElementById('binanceCard').style.display = val === 'binance' ? '' : 'none';
   document.getElementById('mexcCard').style.display    = val === 'mexc'    ? '' : 'none';
+  document.getElementById('bybitCard').style.display   = val === 'bybit'   ? '' : 'none';
 }
 
 document.getElementById('ACTIVE_EXCHANGE').addEventListener('change', function() {
@@ -1271,6 +1290,7 @@ loadCurrentConfig();
 _SENSITIVE_KEYS = {
     "BINANCE_API_KEY", "BINANCE_API_SECRET",
     "MEXC_API_KEY", "MEXC_API_SECRET",
+    "BYBIT_API_KEY", "BYBIT_API_SECRET",
     "AI_API_KEY",
     "TELEGRAM_BOT_TOKEN",
     # Legacy — tetap disembunyikan jika ada di config lama
@@ -2186,6 +2206,202 @@ def api_bot_close_all():
         {"Content-Type": "application/json"}
 
 
+# ---------------------------------------------------------------------------
+# ─── TRADINGVIEW WEBHOOK ─────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# Format JSON yang dikirim dari TradingView Alert Message:
+# {
+#   "symbol":     "BTCUSDT",
+#   "action":     "BUY",          ← BUY | SELL | CLOSE
+#   "price":      {{close}},
+#   "confidence": 80,             ← opsional (default 80)
+#   "reason":     "RSI oversold", ← opsional
+#   "secret":     "xxxxxx"        ← optional API key guard
+# }
+
+@flask_app.route("/api/tradingview/webhook", methods=["POST"])
+def api_tradingview_webhook():
+    """
+    Terima sinyal dari TradingView Pine Script Alert.
+    Bot akan menjalankan process_signal jika bot tidak di-pause.
+    """
+    try:
+        data = flask_request.get_json(force=True) or {}
+    except Exception:
+        return json.dumps({"ok": False, "error": "Invalid JSON"}), 400, \
+            {"Content-Type": "application/json"}
+
+    # Secret guard — WEBHOOK_SECRET wajib dikonfigurasi; reject semua request jika belum diset
+    webhook_secret = _cfg("WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        return json.dumps({"ok": False, "error": "Webhook not configured (WEBHOOK_SECRET not set)"}), 403, \
+            {"Content-Type": "application/json"}
+    if data.get("secret", "") != webhook_secret:
+        return json.dumps({"ok": False, "error": "Unauthorized"}), 401, \
+            {"Content-Type": "application/json"}
+
+    symbol     = str(data.get("symbol", "")).upper().strip()
+    action     = str(data.get("action", "")).upper().strip()
+    price_raw  = data.get("price", 0)
+    confidence = int(data.get("confidence", 80))
+    reason     = str(data.get("reason", "TradingView signal"))
+
+    if not symbol or action not in ("BUY", "SELL", "CLOSE"):
+        return json.dumps({"ok": False, "error": "symbol dan action (BUY/SELL/CLOSE) wajib diisi"}), 400, \
+            {"Content-Type": "application/json"}
+
+    try:
+        current_price = float(price_raw)
+    except (ValueError, TypeError):
+        current_price = 0.0
+
+    # Jika action CLOSE → tutup posisi yang ada
+    if action == "CLOSE":
+        with positions_lock:
+            pos = open_positions.get(symbol)
+        if pos:
+            threading.Thread(
+                target=emergency_close_position,
+                args=(symbol, pos, f"TradingView CLOSE signal"),
+                daemon=True,
+            ).start()
+            log_audit("TV_WEBHOOK", f"CLOSE {symbol}")
+            return json.dumps({"ok": True, "action": "CLOSE", "symbol": symbol}), 200, \
+                {"Content-Type": "application/json"}
+        return json.dumps({"ok": True, "action": "CLOSE", "symbol": symbol, "note": "no open position"}), 200, \
+            {"Content-Type": "application/json"}
+
+    # Sinyal BUY/SELL → buat signal dict dan jalankan di thread terpisah
+    signal = {"decision": action, "confidence": confidence, "reason": reason}
+
+    def _run_tv_signal():
+        try:
+            df_1m = fetch_market(symbol, "1m", CANDLE_LIMIT)
+            if df_1m is None or len(df_1m) < 20:
+                logger.warning(f"TV webhook {symbol}: tidak bisa ambil data market")
+                return
+            df_1m = add_indicators(df_1m)
+            price = current_price or float(df_1m.iloc[-1]["close"])
+            atr   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+            process_signal(symbol, signal, price, atr, df_1m)
+        except Exception as e:
+            logger.error(f"TV webhook execute error {symbol}: {e}")
+
+    threading.Thread(target=_run_tv_signal, daemon=True).start()
+    log_audit("TV_WEBHOOK", f"{action} {symbol} conf={confidence}%")
+
+    return json.dumps({"ok": True, "action": action, "symbol": symbol,
+                       "confidence": confidence}), 200, \
+        {"Content-Type": "application/json"}
+
+
+# ---------------------------------------------------------------------------
+# ─── METATRADER 5 (MT5) WEBHOOK ──────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+# Format JSON yang dikirim dari MT5 Expert Advisor (EA) via HTTP request:
+# {
+#   "symbol":     "EURUSD",      ← simbol MT5 — USDT pair akan di-map ke Binance/Bybit
+#   "action":     "BUY",         ← BUY | SELL | CLOSE
+#   "price":      1.08500,
+#   "confidence": 75,
+#   "reason":     "MA crossover",
+#   "secret":     "xxxxxx"       ← opsional, cocokkan dengan WEBHOOK_SECRET
+# }
+#
+# Cara setup EA MT5:
+# 1. Buat script Expert Advisor yang memanggil WebRequest ke:
+#    POST https://<repl-url>/api/mt5/webhook
+#    Content-Type: application/json
+# 2. Izinkan URL di MT5: Tools → Options → Expert Advisors → Allow WebRequest
+# 3. Isi body sesuai format di atas
+
+@flask_app.route("/api/mt5/webhook", methods=["POST"])
+def api_mt5_webhook():
+    """
+    Terima sinyal dari MetaTrader 5 Expert Advisor via HTTP WebRequest.
+    MT5 EA harus diizinkan memanggil URL bot ini (Tools → Options → Expert Advisors).
+    """
+    try:
+        # MT5 kadang kirim form-data atau raw JSON
+        if flask_request.is_json:
+            data = flask_request.get_json(force=True) or {}
+        else:
+            # Coba parse dari form data atau raw body
+            try:
+                data = json.loads(flask_request.data.decode("utf-8"))
+            except Exception:
+                data = flask_request.form.to_dict()
+    except Exception:
+        return json.dumps({"ok": False, "error": "Invalid request body"}), 400, \
+            {"Content-Type": "application/json"}
+
+    # Secret guard — WEBHOOK_SECRET wajib dikonfigurasi; reject semua request jika belum diset
+    webhook_secret = _cfg("WEBHOOK_SECRET", "")
+    if not webhook_secret:
+        return json.dumps({"ok": False, "error": "Webhook not configured (WEBHOOK_SECRET not set)"}), 403, \
+            {"Content-Type": "application/json"}
+    if data.get("secret", "") != webhook_secret:
+        return json.dumps({"ok": False, "error": "Unauthorized"}), 401, \
+            {"Content-Type": "application/json"}
+
+    raw_symbol = str(data.get("symbol", "")).upper().strip()
+    action     = str(data.get("action", "")).upper().strip()
+    price_raw  = data.get("price", 0)
+    confidence = int(data.get("confidence", 75))
+    reason     = str(data.get("reason", "MT5 EA signal"))
+
+    if not raw_symbol or action not in ("BUY", "SELL", "CLOSE"):
+        return json.dumps({"ok": False, "error": "symbol dan action (BUY/SELL/CLOSE) wajib diisi"}), 400, \
+            {"Content-Type": "application/json"}
+
+    # Normalisasi simbol: EURUSD → EURUSDT, BTCUSD → BTCUSDT (kalau belum ada USDT)
+    symbol = raw_symbol if raw_symbol.endswith("USDT") else raw_symbol.replace("USD", "") + "USDT"
+
+    try:
+        current_price = float(price_raw)
+    except (ValueError, TypeError):
+        current_price = 0.0
+
+    if action == "CLOSE":
+        with positions_lock:
+            pos = open_positions.get(symbol)
+        if pos:
+            threading.Thread(
+                target=emergency_close_position,
+                args=(symbol, pos, f"MT5 EA CLOSE signal"),
+                daemon=True,
+            ).start()
+            log_audit("MT5_WEBHOOK", f"CLOSE {symbol}")
+            return json.dumps({"ok": True, "action": "CLOSE", "symbol": symbol}), 200, \
+                {"Content-Type": "application/json"}
+        return json.dumps({"ok": True, "action": "CLOSE", "symbol": symbol, "note": "no open position"}), 200, \
+            {"Content-Type": "application/json"}
+
+    signal = {"decision": action, "confidence": confidence, "reason": reason}
+
+    def _run_mt5_signal():
+        try:
+            df_1m = fetch_market(symbol, "1m", CANDLE_LIMIT)
+            if df_1m is None or len(df_1m) < 20:
+                logger.warning(f"MT5 webhook {symbol}: tidak bisa ambil data market (cek simbol)")
+                return
+            df_1m = add_indicators(df_1m)
+            price = current_price or float(df_1m.iloc[-1]["close"])
+            atr   = float(df_1m.iloc[-1].get("atr14", 0) or 0)
+            process_signal(symbol, signal, price, atr, df_1m)
+        except Exception as e:
+            logger.error(f"MT5 webhook execute error {symbol}: {e}")
+
+    threading.Thread(target=_run_mt5_signal, daemon=True).start()
+    log_audit("MT5_WEBHOOK", f"{action} {raw_symbol}→{symbol} conf={confidence}%")
+
+    return json.dumps({"ok": True, "action": action, "symbol": symbol,
+                       "mt5_symbol": raw_symbol, "confidence": confidence}), 200, \
+        {"Content-Type": "application/json"}
+
+
 # CORS preflight
 def _cors_origin_for(request_origin: str | None) -> str:
     """Return the allowed origin string for this request, or empty string."""
@@ -2626,6 +2842,9 @@ def refresh_pairs() -> None:
         if ACTIVE_EXCHANGE == "mexc":
             fetched = fetch_mexc_pairs()
             exch_label = "MEXC"
+        elif ACTIVE_EXCHANGE == "bybit":
+            fetched = fetch_bybit_pairs()
+            exch_label = "Bybit"
         else:
             fetched = fetch_usdt_pairs()
             exch_label = "Binance"
@@ -2661,9 +2880,11 @@ def pairs_refresher_loop() -> None:
 
 def fetch_market(symbol: str, interval: str = CANDLE_INTERVAL,
                   limit: int = CANDLE_LIMIT) -> Optional[pd.DataFrame]:
-    """Route ke MEXC atau Binance sesuai ACTIVE_EXCHANGE."""
+    """Route ke MEXC, Bybit, atau Binance sesuai ACTIVE_EXCHANGE."""
     if ACTIVE_EXCHANGE == "mexc":
         return fetch_mexc_market(symbol, interval, limit)
+    if ACTIVE_EXCHANGE == "bybit":
+        return fetch_bybit_market(symbol, interval, limit)
     global _api_weight_1m  # diperbarui dari response header Binance
     url = "https://api.binance.com/api/v3/klines"
     params = {"symbol": symbol, "interval": interval, "limit": limit}
@@ -3519,7 +3740,7 @@ Bot ini mengeksekusi order NYATA di Binance — akurasi lebih penting dari kuant
 Balas HANYA dengan JSON valid, tanpa teks lain:
 { "decision": "BUY"|"SELL"|"HOLD", "reason": "<2-3 kalimat ringkas bahasa Indonesia, sebutkan apakah kamu setuju/tidak dan alasannya>", "confidence": <0-100> }"""
 
-def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, primary_signal: dict,
                        df_5m: Optional[pd.DataFrame] = None,
                        df_15m: Optional[pd.DataFrame] = None,
                        funding: Optional[dict] = None,
@@ -3528,7 +3749,7 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
     Validator-1 via 9Router (model: AI_VALIDATOR_MODEL, default Claude Sonnet).
     """
     if not AI_BASE_URL:
-        return groq_signal
+        return primary_signal
 
     # ── Blok multi-timeframe ────────────────────────────────────────────────
     tf_blocks = (
@@ -3567,8 +3788,8 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         f"\n\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})"
         + (f"\n\n— BERITA —{news_block}" if news_block else "")
         + f"\n\n— SINYAL AI PERTAMA —\n"
-        f"  Keputusan : {groq_signal['decision']} ({groq_signal['confidence']}%)\n"
-        f"  Alasan    : {groq_signal['reason']}\n\n"
+        f"  Keputusan : {primary_signal['decision']} ({primary_signal['confidence']}%)\n"
+        f"  Alasan    : {primary_signal['reason']}\n\n"
         f"Verifikasi independen. Jawab hanya JSON."
     )
 
@@ -3602,7 +3823,7 @@ def ask_ai_openrouter(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
 # ─── VALIDATOR: OpenAI GPT-4o ────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, primary_signal: dict,
                               df_5m=None, df_15m=None, funding=None, oi_change=None):
     """Validator-2 via 9Router (model: AI_VALIDATOR_MODEL2, default GPT-4o)."""
     if not AI_BASE_URL:
@@ -3625,7 +3846,7 @@ def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
             f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})\n"
             f"\n— SINYAL AI PERTAMA —\n"
-            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"{primary_signal['decision']} ({primary_signal['confidence']}%): {primary_signal['reason']}\n\n"
             f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
         raw = _call_9router(
@@ -3651,7 +3872,7 @@ def ask_ai_openai_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
 # ─── VALIDATOR: Claude Sonnet (Anthropic direct API) ─────────────────────────
 # ---------------------------------------------------------------------------
 
-def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, primary_signal: dict,
                                     df_5m=None, df_15m=None, funding=None, oi_change=None):
     """Validator-3 via 9Router (AI_VALIDATOR_MODEL second pass, news-focused)."""
     if not AI_BASE_URL:
@@ -3679,7 +3900,7 @@ def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
             f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']}){sentiment_note}\n"
             f"\n— SINYAL AI PERTAMA —\n"
-            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"{primary_signal['decision']} ({primary_signal['confidence']}%): {primary_signal['reason']}\n\n"
             f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
         raw = _call_9router(
@@ -3705,7 +3926,7 @@ def ask_ai_claude_direct_validator(symbol: str, df_1m: pd.DataFrame, groq_signal
 # ─── VALIDATOR: Google Gemini ────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, primary_signal: dict,
                              df_5m=None, df_15m=None, funding=None, oi_change=None):
     """Validator-4 via 9Router (model: AI_VALIDATOR_MODEL3, default Gemini Flash)."""
     if not AI_BASE_URL:
@@ -3729,7 +3950,7 @@ def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
             f"R:R=1:{int(TP_ATR_MULT/SL_ATR_MULT)}\n"
             f"\n— SENTIMENT — Fear&Greed={fg['value']} ({fg['label']})\n"
             f"\n— SINYAL AI PERTAMA —\n"
-            f"{groq_signal['decision']} ({groq_signal['confidence']}%): {groq_signal['reason']}\n\n"
+            f"{primary_signal['decision']} ({primary_signal['confidence']}%): {primary_signal['reason']}\n\n"
             f'Verifikasi independen. Jawab hanya JSON: {{"decision":"BUY|SELL|HOLD","confidence":0-100,"reason":"..."}}'
         )
         raw = _call_9router(
@@ -3751,10 +3972,10 @@ def ask_ai_gemini_validator(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
 
 
 # ---------------------------------------------------------------------------
-# ─── MULTI-AI CONSENSUS (Groq + Claude/OR + Claude/Direct + OpenAI + Gemini) ─
+# ─── MULTI-AI CONSENSUS (Primary + Validators via 9Router) ───────────────────
 # ---------------------------------------------------------------------------
 
-def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
+def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, primary_signal: dict,
                             df_5m=None, df_15m=None, funding=None, oi_change=None) -> dict:
     """
     Jalankan semua validator AI secara paralel.
@@ -3769,16 +3990,16 @@ def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
     """
     validators = {
         "9Router/Validator-1": lambda: ask_ai_openrouter(
-            symbol, df_1m, groq_signal,
+            symbol, df_1m, primary_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
         "9Router/Validator-3": lambda: ask_ai_claude_direct_validator(
-            symbol, df_1m, groq_signal,
+            symbol, df_1m, primary_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
         "9Router/Validator-2": lambda: ask_ai_openai_validator(
-            symbol, df_1m, groq_signal,
+            symbol, df_1m, primary_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
         "9Router/Validator-4": lambda: ask_ai_gemini_validator(
-            symbol, df_1m, groq_signal,
+            symbol, df_1m, primary_signal,
             df_5m=df_5m, df_15m=df_15m, funding=funding, oi_change=oi_change),
     }
 
@@ -3801,7 +4022,7 @@ def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, groq_signal: dict,
         t.join(timeout=45)  # max 45 detik per validator
 
     # Gabungkan dengan Groq sebagai suara pertama
-    all_models = {"9Router/Primary": groq_signal}
+    all_models = {"9Router/Primary": primary_signal}
     for name, res in results.items():
         if res is not None:
             all_models[name] = res
@@ -4250,14 +4471,13 @@ def handle_incoming_message(msg: dict) -> None:
             paused = bot_paused
         mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
         pause_note = "\n⏸ *BOT SEDANG DIPAUSE* — ketik `/start` untuk lanjut" if paused else ""
-        ai_count = sum(bool(k) for k in [GROQ_API_KEY, OPENROUTER_API_KEY,
-                                          ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
+        n_ai_models = 1 + sum(bool(k) for k in [AI_VALIDATOR_MODEL, AI_VALIDATOR_MODEL2, AI_VALIDATOR_MODEL3])
         send_telegram_message(
             f"🤖 *Trading Bot AI*{pause_note}\n\n"
             f"Mode  : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
             f"Pair  : `{n_pairs}` USDT tiap `{CANDLE_INTERVAL}`\n"
             f"Posisi: `{n_pos}/{MAX_CONCURRENT_POSITIONS}` terbuka\n"
-            f"AI    : `{ai_count}` model \\(Groq \\+ Claude \\+ OpenAI \\+ Gemini\\)\n\n"
+            f"AI    : `{n_ai_models}` model via 9Router \\(Primary \\+ Validator\\)\n\n"
             "*⚡ Perintah utama:*\n"
             "`/start`         — paksa analisis sekarang\n"
             "`/stop`          — matikan bot sepenuhnya\n"
@@ -4428,8 +4648,7 @@ def handle_incoming_message(msg: dict) -> None:
             n_pairs = len(active_pairs)
         mode_icon = "🟡" if BINANCE_TESTNET else ("🔴" if LIVE_MODE else "🔵")
         status_str = "⏸ DIPAUSE" if paused else "✅ Aktif"
-        ai_count = sum(bool(k) for k in [GROQ_API_KEY, OPENROUTER_API_KEY,
-                                          ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
+        n_ai_models = 1 + sum(bool(k) for k in [AI_VALIDATOR_MODEL, AI_VALIDATOR_MODEL2, AI_VALIDATOR_MODEL3])
         lines_pos = []
         for sym, p in snap.items():
             entry  = p.get("entry_price", 0)
@@ -4439,14 +4658,14 @@ def handle_incoming_message(msg: dict) -> None:
             lines_pos.append(f"  • `{sym}`{trail}: entry=`{entry}` TP=`{tp}` SL=`{sl}`")
         pos_block = ("\n" + "\n".join(lines_pos)) if lines_pos else " _tidak ada_"
         saldo_txt = ""
-        if LIVE_MODE and BINANCE_API_KEY:
+        if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY):
             eq = get_exchange_equity()
             saldo_txt = f"\n💰 Saldo USDT   : `{eq:.4f}`"
         send_telegram_message(
             f"📡 *Status Bot — Real\\-time*\n\n"
             f"Status   : {status_str}\n"
             f"Mode     : {mode_icon} {'TESTNET' if BINANCE_TESTNET else ('LIVE' if LIVE_MODE else 'Simulasi')}\n"
-            f"AI aktif : `{ai_count}` model \\(Groq, Claude, OpenAI, Gemini\\)\n"
+            f"AI aktif : `{n_ai_models}` model via 9Router \\(Primary \\+ Validator\\)\n"
             f"Pair     : memindai `{n_pairs}` pair"
             f"{saldo_txt}\n\n"
             f"📂 *Posisi terbuka \\({len(snap)}\\):*{pos_block}\n\n"
@@ -5061,13 +5280,246 @@ def cancel_mexc_orders(symbol: str, pos: dict) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# ─── 5c. EXCHANGE-AWARE WRAPPERS ─────────────────────────────────────────────
+# ─── 5c. BYBIT EXCHANGE FUNCTIONS ────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_BYBIT_BASE = "https://api.bybit.com"
+
+def _bybit_sign(params: dict) -> tuple[dict, dict]:
+    """Buat signature HMAC-SHA256 untuk Bybit V5 API.
+    Return: (params, headers)
+    """
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "5000"
+    query = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+    sign_str = timestamp + BYBIT_API_KEY + recv_window + query
+    sig = hmac.new(BYBIT_API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP":   timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN":        sig,
+        "Content-Type":       "application/json",
+    }
+    return params, headers
+
+
+def _bybit_sign_body(body: dict) -> tuple[str, dict]:
+    """Buat signature HMAC-SHA256 untuk Bybit V5 API (POST body JSON)."""
+    timestamp = str(int(time.time() * 1000))
+    recv_window = "5000"
+    body_str = json.dumps(body, separators=(",", ":"))
+    sign_str = timestamp + BYBIT_API_KEY + recv_window + body_str
+    sig = hmac.new(BYBIT_API_SECRET.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY":     BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP":   timestamp,
+        "X-BAPI-RECV-WINDOW": recv_window,
+        "X-BAPI-SIGN":        sig,
+        "Content-Type":       "application/json",
+    }
+    return body_str, headers
+
+
+def fetch_bybit_pairs() -> list[str]:
+    """Ambil semua spot pair USDT yang aktif di Bybit."""
+    try:
+        r = requests.get(
+            f"{_BYBIT_BASE}/v5/market/instruments-info",
+            params={"category": "spot", "status": "Trading"},
+            timeout=15,
+        )
+        r.raise_for_status()
+        data = r.json()
+        pairs = []
+        for item in data.get("result", {}).get("list", []):
+            sym = item.get("symbol", "")
+            if sym.endswith("USDT") and item.get("status") == "Trading":
+                base = sym[:-4]
+                if any(sym.endswith(suf) for suf in _EXCLUDED_SUFFIXES):
+                    continue
+                if base in _EXCLUDED_BASES:
+                    continue
+                pairs.append(sym)
+        return sorted(pairs)
+    except Exception as e:
+        logger.error(f"Gagal ambil daftar pair Bybit: {e}")
+        return []
+
+
+def fetch_bybit_market(symbol: str, interval: str = CANDLE_INTERVAL,
+                       limit: int = CANDLE_LIMIT) -> Optional[pd.DataFrame]:
+    """Ambil klines dari Bybit V5 spot (konversi ke format Binance-compatible)."""
+    # Bybit interval mapping: "1m" → "1", "5m" → "5", "15m" → "15", dll.
+    interval_map = {
+        "1m": "1", "3m": "3", "5m": "5", "15m": "15",
+        "30m": "30", "1h": "60", "2h": "120", "4h": "240",
+        "6h": "360", "12h": "720", "1d": "D", "1w": "W",
+    }
+    bybit_interval = interval_map.get(interval, interval.replace("m", "").replace("h", ""))
+    url = f"{_BYBIT_BASE}/v5/market/kline"
+    params = {"category": "spot", "symbol": symbol, "interval": bybit_interval, "limit": str(limit)}
+    for attempt in range(3):
+        try:
+            r = requests.get(url, params=params, timeout=10)
+            if r.status_code == 429:
+                time.sleep(30)
+                continue
+            r.raise_for_status()
+            data = r.json()
+            raw = data.get("result", {}).get("list", [])
+            if not raw:
+                return None
+            # Bybit returns newest first → reverse untuk index time ascending
+            raw = list(reversed(raw))
+            rows = []
+            for candle in raw:
+                # [startTime, open, high, low, close, volume, turnover]
+                rows.append({
+                    "open_time": int(candle[0]),
+                    "open":      float(candle[1]),
+                    "high":      float(candle[2]),
+                    "low":       float(candle[3]),
+                    "close":     float(candle[4]),
+                    "volume":    float(candle[5]),
+                })
+            df = pd.DataFrame(rows)
+            df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
+            df.set_index("open_time", inplace=True)
+            return df[["open", "high", "low", "close", "volume"]]
+        except Exception as e:
+            logger.warning(f"Bybit fetch error {symbol} (attempt {attempt+1}): {e}")
+            time.sleep(1)
+    return None
+
+
+def get_bybit_equity() -> float:
+    """Ambil saldo USDT dari akun Bybit Spot."""
+    try:
+        params = {"accountType": "UNIFIED", "coin": "USDT"}
+        _, headers = _bybit_sign(params)
+        r = requests.get(
+            f"{_BYBIT_BASE}/v5/account/wallet-balance",
+            params=params, headers=headers, timeout=10,
+        )
+        r.raise_for_status()
+        data = r.json()
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    return float(coin.get("walletBalance", 0))
+    except Exception as e:
+        logger.warning(f"Tidak bisa ambil equity Bybit: {e}")
+    return 0.0
+
+
+def execute_bybit(symbol: str, side: str, qty: float) -> dict:
+    """Eksekusi market order di Bybit Spot."""
+    body = {
+        "category": "spot",
+        "symbol":   symbol,
+        "side":     side.capitalize(),  # "Buy" atau "Sell"
+        "orderType": "Market",
+        "qty":      str(qty),
+    }
+    for attempt in range(3):
+        try:
+            body_str, headers = _bybit_sign_body(body)
+            r = requests.post(
+                f"{_BYBIT_BASE}/v5/order/create",
+                data=body_str, headers=headers, timeout=10,
+            )
+            r.raise_for_status()
+            resp = r.json()
+            if resp.get("retCode", -1) != 0:
+                raise RuntimeError(f"Bybit error: {resp.get('retMsg')}")
+            logger.info(f"Bybit order: {resp}")
+            return resp.get("result", {})
+        except Exception as e:
+            logger.error(f"Bybit order error (attempt {attempt+1}): {e}")
+            time.sleep(2 ** attempt)
+    raise RuntimeError("Bybit order gagal setelah 3 kali coba")
+
+
+def place_bybit_tp_sl(symbol: str, qty: float, entry_price: float,
+                      atr: float = 0.0,
+                      tp_price_override: Optional[float] = None,
+                      sl_price_override: Optional[float] = None) -> Optional[dict]:
+    """Pasang LIMIT sell (TP) di Bybit Spot. SL dijaga position monitor.
+
+    Jika tp_price_override / sl_price_override diberikan, nilai itu dipakai langsung
+    (untuk trailing SL, breakeven, dan partial TP yang sudah menghitung harga sendiri).
+    """
+    try:
+        if tp_price_override is not None and sl_price_override is not None:
+            tp_price = tp_price_override
+            sl_price = sl_price_override
+        elif atr > 0:
+            tp_price = round(entry_price + TP_ATR_MULT * atr, 8)
+            sl_price = round(entry_price - SL_ATR_MULT * atr, 8)
+        else:
+            tp_price = round(entry_price * (1 + TP_PCT / 100), 8)
+            sl_price = round(entry_price * (1 - SL_PCT / 100), 8)
+        body = {
+            "category":  "spot",
+            "symbol":    symbol,
+            "side":      "Sell",
+            "orderType": "Limit",
+            "qty":       str(qty),
+            "price":     str(tp_price),
+            "timeInForce": "GTC",
+        }
+        body_str, headers = _bybit_sign_body(body)
+        r = requests.post(
+            f"{_BYBIT_BASE}/v5/order/create",
+            data=body_str, headers=headers, timeout=10,
+        )
+        r.raise_for_status()
+        resp = r.json()
+        if resp.get("retCode", -1) != 0:
+            raise RuntimeError(f"Bybit TP error: {resp.get('retMsg')}")
+        order = resp.get("result", {})
+        order["_tp_price"]    = tp_price
+        order["_sl_price"]    = sl_price
+        order["_tp_order_id"] = order.get("orderId")
+        order["_sl_order_id"] = None
+        order["orderListId"]  = None
+        logger.info(f"🎯 Bybit LIMIT sell (TP) terpasang {symbol}: TP={tp_price} | SL (monitor)={sl_price}")
+        return order
+    except Exception as e:
+        logger.error(f"Bybit TP order error {symbol}: {e}")
+        return None
+
+
+def cancel_bybit_orders(symbol: str, pos: dict) -> bool:
+    """Cancel LIMIT sell (TP) di Bybit Spot jika masih aktif."""
+    tp_id = pos.get("tp_order_id")
+    if not tp_id:
+        return True
+    try:
+        body = {"category": "spot", "symbol": symbol, "orderId": str(tp_id)}
+        body_str, headers = _bybit_sign_body(body)
+        r = requests.post(
+            f"{_BYBIT_BASE}/v5/order/cancel",
+            data=body_str, headers=headers, timeout=10,
+        )
+        r.raise_for_status()
+        return True
+    except Exception as e:
+        logger.warning(f"Gagal cancel Bybit order {tp_id} {symbol}: {e}")
+        return False
+
+
+# ---------------------------------------------------------------------------
+# ─── 5d. EXCHANGE-AWARE WRAPPERS ─────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
 def get_exchange_equity() -> float:
     """Ambil equity USDT dari exchange yang sedang aktif."""
     if ACTIVE_EXCHANGE == "mexc":
         return get_mexc_equity()
+    if ACTIVE_EXCHANGE == "bybit":
+        return get_bybit_equity()
     return get_binance_equity()
 
 
@@ -5075,6 +5527,8 @@ def execute_exchange(symbol: str, side: str, qty: float) -> dict:
     """Eksekusi market order di exchange yang sedang aktif."""
     if ACTIVE_EXCHANGE == "mexc":
         return execute_mexc(symbol, side, qty)
+    if ACTIVE_EXCHANGE == "bybit":
+        return execute_bybit(symbol, side, qty)
     return execute_binance(symbol, side, qty)
 
 
@@ -5083,6 +5537,8 @@ def place_exchange_tp_sl(symbol: str, qty: float, entry_price: float,
     """Pasang TP/SL di exchange yang sedang aktif."""
     if ACTIVE_EXCHANGE == "mexc":
         return place_mexc_tp_sl(symbol, qty, entry_price, atr)
+    if ACTIVE_EXCHANGE == "bybit":
+        return place_bybit_tp_sl(symbol, qty, entry_price, atr)
     return place_oco_sell(symbol, qty, entry_price, atr)
 
 
@@ -5090,6 +5546,8 @@ def cancel_exchange_orders(symbol: str, pos: dict) -> bool:
     """Cancel order TP/SL di exchange yang sedang aktif."""
     if ACTIVE_EXCHANGE == "mexc":
         return cancel_mexc_orders(symbol, pos)
+    if ACTIVE_EXCHANGE == "bybit":
+        return cancel_bybit_orders(symbol, pos)
     return cancel_oco_orders(symbol, pos)
 
 
@@ -5231,7 +5689,7 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
     today_str  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     daily_r    = compute_daily_report(today_str)
     cum_pnl    = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
-    saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+    saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
 
     icon = "🟡" if pnl >= 0 else "🟠"
     send_telegram_message(
@@ -5253,9 +5711,43 @@ def emergency_close_position(symbol: str, pos: dict, reason: str) -> None:
     save_state()
 
 
+def _get_order_status(symbol: str, order_id) -> dict:
+    """Ambil status order dari exchange yang aktif. Return dict kosong jika error."""
+    try:
+        if ACTIVE_EXCHANGE == "mexc":
+            params = _mexc_sign({"symbol": symbol, "orderId": str(order_id)})
+            r = requests.get(f"{_MEXC_BASE}/api/v3/order",
+                             params=params, headers=_mexc_headers(), timeout=10)
+            r.raise_for_status()
+            return r.json()  # MEXC Binance-compatible: status field = "FILLED"
+        if ACTIVE_EXCHANGE == "bybit":
+            params = {"category": "spot", "orderId": str(order_id)}
+            _, headers = _bybit_sign(params)
+            r = requests.get(f"{_BYBIT_BASE}/v5/order/history",
+                             params=params, headers=headers, timeout=10)
+            r.raise_for_status()
+            data = r.json()
+            orders = data.get("result", {}).get("list", [])
+            if orders:
+                raw = orders[0]
+                # Normalise ke format Binance-compatible untuk logika berikutnya
+                return {
+                    "status":              "FILLED" if raw.get("orderStatus") == "Filled" else raw.get("orderStatus", ""),
+                    "executedQty":         raw.get("cumExecQty", "0"),
+                    "cummulativeQuoteQty": raw.get("cumExecValue", "0"),
+                    "price":               raw.get("avgPrice", "0"),
+                }
+            return {}
+        # Default: Binance
+        client = make_binance_client()
+        return client.get_order(symbol=symbol, orderId=order_id)
+    except Exception as e:
+        logger.warning(f"Gagal cek status order {symbol} #{order_id}: {e}")
+        return {}
+
+
 def _check_position_close(symbol: str, pos: dict) -> None:
-    """Cek apakah OCO leg (TP/SL) sudah FILLED. Kalau ya, catat pnl & kirim notifikasi."""
-    client = make_binance_client()
+    """Cek apakah TP/SL order sudah FILLED. Kalau ya, catat pnl & kirim notifikasi."""
     entry_price = pos["entry_price"]
     qty = pos["qty"]
 
@@ -5265,10 +5757,8 @@ def _check_position_close(symbol: str, pos: dict) -> None:
     ):
         if not order_id:
             continue
-        try:
-            order = client.get_order(symbol=symbol, orderId=order_id)
-        except Exception as e:
-            logger.warning(f"Gagal cek status order {label} {symbol}: {e}")
+        order = _get_order_status(symbol, order_id)
+        if not order:
             continue
 
         if order.get("status") != "FILLED":
@@ -5302,7 +5792,7 @@ def _check_position_close(symbol: str, pos: dict) -> None:
         cum_pnl  = daily_r["total_pnl"]  # trade sudah di-log sebelum compute, tidak perlu ditambah lagi
 
         # Saldo setelah close
-        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
 
         icon = "✅" if pnl >= 0 else "🔴"
         result_label = "Take Profit 🎯" if label == "TP" else "Stop Loss 🛡"
@@ -5341,7 +5831,7 @@ def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
     """
     if not TRAILING_SL_ENABLED:
         return
-    if not (LIVE_MODE and BINANCE_API_KEY):
+    if not LIVE_MODE:
         return  # trailing hanya di live mode
 
     entry_price = pos.get("entry_price", 0)
@@ -5398,12 +5888,20 @@ def _update_trailing_sl(symbol: str, pos: dict, current_price: float) -> None:
         rounded_tp  = _round_price(tp_price, tick)
 
         new_tp_id = new_sl_id = None
+        oco: dict = {}
         if ACTIVE_EXCHANGE == "mexc":
-            # MEXC: pasang LIMIT sell (TP) baru, SL ditangani position monitor
             mexc_ord = place_mexc_tp_sl(symbol, rounded_qty, pos.get("entry_price", 0), atr=0)
             if mexc_ord:
                 new_tp_id = mexc_ord.get("_tp_order_id")
             oco = mexc_ord or {}
+        elif ACTIVE_EXCHANGE == "bybit":
+            bybit_ord = place_bybit_tp_sl(
+                symbol, rounded_qty, pos.get("entry_price", 0),
+                tp_price_override=rounded_tp, sl_price_override=rounded_sl,
+            )
+            if bybit_ord:
+                new_tp_id = bybit_ord.get("_tp_order_id")
+            oco = bybit_ord or {}
         else:
             client = make_binance_client()
             oco = client.create_oco_order(
@@ -5459,7 +5957,7 @@ def _check_breakeven_sl(symbol: str, pos: dict, current_price: float) -> None:
     """
     if not BREAKEVEN_ENABLED:
         return
-    if not (LIVE_MODE and BINANCE_API_KEY):
+    if not LIVE_MODE:
         return
     if pos.get("breakeven_done"):
         return
@@ -5510,6 +6008,13 @@ def _check_breakeven_sl(symbol: str, pos: dict, current_price: float) -> None:
             mexc_ord = place_mexc_tp_sl(symbol, rounded_qty, entry_price, atr=0)
             if mexc_ord:
                 new_tp_id = mexc_ord.get("_tp_order_id")
+        elif ACTIVE_EXCHANGE == "bybit":
+            bybit_ord = place_bybit_tp_sl(
+                symbol, rounded_qty, entry_price,
+                tp_price_override=rounded_tp, sl_price_override=rounded_sl,
+            )
+            if bybit_ord:
+                new_tp_id = bybit_ord.get("_tp_order_id")
         else:
             client = make_binance_client()
             oco = client.create_oco_order(
@@ -5566,7 +6071,7 @@ def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
     """
     if not PARTIAL_TP_ENABLED:
         return
-    if not (LIVE_MODE and BINANCE_API_KEY):
+    if not LIVE_MODE:
         return
     if pos.get("partial_tp_done"):
         return
@@ -5650,6 +6155,13 @@ def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
             mexc_ord = place_mexc_tp_sl(symbol, rounded_rem, entry_price, atr=0)
             if mexc_ord:
                 new_tp_id = mexc_ord.get("_tp_order_id")
+        elif ACTIVE_EXCHANGE == "bybit":
+            bybit_ord = place_bybit_tp_sl(
+                symbol, rounded_rem, entry_price,
+                tp_price_override=rounded_tp, sl_price_override=rounded_sl,
+            )
+            if bybit_ord:
+                new_tp_id = bybit_ord.get("_tp_order_id")
         else:
             client = make_binance_client()
             oco = client.create_oco_order(
@@ -5674,7 +6186,7 @@ def _check_partial_tp(symbol: str, pos: dict, current_price: float) -> None:
                 open_positions[symbol]["order_list_id"]  = new_order_list_id
         save_state()
 
-        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+        saldo_after = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
         send_telegram_message(
             f"🎯 *Partial TP — `{symbol}`*\n\n"
             f"Profit saat ini  : `{profit_pct:+.2f}%`\n"
@@ -5722,7 +6234,7 @@ def position_monitor_loop() -> None:
 
                 # ── 2. Ambil harga terkini (sekali, dipakai oleh step 2-4) ──
                 current_price = None
-                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
+                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY):
                     try:
                         df_live = fetch_market(symbol, "1m", 2)
                         if df_live is not None and len(df_live) >= 1:
@@ -5769,7 +6281,7 @@ def position_monitor_loop() -> None:
                     continue
 
                 # ── 4. Cek reversal untuk early exit ─────────────────────────
-                if not (LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY)):
+                if not (LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY)):
                     continue
 
                 try:
@@ -5803,7 +6315,7 @@ def position_monitor_loop() -> None:
 
             # ── 6. Reset equity awal hari di tengah malam WIB (17:00 UTC) ───
             if now.hour == 17 and now.minute < 1 and daily_report_sent_date == today_str:
-                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
+                if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY):
                     new_equity = get_exchange_equity()
                     if new_equity > 0:
                         daily_start_equity = new_equity
@@ -5870,7 +6382,7 @@ def send_daily_report(date_str: str, chat_id: Optional[int] = None,
         n_open = len(open_positions)
 
     # Ambil saldo sekarang untuk bandingkan dengan modal awal hari ini
-    saldo_now = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+    saldo_now = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
     net_change = round(saldo_now - daily_start_equity, 4) if daily_start_equity > 0 else 0.0
     net_pct    = round((net_change / daily_start_equity * 100), 2) if daily_start_equity > 0 else 0.0
 
@@ -6062,14 +6574,14 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
                    funding: Optional[dict] = None,
                    oi_change: Optional[dict] = None) -> None:
     """
-    Auto-trading dengan dual-AI consensus (Groq + Claude Sonnet 5 via OpenRouter).
+    Auto-trading dengan multi-AI consensus (Primary + Validators via 9Router).
     Menggunakan ATR-based dynamic TP/SL (R:R 1:4) dan data multi-TF + Futures.
 
     Alur:
-    1. Groq sudah analisis (parameter signal)
-    2. Claude Sonnet 5 via OpenRouter memverifikasi secara independen
-    3. Kalau keduanya sepakat arah (BUY/SELL) → eksekusi OTOMATIS tanpa tombol
-    4. Kalau beda pendapat → skip, kirim info ke Telegram
+    1. AI Primary sudah analisis (parameter signal)
+    2. Validator AI (Claude, OpenAI, Gemini) memverifikasi secara independen via 9Router
+    3. Kalau mayoritas sepakat arah (BUY/SELL) → eksekusi OTOMATIS tanpa tombol
+    4. Kalau tidak ada mayoritas → skip, kirim info ke Telegram
     5. Setelah eksekusi → pasang OCO ATR-based TP/SL, kirim notifikasi
     """
     decision   = signal["decision"]
@@ -6094,7 +6606,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     atr_sl = atr * SL_ATR_MULT  # jarak Stop Loss dari entry
     atr_tp = atr * TP_ATR_MULT  # jarak Take Profit dari entry
 
-    raw_equity    = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 10_000.0
+    raw_equity    = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 10_000.0
     equity        = raw_equity * CAPITAL_ALLOCATION_PCT   # hanya pakai sebagian saldo
     qty           = calc_quantity(current_price, atr_sl if atr_sl > 0 else atr, equity, symbol=symbol)
 
@@ -6104,7 +6616,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
         log_trade(symbol, decision, qty, current_price, confidence, reason, "SKIPPED_TOO_SMALL")
         send_telegram_message(
             f"⏭️ *Sinyal {symbol} dilewati*\n\n"
-            f"Groq bilang {decision} \\({confidence}%\\) tapi saldo USDT kekecilan "
+            f"AI bilang {decision} \\({confidence}%\\) tapi saldo USDT kekecilan "
             f"\\(butuh min notional ~{f['minNotional']}\\)\\.",
             topic_id=_signal_topic(decision),
         )
@@ -6124,18 +6636,18 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
     now_wib = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime("%H:%M WIB")
 
     # ── Step 2: Jalankan semua validator AI secara paralel ──────────────────
-    ai_count = sum(bool(k) for k in [OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, GEMINI_API_KEY])
+    n_validators = sum(bool(m) for m in [AI_VALIDATOR_MODEL, AI_VALIDATOR_MODEL2, AI_VALIDATOR_MODEL3])
     send_telegram_message(
         f"🔍 *Sinyal {decision} terdeteksi — {symbol}*\n\n"
         f"⏰ `{now_wib}` \\| Harga: `{current_price}`\n\n"
-        f"🤖 *Groq/Llama*: *{decision}* \\({confidence}%\\)\n"
+        f"🤖 *AI Primary*: *{decision}* \\({confidence}%\\)\n"
         f"💬 _{reason}_\n\n"
         f"📐 ATR14: `{atr:.6f}` \\({atr_pct:.3f}%\\)\n"
         f"🎯 TP: `{tp_preview}` \\(+`{potential_profit:.4f}` USDT\\)\n"
         f"🛡 SL: `{sl_preview}` \\(-`{potential_loss:.4f}` USDT\\)\n"
         f"💵 Est\\. modal: `{estimated_cost:.4f}` USDT\n"
         f"📊 Saldo terpakai: `{int(CAPITAL_ALLOCATION_PCT*100)}%` dari akun\n\n"
-        f"⏳ _Meminta validasi {ai_count} AI \\(Claude, OpenAI, Gemini\\)\\.\\.\\._",
+        f"⏳ _Meminta validasi {n_validators} AI validator via 9Router\\.\\.\\._",
         topic_id=_signal_topic(decision),
     )
 
@@ -6231,7 +6743,7 @@ def process_signal(symbol: str, signal: dict, current_price: float, atr: float,
               reasons_summary, status_str, order_id)
 
     total_spent    = round(filled_qty * fill_price, 4)
-    saldo_sekarang = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) else 0.0
+    saldo_sekarang = get_exchange_equity() if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) else 0.0
     icon = "✅" if not errors else "⚠️"
     send_telegram_message(
         f"{icon} *Order {'masuk' if not errors else 'GAGAL'} — `{symbol}`*\n\n"
@@ -6319,7 +6831,7 @@ def health_monitor_loop() -> None:
                     f"Kemungkinan penyebab:\n"
                     f"• Semua pair tidak lolos pre\\-filter \\(pasar sangat sideways\\)\n"
                     f"• Confidence AI selalu di bawah `{CONFIDENCE_THRESHOLD}%`\n"
-                    f"• Rate limit Groq atau Claude \\(cek log\\)\n\n"
+                    f"• Rate limit AI atau Claude \\(cek log\\)\n\n"
                     f"_Bot masih aktif memindai `{n_pairs}` pair\\._",
                     topic_id=TELEGRAM_REPORT_TOPIC_ID,
                 )
@@ -6327,7 +6839,7 @@ def health_monitor_loop() -> None:
                 logger.warning(f"⚠️ Health alert: {since_hours:.1f}j tanpa sinyal")
 
             # ── 2. Alert equity drop + simpan snapshot ───────────────────────
-            if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY) and daily_start_equity > 0:
+            if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY) and daily_start_equity > 0:
                 try:
                     equity = get_exchange_equity()
                     if equity > 0:
@@ -6472,7 +6984,7 @@ def main_loop():
     # Load posisi tersimpan sebelum mulai loop
     load_state()
 
-    if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY):
+    if LIVE_MODE and (BINANCE_API_KEY or MEXC_API_KEY or BYBIT_API_KEY):
         daily_start_equity = get_exchange_equity()
         logger.info(f"💰 Equity awal {ACTIVE_EXCHANGE.upper()}: {daily_start_equity} USDT")
 
@@ -6510,10 +7022,10 @@ def main_loop():
     recovery_note = f"\n♻️ *{n_recovered} posisi dipulihkan dari restart*" if n_recovered else ""
     send_telegram_message(
         f"👋 *Bot trading udah nyala nih\\!*{recovery_note}\n\n"
-        f"Broker   : Binance Spot\n"
+        f"Exchange : {ACTIVE_EXCHANGE.upper()} Spot\n"
         f"Mode     : {mode_label}\n"
         f"Pair     : memindai `{n_pairs}` pair USDT setiap `{CANDLE_INTERVAL}`\n"
-        f"AI       : Groq Llama 3\\.1 \\+ Claude Sonnet 5 \\(validator\\)\n"
+        f"AI       : Multi\\-model via 9Router \\(Primary \\+ Validators\\)\n"
         f"Filter   : Multi\\-TF 1m\\+5m\\+15m \\+ Funding Rate \\+ Open Interest\n"
         f"TP/SL    : ATR\\-based dynamic \\(R:R 1:{int(TP_ATR_MULT/SL_ATR_MULT)}\\)\n"
         f"Trailing : {'✅ aktif' if TRAILING_SL_ENABLED else '❌ nonaktif'} "
@@ -6720,6 +7232,12 @@ if __name__ == "__main__":
 
     if LIVE_MODE and ACTIVE_EXCHANGE == "mexc" and not (MEXC_API_KEY and MEXC_API_SECRET):
         logger.warning("⚠️ MEXC_API_KEY/SECRET belum diisi → buka /config")
+        port = int(os.getenv("PORT", 3000))
+        flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+        raise SystemExit(0)
+
+    if LIVE_MODE and ACTIVE_EXCHANGE == "bybit" and not (BYBIT_API_KEY and BYBIT_API_SECRET):
+        logger.warning("⚠️ BYBIT_API_KEY/SECRET belum diisi → buka /config")
         port = int(os.getenv("PORT", 3000))
         flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
         raise SystemExit(0)
