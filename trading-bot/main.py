@@ -131,6 +131,14 @@ NEWS_FEEDS: list[str] = [
     "https://cointelegraph.com/rss",
     "https://decrypt.co/feed",
 ]
+NEWS_FEEDS_FOREX: list[str] = [
+    "https://www.forexlive.com/feed/news",
+    "https://www.dailyfx.com/feeds/all",
+]
+NEWS_FEEDS_SAHAM: list[str] = [
+    "https://feeds.reuters.com/reuters/businessNews",
+    "https://finance.yahoo.com/news/rssindex",
+]
 NEWS_REFRESH_SEC: int = int(os.getenv("NEWS_REFRESH_SEC", "900"))  # 15 menit
 
 # ─── EMAIL NOTIFICATIONS ──────────────────────────────────────────────────────
@@ -308,6 +316,15 @@ TELEGRAM_STOCK_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_STOCK_NEW
 TELEGRAM_CALENDAR_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_CALENDAR_TOPIC_ID")     # Kalender Ekonomi
 TELEGRAM_STRATEGY_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_STRATEGY_TOPIC_ID")     # Strategi Trading
 TELEGRAM_SCHOOL_TOPIC_ID:       Optional[int] = _parse_topic("TELEGRAM_SCHOOL_TOPIC_ID")       # Sekolah Trading
+
+# Mapping kategori berita → topic ID (dipakai oleh _post_news_item)
+# Dideklarasikan setelah semua topic var tersedia
+def _news_topic_for_category(category: str) -> Optional[int]:
+    return {
+        "crypto": TELEGRAM_NEWS_TOPIC_ID,
+        "forex":  TELEGRAM_FOREX_NEWS_TOPIC_ID,
+        "saham":  TELEGRAM_STOCK_NEWS_TOPIC_ID,
+    }.get(category, TELEGRAM_NEWS_TOPIC_ID)
 
 # Binance credentials
 BINANCE_API_KEY    = _cfg("BINANCE_API_KEY")
@@ -2576,64 +2593,86 @@ def _clean_html(text: str, max_len: int = 220) -> str:
     return text[:max_len].rstrip() + ("…" if len(text) > max_len else "")
 
 
-def fetch_crypto_news() -> list[dict]:
-    """Ambil headline + ringkasan terbaru dari RSS feed media crypto (CoinDesk,
-    Cointelegraph, Decrypt) — gratis, tanpa API key. Dipakai buat kasih AI & user
-    konteks kondisi pasar/berita terkini, bukan cuma indikator teknikal."""
+def _fetch_feeds(feeds: list[str], category: str) -> list[dict]:
+    """Ambil headline dari daftar URL RSS dengan tag kategori tertentu."""
     import feedparser
     items = []
-    for url in NEWS_FEEDS:
+    for url in feeds:
         try:
             feed = feedparser.parse(url)
             source = feed.feed.get("title", url)
             for entry in feed.entries[:10]:
                 items.append({
-                    "title": entry.get("title", "").strip(),
-                    "summary": _clean_html(entry.get("summary", "")),
-                    "link": entry.get("link", ""),
-                    "source": source,
+                    "title":     entry.get("title", "").strip(),
+                    "summary":   _clean_html(entry.get("summary", "")),
+                    "link":      entry.get("link", ""),
+                    "source":    source,
                     "published": entry.get("published", ""),
+                    "category":  category,
                 })
         except Exception as e:
             logger.warning(f"Gagal ambil RSS {url}: {e}")
     return items
 
 
+def fetch_crypto_news() -> list[dict]:
+    """Ambil headline dari semua RSS feed: crypto, forex, dan saham."""
+    items  = _fetch_feeds(NEWS_FEEDS,       "crypto")
+    items += _fetch_feeds(NEWS_FEEDS_FOREX, "forex")
+    items += _fetch_feeds(NEWS_FEEDS_SAHAM, "saham")
+    return items
+
+
 def _post_news_item(n: dict) -> None:
-    """Posting satu headline ke topic berita, gaya feed real-time — judul,
-    sumber, ringkasan singkat, dan link ke artikel aslinya."""
-    text = f"📰 *{n['source']}*\n\n*{n['title']}*"
+    """Posting headline ke topic sesuai kategorinya (crypto/forex/saham)."""
+    category = n.get("category", "crypto")
+    topic_id = _news_topic_for_category(category)
+    emoji    = {"crypto": "🪙", "forex": "💱", "saham": "📊"}.get(category, "📰")
+    text = f"{emoji} *{n['source']}*\n\n*{n['title']}*"
     if n.get("summary"):
         text += f"\n\n{n['summary']}"
     if n.get("link"):
         text += f"\n\n🔗 {n['link']}"
-    send_telegram_message(text, topic_id=TELEGRAM_NEWS_TOPIC_ID)
+    send_telegram_message(text, topic_id=topic_id)
 
 
 def news_refresher_loop() -> None:
     """Refresh cache berita tiap NEWS_REFRESH_SEC detik di background, dan posting
-    headline baru (belum pernah tampil) ke topic berita secara real-time."""
+    headline baru ke topic masing-masing kategori (crypto/forex/saham) secara real-time."""
     global latest_news
-    first_run = True
+    first_run       = True
+    all_feeds_count = len(NEWS_FEEDS) + len(NEWS_FEEDS_FOREX) + len(NEWS_FEEDS_SAHAM)
     while True:
         try:
             items = fetch_crypto_news()
             if items:
+                # Simpan hanya crypto ke latest_news — dipakai AI untuk konteks sinyal
+                crypto_items = [n for n in items if n.get("category") == "crypto"]
                 with news_lock:
-                    latest_news = items
+                    latest_news = crypto_items or items
 
                 new_items = [n for n in items if n["link"] and n["link"] not in seen_news_links]
                 for n in items:
                     if n["link"]:
                         seen_news_links.add(n["link"])
 
-                if TELEGRAM_NEWS_TOPIC_ID and new_items and not first_run:
-                    # urutkan lama → baru biar kebaca seperti feed kronologis
-                    for n in list(reversed(new_items))[-MAX_NEW_NEWS_PER_CYCLE:]:
+                if new_items and not first_run:
+                    # Hanya posting kalau topic-nya sudah terkonfigurasi
+                    postable = [
+                        n for n in new_items
+                        if _news_topic_for_category(n.get("category", "crypto"))
+                    ]
+                    for n in list(reversed(postable))[-MAX_NEW_NEWS_PER_CYCLE:]:
                         _post_news_item(n)
                         time.sleep(1.5)  # hindari rate-limit Telegram
 
-                logger.info(f"📰 Berita ter-update: {len(items)} headline dari {len(NEWS_FEEDS)} sumber, {len(new_items)} baru")
+                n_crypto = len([n for n in items if n.get("category") == "crypto"])
+                n_forex  = len([n for n in items if n.get("category") == "forex"])
+                n_saham  = len([n for n in items if n.get("category") == "saham"])
+                logger.info(
+                    f"📰 Berita ter-update: {len(items)} headline dari {all_feeds_count} sumber "
+                    f"(crypto={n_crypto}, forex={n_forex}, saham={n_saham}), {len(new_items)} baru"
+                )
                 first_run = False
         except Exception as e:
             logger.error(f"news_refresher_loop error: {e}")
@@ -4300,7 +4339,7 @@ def _detect_sentiment(text: str) -> str:
     bear_score = sum(1 for w in _BEAR_KEYWORDS if w in lower)
     return "bear" if bear_score > bull_score else "bull"
 
-def send_trend_message(text: str, decision: str = "HOLD") -> None:
+def send_trend_message(text: str, decision: str = "HOLD", symbol: str = "") -> None:
     if decision == "BUY":
         topic = TELEGRAM_BULL_TOPIC_ID
     elif decision == "SELL":
@@ -4311,6 +4350,9 @@ def send_trend_message(text: str, decision: str = "HOLD") -> None:
         sentiment = _detect_sentiment(text)
         topic = TELEGRAM_BULL_TOPIC_ID if sentiment == "bull" else TELEGRAM_BEAR_TOPIC_ID
     send_telegram_message(text, topic_id=topic)
+    # Kirim duplikat ke Hot Coin untuk priority pair
+    if TELEGRAM_HOT_COIN_TOPIC_ID and symbol and symbol.upper() in [p.upper() for p in PRIORITY_PAIRS]:
+        send_telegram_message(text, topic_id=TELEGRAM_HOT_COIN_TOPIC_ID)
 
 
 def send_telegram_confirm(symbol: str, signal: dict, volume: float) -> Optional[int]:
@@ -6840,7 +6882,7 @@ def health_monitor_loop() -> None:
                     f"• Confidence AI selalu di bawah `{CONFIDENCE_THRESHOLD}%`\n"
                     f"• Rate limit AI atau Claude \\(cek log\\)\n\n"
                     f"_Bot masih aktif memindai `{n_pairs}` pair\\._",
-                    topic_id=TELEGRAM_REPORT_TOPIC_ID,
+                    topic_id=TELEGRAM_ALERTS_TOPIC_ID or TELEGRAM_REPORT_TOPIC_ID,
                 )
                 last_no_signal_alert = now
                 logger.warning(f"⚠️ Health alert: {since_hours:.1f}j tanpa sinyal")
@@ -6862,7 +6904,7 @@ def health_monitor_loop() -> None:
                                 f"Penurunan      : `{drop_pct:.2f}%`\n\n"
                                 f"Hard stop di `{HARD_STOP_LOSS_PCT}%` — "
                                 f"{'⏸ bot sudah di\\-pause' if is_paused else f'⚠️ belum tercapai \\(masih {HARD_STOP_LOSS_PCT - drop_pct:.1f}% lagi\\)'}\\.",
-                                topic_id=TELEGRAM_REPORT_TOPIC_ID,
+                                topic_id=TELEGRAM_ALERTS_TOPIC_ID or TELEGRAM_REPORT_TOPIC_ID,
                             )
                             last_equity_alert = now
                             logger.warning(f"🚨 Health alert: equity turun {drop_pct:.2f}%")
@@ -7174,6 +7216,7 @@ def main_loop():
                             f"💬 _{reason}_\n\n"
                             f"⏸ _Nunggu dulu, belum cukup yakin_",
                             decision=decision,
+                            symbol=symbol,
                         )
                         continue
 
