@@ -271,12 +271,13 @@ _raw_chat_id = _cfg("TELEGRAM_CHAT_ID", "0")
 try:
     TELEGRAM_CHAT_ID = int(_raw_chat_id)
 except ValueError:
+    # Bukan angka (misalnya masih placeholder) — set ke 0 supaya
+    # startup check di __main__ bisa deteksi dan serve /config page
     print(
-        f"\n❌ ERROR: TELEGRAM_CHAT_ID harus berupa angka, bukan '{_raw_chat_id}'.\n"
+        f"\n⚠️  TELEGRAM_CHAT_ID '{_raw_chat_id}' bukan angka — bot akan serve /config untuk pengisian.\n"
         f"   Cara dapat Chat ID: cari @userinfobot di Telegram → klik Start.\n"
-        f"   Atau isi lewat halaman /config di dashboard bot.\n"
     )
-    raise SystemExit(1)
+    TELEGRAM_CHAT_ID = 0
 
 ALLOWED_CHAT_IDS = [
     int(x.strip())
@@ -298,9 +299,15 @@ TELEGRAM_REPORT_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_REPORT_TOPIC_
 TELEGRAM_NEWS_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_NEWS_TOPIC_ID")
 TELEGRAM_HOLD_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_HOLD_TOPIC_ID")
 # Topik tambahan — isi di config.json setelah buat topik di grup Telegram kamu
-TELEGRAM_ALERTS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_ALERTS_TOPIC_ID")    # notifikasi sistem (health, error)
-TELEGRAM_ANALYSIS_TOPIC_ID: Optional[int] = _parse_topic("TELEGRAM_ANALYSIS_TOPIC_ID")  # detail analisis AI per pair
-TELEGRAM_CODING_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_CODING_TOPIC_ID")    # log AI coding updates
+TELEGRAM_ALERTS_TOPIC_ID:       Optional[int] = _parse_topic("TELEGRAM_ALERTS_TOPIC_ID")       # Alert Market (health, error)
+TELEGRAM_ANALYSIS_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_ANALYSIS_TOPIC_ID")     # Analisis AI per pair
+TELEGRAM_CODING_TOPIC_ID:       Optional[int] = _parse_topic("TELEGRAM_CODING_TOPIC_ID")       # log AI coding updates
+TELEGRAM_HOT_COIN_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_HOT_COIN_TOPIC_ID")     # Hot Coin watchlist
+TELEGRAM_FOREX_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_FOREX_NEWS_TOPIC_ID")   # Berita Forex
+TELEGRAM_STOCK_NEWS_TOPIC_ID:   Optional[int] = _parse_topic("TELEGRAM_STOCK_NEWS_TOPIC_ID")   # Berita Saham
+TELEGRAM_CALENDAR_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_CALENDAR_TOPIC_ID")     # Kalender Ekonomi
+TELEGRAM_STRATEGY_TOPIC_ID:     Optional[int] = _parse_topic("TELEGRAM_STRATEGY_TOPIC_ID")     # Strategi Trading
+TELEGRAM_SCHOOL_TOPIC_ID:       Optional[int] = _parse_topic("TELEGRAM_SCHOOL_TOPIC_ID")       # Sekolah Trading
 
 # Binance credentials
 BINANCE_API_KEY    = _cfg("BINANCE_API_KEY")
