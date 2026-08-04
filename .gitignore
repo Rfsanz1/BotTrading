@@ -47,3 +47,7 @@ Thumbs.db
 # Replit
 .cache/
 .local/
+trading-bot/config.json
+trading-bot/bot_state.json
+trading-bot/trades.db
+trading-bot/trades.log

@@ -149,6 +149,14 @@ The React dashboard at `/trading-dashboard/` connects to the Python Flask bot an
 - Backtest runner, DCA manager, system monitor
 - Settings panel (configure everything via UI)
 
+## One-time Telegram setup
+
+The Telegram bot needs to be **added to your group** before it can send messages:
+1. Add `@YourBotUsername` to your Telegram group as an admin
+2. The bot will then be able to post signals to the configured topic IDs
+
+If you see `chat not found` errors in the Trading Bot logs, it means the bot hasn't joined the group yet.
+
 ## User preferences
 
 - Keep existing project structure — do not restructure or migrate

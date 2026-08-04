@@ -1,11 +1,11 @@
 """
-AI Trading Bot – Binance (semua pair USDT) + Groq (Llama 3.1) + Telegram
-=========================================================================
+AI Trading Bot – Binance (semua pair USDT) + Multi-AI (via 9Router) + Telegram
+===============================================================================
 Mode saat ini: LIVE (LIVE_MODE = True)
 Data pasar    : Binance public API — memindai SEMUA pair spot USDT
 Pre-filter    : indikator teknikal (RSI/MACD) memilih pair yang "menarik"
-                sebelum dikirim ke AI, supaya tidak membanjiri rate-limit Groq
-AI Analyst    : Groq – Llama 3.1 (conversational, ingat history)
+                sebelum dikirim ke AI, supaya tidak membanjiri rate-limit AI
+AI Analyst    : Multi-AI via 9Router (Gemini/Claude/GPT-4o, conversational)
 Notifikasi    : Telegram (konfirmasi inline ✅ / ❌, group topics support)
 Eksekusi      : Binance Spot market order
 """
@@ -99,7 +99,7 @@ CONFIRM_TIMEOUT: int = 120
 _EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 _EXCLUDED_BASES = {"USDC", "FDUSD", "TUSD", "DAI", "EUR", "GBP", "TRY", "BUSD"}
 
-# Berapa pair maksimum yang boleh AI analisis (Groq) per siklus — pre-filter
+# Berapa pair maksimum yang boleh AI analisis per siklus — pre-filter
 # indikator memilih kandidat paling menarik dulu supaya rate-limit aman.
 MAX_AI_CALLS_PER_CYCLE: int = int(os.getenv("MAX_AI_CALLS_PER_CYCLE", "8"))
 
@@ -173,7 +173,7 @@ _CORS_ALLOWED_ORIGINS: list = [
     o.strip().rstrip("/") for o in _CORS_ALLOWED_ORIGINS_RAW.split(",") if o.strip()
 ]
 
-# Groq – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
+# AI history – berapa exchange terakhir yang diingat (1 exchange = 1 user + 1 assistant)
 MAX_HISTORY_EXCHANGES: int = 4   # dikurangi supaya tidak 413 Too Large
 
 # ATR-based dynamic TP/SL — R:R 1:4
@@ -577,7 +577,7 @@ def load_state() -> None:
 
 daily_start_equity: float = 0.0  # di-set oleh main_loop setelah fetch equity dari Binance
 
-# Groq conversation history (shared antara analisis trading & chat)
+# AI conversation history (shared antara analisis trading & chat)
 conversation_history: list[dict] = []
 history_lock = threading.Lock()
 
@@ -3396,7 +3396,7 @@ def get_pair_feedback(symbol: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ─── 3. ANALISIS AI (GROQ – conversational, ingat history) ──────────────────
+# ─── 3. ANALISIS AI (9Router – conversational, ingat history) ───────────────
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT_TRADING = """Kamu adalah analis trading kripto profesional yang cerdas dan teliti. \
@@ -4021,7 +4021,7 @@ def run_multi_ai_consensus(symbol: str, df_1m: pd.DataFrame, primary_signal: dic
     for t in threads:
         t.join(timeout=45)  # max 45 detik per validator
 
-    # Gabungkan dengan Groq sebagai suara pertama
+    # Gabungkan dengan 9Router/Primary sebagai suara pertama
     all_models = {"9Router/Primary": primary_signal}
     for name, res in results.items():
         if res is not None:
