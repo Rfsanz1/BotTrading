@@ -1,9 +1,10 @@
 {
+  "_comment": "Copy this to config.json and fill in your values. config.json is gitignored.",
   "BINANCE_TESTNET": "true",
   "LIVE_MODE": "false",
   "TRADING_PAIRS": "ALL",
   "PRIORITY_PAIRS": "XAUTUSDT",
-  "TELEGRAM_CHAT_ID": "-1003812928623",
+  "TELEGRAM_CHAT_ID": "-100xxxxxxxxxx",
   "TELEGRAM_BUY_TOPIC_ID": "5",
   "TELEGRAM_SELL_TOPIC_ID": "6",
   "TELEGRAM_BULL_TOPIC_ID": "4",

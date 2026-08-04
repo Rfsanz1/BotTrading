@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 # ─── Minimal stubs so main.py can be imported in test env ───────────────────
 os.environ.setdefault("TELEGRAM_CHAT_ID", "0")
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "stub")
-os.environ.setdefault("GROQ_API_KEY", "stub")
+os.environ.setdefault("GROQ_API_KEY", "stub")  # legacy key still read by _cfg() at import
 os.environ.setdefault("PORT", "19999")
 
 _requests_patcher = patch(

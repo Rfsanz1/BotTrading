@@ -1,12 +1,12 @@
 # 🤖 AI Trading Bot
 
-Automated crypto trading bot with AI-powered signals (Groq Llama 3.1 + Claude Sonnet 5), real-time Telegram integration, and a full-featured React dashboard.
+Automated crypto trading bot with multi-AI consensus signals (via 9Router gateway — Gemini, Claude, GPT-4o), real-time Telegram integration, and a full-featured React dashboard.
 
 ## Features
 
 ### Core Trading
 - **Live Trading** — Binance Spot (testnet or live)
-- **Dual AI Consensus** — Groq Llama 3.1 + Claude Sonnet 5 validation
+- **Multi-AI Consensus** — primary model + 3 validators via 9Router (Gemini, Claude, GPT-4o)
 - **Multi-timeframe Analysis** — 1m / 5m / 15m candles
 - **ATR-based Dynamic TP/SL** — R:R 1:4 by default
 
@@ -66,23 +66,32 @@ Automated crypto trading bot with AI-powered signals (Groq Llama 3.1 + Claude So
 
 ## Configuration
 
-All settings can be changed via the `/config` page in the dashboard or by editing `config.json` directly.
+**On Replit:** set `TELEGRAM_BOT_TOKEN`, `BINANCE_API_KEY`, and `BINANCE_API_SECRET` as Replit Secrets. Non-secret settings go in `trading-bot/config.json` (gitignored — copy from `config.example.json`). Settings can also be changed via the `/config` page in the dashboard.
 
-### Required Keys
+> **Safe defaults:** the bot starts with `LIVE_MODE=false` and `BINANCE_TESTNET=true` out of the box. Real trading requires explicitly setting `LIVE_MODE=true` and `BINANCE_TESTNET=false` in your config or environment.
+
+### Required Keys (Replit Secrets)
 
 | Key | Description |
 |-----|-------------|
 | `TELEGRAM_BOT_TOKEN` | From @BotFather |
-| `TELEGRAM_CHAT_ID` | Your group chat ID |
 | `BINANCE_API_KEY` | Binance API key |
 | `BINANCE_API_SECRET` | Binance API secret |
-| `GROQ_API_KEY` | From console.groq.com |
+
+### Required config (config.json / env)
+
+| Key | Description |
+|-----|-------------|
+| `TELEGRAM_CHAT_ID` | Your group chat ID |
+| `AI_BASE_URL` | 9Router gateway URL (e.g. `http://localhost:20128/v1`) |
+| `AI_API_KEY` | 9Router bearer token (leave empty for unauthenticated local) |
 
 ### Optional Keys
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `BINANCE_TESTNET` | `false` | Use testnet (virtual money) |
+| `BINANCE_TESTNET` | `true` | Use testnet (virtual money) — change to `false` only when ready for live trading |
+| `LIVE_MODE` | `false` | Enable real order execution — must be explicitly set to `true` for live trading |
 | `CAPITAL_ALLOCATION_PCT` | `0.5` | % of balance to trade with |
 | `MAX_EXPOSURE_PCT` | `0.02` | Max risk per trade |
 | `CONFIDENCE_THRESHOLD` | `80` | Minimum AI confidence to trade |

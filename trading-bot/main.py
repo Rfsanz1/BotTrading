@@ -63,14 +63,14 @@ def _cfg(key: str, default: str = "") -> str:
 # ─── KONFIGURASI ────────────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
-LIVE_MODE: bool = _cfg("LIVE_MODE", "true").lower() in ("1", "true", "yes")
+LIVE_MODE: bool = _cfg("LIVE_MODE", "false").lower() in ("1", "true", "yes")
 
 # Kosongkan / set "ALL" di TRADING_PAIRS env var untuk memindai SEMUA pair
 # spot USDT yang ada di Binance. Atau isi daftar spesifik, contoh:
 # TRADING_PAIRS=BTCUSDT,ETHUSDT,SOLUSDT
 # Mode testnet Binance — pakai API key dari testnet.binance.vision (uang virtual)
 # Set BINANCE_TESTNET=true di config.json atau Replit Secrets untuk aktifkan
-BINANCE_TESTNET: bool = _cfg("BINANCE_TESTNET", "false").lower() in ("1", "true", "yes")
+BINANCE_TESTNET: bool = _cfg("BINANCE_TESTNET", "true").lower() in ("1", "true", "yes")
 
 TRADING_PAIRS_ENV: str = _cfg("TRADING_PAIRS", "ALL").strip()
 # Pair yang selalu dipindai PERTAMA setiap siklus (pisah koma), misal: XAUTUSDT,BTCUSDT
@@ -3060,7 +3060,7 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
 def is_interesting(df: pd.DataFrame) -> bool:
     """
     Pre-filter murah (tanpa AI) untuk mempersempit ratusan pair jadi
-    beberapa kandidat yang layak dikirim ke Groq. Menghindari boros
+    beberapa kandidat yang layak dikirim ke AI. Menghindari boros
     rate-limit/API saat memindai semua pair sekaligus.
     """
     last = df.iloc[-1]
@@ -3558,7 +3558,7 @@ def _call_9router(
     """
     Kirim request ke 9Router (OpenAI-compatible gateway).
     Semua AI traffic harus lewat fungsi ini — jangan panggil SDK
-    groq/anthropic/openai/gemini langsung.
+    SDK AI lain secara langsung.
     Return: string response mentah; raise Exception jika error.
     """
     url     = f"{AI_BASE_URL}/chat/completions"
