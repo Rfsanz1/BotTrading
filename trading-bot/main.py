@@ -3620,11 +3620,13 @@ def _call_9router(
         "messages":    messages,
         "max_tokens":  max_tokens,
         "temperature": temperature,
+        "stream":      False,
     }
     resp = requests.post(url, headers=headers, json=payload,
                          timeout=AI_TIMEOUT_MS / 1000)
     resp.raise_for_status()
-    return resp.json()["choices"][0]["message"]["content"].strip()
+    data = resp.json()
+    return data["choices"][0]["message"]["content"].strip()
 
 
 def ask_ai(symbol: str, df_1m: pd.DataFrame,
