@@ -2656,13 +2656,15 @@ def news_refresher_loop() -> None:
                     if n["link"]:
                         seen_news_links.add(n["link"])
 
-                if new_items and not first_run:
+                if new_items:
                     # Hanya posting kalau topic-nya sudah terkonfigurasi
                     postable = [
                         n for n in new_items
                         if _news_topic_for_category(n.get("category", "crypto"))
                     ]
-                    for n in list(reversed(postable))[-MAX_NEW_NEWS_PER_CYCLE:]:
+                    # Batasi lebih ketat di run pertama biar tidak spam (5 per kategori)
+                    limit = MAX_NEW_NEWS_PER_CYCLE if not first_run else 5
+                    for n in list(reversed(postable))[-limit:]:
                         _post_news_item(n)
                         time.sleep(1.5)  # hindari rate-limit Telegram
 
@@ -7060,23 +7062,40 @@ def calendar_loop() -> None:
 
             events = _fetch_ff_calendar()
 
-            # ── 1. Daily briefing jam 00:01–00:30 UTC ────────────────────────
-            if now.hour == 0 and now.minute < 30 and _last_daily_date != today_str:
+            # ── 1. Daily briefing: jam 00:01–00:30 UTC ATAU startup pertama ────
+            if _last_daily_date != today_str and (
+                (now.hour == 0 and now.minute < 30) or _last_daily_date is None
+            ):
                 today_events = [
                     ev for ev in events
                     if ev.get("_dt") and ev["_dt"].strftime("%Y-%m-%d") == today_str
                     and ev.get("impact") in ("High", "Medium")
                 ]
+                # Startup: filter hanya event yang BELUM lewat
+                if _last_daily_date is None:
+                    today_events = [
+                        ev for ev in today_events
+                        if ev.get("_dt") and ev["_dt"] > now
+                    ]
                 if today_events:
-                    lines = [_format_calendar_event(ev) for ev in today_events[:15]]
+                    lines  = [_format_calendar_event(ev) for ev in today_events[:15]]
+                    label  = "Sisa Event Hari Ini" if _last_daily_date is None else f"{now.strftime('%A, %d %b %Y')} \\(UTC\\)"
                     header = (
-                        f"📅 *Kalender Ekonomi — {now.strftime('%A, %d %b %Y')} \\(UTC\\)*\n"
-                        f"_Event High & Medium Impact hari ini:_\n\n"
+                        f"📅 *Kalender Ekonomi — {label}*\n"
+                        f"_Event High & Medium Impact:_\n\n"
                     )
                     msg = header + "\n\n".join(lines)
                     send_telegram_message(msg, topic_id=TELEGRAM_CALENDAR_TOPIC_ID)
-                    _last_daily_date = today_str
                     logger.info(f"📅 Calendar briefing: {len(today_events)} event dikirim")
+                elif _last_daily_date is None:
+                    send_telegram_message(
+                        "📅 *Kalender Ekonomi Aktif*\n\n"
+                        "_Tidak ada event High\\/Medium Impact tersisa hari ini\\._\n"
+                        "Alert otomatis akan muncul 15 menit sebelum event berikutnya\\.",
+                        topic_id=TELEGRAM_CALENDAR_TOPIC_ID,
+                    )
+                    logger.info("📅 Calendar: tidak ada sisa event hari ini")
+                _last_daily_date = today_str
 
             # ── 2. Alert 15 menit sebelum event High/Medium ──────────────────
             for ev in events:
@@ -7130,7 +7149,8 @@ def strategy_loop() -> None:
         return
     logger.info("✅ Strategy loop aktif")
 
-    _posted_hours: set = set()
+    _posted_hours:  set  = set()
+    _startup_done:  bool = False
 
     while True:
         try:
@@ -7138,7 +7158,7 @@ def strategy_loop() -> None:
             hour = now.hour
             key  = f"{now.strftime('%Y-%m-%d')}-{hour}"
 
-            if hour in (1, 13) and key not in _posted_hours:
+            if (hour in (1, 13) and key not in _posted_hours) or not _startup_done:
                 session = "🌅 Pagi" if hour == 1 else "🌙 Malam"
                 wib_h   = (hour + 7) % 24
 
@@ -7178,16 +7198,28 @@ def strategy_loop() -> None:
                         .replace("+", "\\+").replace("=", "\\=").replace(">", "\\>")
                         .replace("|", "\\|").replace("{", "\\{").replace("}", "\\}")
                     )
+                    label = f"Strategi Trading {session}" if hour in (1, 13) else "Strategi Trading — Update"
                     msg = (
-                        f"📈 *Strategi Trading {session} — {now.strftime('%d %b %Y')}*\n\n"
+                        f"📈 *{label} — {now.strftime('%d %b %Y')}*\n\n"
                         f"{safe_resp}\n\n"
                         f"_\\— RFSANZ AI Trading Bot_"
                     )
                     send_telegram_message(msg, topic_id=TELEGRAM_STRATEGY_TOPIC_ID)
                     _posted_hours.add(key)
+                    _startup_done = True
                     logger.info(f"📈 Strategy post dikirim: sesi {session}")
                 except Exception as e:
                     logger.warning(f"Strategy AI error: {e}")
+                    if not _startup_done:
+                        # AI tidak tersedia — kirim placeholder agar topic tetap aktif
+                        send_telegram_message(
+                            f"📈 *Strategi Trading — {now.strftime('%d %b %Y')}*\n\n"
+                            f"_AI sedang tidak tersedia\\. Sinyal strategi akan muncul otomatis "
+                            f"setiap pagi \\(08:00 WIB\\) dan malam \\(20:00 WIB\\) saat AI aktif\\._\n\n"
+                            f"_\\— RFSANZ AI Trading Bot_",
+                            topic_id=TELEGRAM_STRATEGY_TOPIC_ID,
+                        )
+                        _startup_done = True
 
         except Exception as e:
             logger.warning(f"strategy_loop error: {e}")
@@ -7236,13 +7268,15 @@ def school_loop() -> None:
     logger.info("✅ Sekolah Trading loop aktif")
 
     _last_post_date: Optional[str] = None
+    _startup_sent:   bool          = False
 
     while True:
         try:
             now       = datetime.now(timezone.utc)
             today_str = now.strftime("%Y-%m-%d")
 
-            if now.hour == 2 and now.minute < 10 and _last_post_date != today_str:
+            if (now.hour == 2 and now.minute < 10 and _last_post_date != today_str) \
+                    or not _startup_sent:
                 # Pilih tips berdasarkan hari ke-N (berputar)
                 day_num  = (now - datetime(2025, 1, 1, tzinfo=timezone.utc)).days
                 tip      = _SCHOOL_TIPS[day_num % len(_SCHOOL_TIPS)]
@@ -7268,6 +7302,7 @@ def school_loop() -> None:
                 )
                 send_telegram_message(msg, topic_id=TELEGRAM_SCHOOL_TOPIC_ID)
                 _last_post_date = today_str
+                _startup_sent   = True
                 logger.info(f"🎓 School tip #{tip_num} dikirim: {tip['title']}")
 
         except Exception as e:
