@@ -4347,14 +4347,17 @@ def _detect_sentiment(text: str) -> str:
 
 def send_trend_message(text: str, decision: str = "HOLD", symbol: str = "") -> None:
     if decision == "BUY":
-        topic = TELEGRAM_BULL_TOPIC_ID
+        topic = TELEGRAM_BULL_TOPIC_ID or TELEGRAM_BUY_TOPIC_ID
     elif decision == "SELL":
-        topic = TELEGRAM_BEAR_TOPIC_ID
+        topic = TELEGRAM_BEAR_TOPIC_ID or TELEGRAM_SELL_TOPIC_ID
     elif decision == "HOLD":
-        topic = TELEGRAM_HOLD_TOPIC_ID
+        topic = TELEGRAM_HOLD_TOPIC_ID or TELEGRAM_ANALYSIS_TOPIC_ID
     else:
         sentiment = _detect_sentiment(text)
-        topic = TELEGRAM_BULL_TOPIC_ID if sentiment == "bull" else TELEGRAM_BEAR_TOPIC_ID
+        if sentiment == "bull":
+            topic = TELEGRAM_BULL_TOPIC_ID or TELEGRAM_BUY_TOPIC_ID
+        else:
+            topic = TELEGRAM_BEAR_TOPIC_ID or TELEGRAM_SELL_TOPIC_ID
     send_telegram_message(text, topic_id=topic)
     # Kirim duplikat ke Hot Coin untuk priority pair
     if TELEGRAM_HOT_COIN_TOPIC_ID and symbol and symbol.upper() in [p.upper() for p in PRIORITY_PAIRS]:
