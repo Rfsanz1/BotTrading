@@ -7000,6 +7000,283 @@ def scheduled_pause_checker_loop() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ─── ECONOMIC CALENDAR LOOP ──────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_CALENDAR_IMPACT_EMOJI = {"High": "🔴", "Medium": "🟡", "Low": "🟢"}
+_calendar_posted_ids: set = set()   # track event ID yang sudah diposting
+
+def _fetch_ff_calendar() -> list[dict]:
+    """Fetch ForexFactory calendar JSON (gratis, no API key).
+    Return list event minggu ini, diurutkan by datetime."""
+    url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    resp = requests.get(url, timeout=15)
+    resp.raise_for_status()
+    events = resp.json()
+    # parse datetime string → datetime object
+    for ev in events:
+        try:
+            ev["_dt"] = datetime.strptime(ev["date"], "%Y-%m-%dT%H:%M:%S%z")
+        except Exception:
+            ev["_dt"] = None
+    return sorted(events, key=lambda x: x.get("_dt") or datetime.max.replace(tzinfo=timezone.utc))
+
+
+def _format_calendar_event(ev: dict) -> str:
+    """Format satu event kalender jadi teks Telegram Markdown."""
+    impact  = ev.get("impact", "")
+    emoji   = _CALENDAR_IMPACT_EMOJI.get(impact, "⚪")
+    country = ev.get("country", "").upper()
+    title   = ev.get("title", "").strip()
+    forecast = ev.get("forecast", "") or "—"
+    previous = ev.get("previous", "") or "—"
+    dt = ev.get("_dt")
+    time_str = dt.strftime("%H:%M UTC") if dt else "?"
+    return (
+        f"{emoji} `{time_str}` \\| *{country}* — {title}\n"
+        f"   ┗ Forecast: `{forecast}` \\| Prev: `{previous}`"
+    )
+
+
+def calendar_loop() -> None:
+    """Kirim briefing kalender ekonomi harian ke topic Kalender Ekonomi.
+    Jadwal:
+    • Jam 00:01 UTC — briefing event HIGH impact hari ini
+    • Real-time     — alert 15 menit sebelum event HIGH/MEDIUM impact
+    Loop setiap 5 menit untuk cek jadwal & upcoming events.
+    """
+    if not TELEGRAM_CALENDAR_TOPIC_ID:
+        logger.info("⏭ Calendar loop: TELEGRAM_CALENDAR_TOPIC_ID tidak di-set, skip")
+        return
+    logger.info("✅ Economic calendar loop aktif")
+
+    _last_daily_date: Optional[str] = None
+    _alerted_ids:     set           = set()
+
+    while True:
+        try:
+            now = datetime.now(timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+
+            events = _fetch_ff_calendar()
+
+            # ── 1. Daily briefing jam 00:01–00:30 UTC ────────────────────────
+            if now.hour == 0 and now.minute < 30 and _last_daily_date != today_str:
+                today_events = [
+                    ev for ev in events
+                    if ev.get("_dt") and ev["_dt"].strftime("%Y-%m-%d") == today_str
+                    and ev.get("impact") in ("High", "Medium")
+                ]
+                if today_events:
+                    lines = [_format_calendar_event(ev) for ev in today_events[:15]]
+                    header = (
+                        f"📅 *Kalender Ekonomi — {now.strftime('%A, %d %b %Y')} \\(UTC\\)*\n"
+                        f"_Event High & Medium Impact hari ini:_\n\n"
+                    )
+                    msg = header + "\n\n".join(lines)
+                    send_telegram_message(msg, topic_id=TELEGRAM_CALENDAR_TOPIC_ID)
+                    _last_daily_date = today_str
+                    logger.info(f"📅 Calendar briefing: {len(today_events)} event dikirim")
+
+            # ── 2. Alert 15 menit sebelum event High/Medium ──────────────────
+            for ev in events:
+                ev_dt = ev.get("_dt")
+                if not ev_dt:
+                    continue
+                if ev.get("impact") not in ("High", "Medium"):
+                    continue
+                ev_id = f"{ev_dt.isoformat()}_{ev.get('title','')}"
+                if ev_id in _alerted_ids:
+                    continue
+                mins_away = (ev_dt - now).total_seconds() / 60
+                if 0 <= mins_away <= 15:
+                    impact  = ev.get("impact", "")
+                    emoji   = _CALENDAR_IMPACT_EMOJI.get(impact, "⚪")
+                    country = ev.get("country", "").upper()
+                    title   = ev.get("title", "").strip()
+                    forecast = ev.get("forecast", "") or "—"
+                    previous = ev.get("previous", "") or "—"
+                    alert = (
+                        f"⏰ *Alert: Event Ekonomi 15 Menit Lagi\\!*\n\n"
+                        f"{emoji} *{country}* — {title}\n"
+                        f"Waktu    : `{ev_dt.strftime('%H:%M UTC')}`\n"
+                        f"Impact   : `{impact}`\n"
+                        f"Forecast : `{forecast}` \\| Prev: `{previous}`\n\n"
+                        f"_Waspadai volatilitas tinggi di pasangan {country}\\._"
+                    )
+                    send_telegram_message(alert, topic_id=TELEGRAM_CALENDAR_TOPIC_ID)
+                    _alerted_ids.add(ev_id)
+                    logger.info(f"⏰ Calendar alert: {country} {title} in {mins_away:.0f}m")
+
+        except Exception as e:
+            logger.warning(f"calendar_loop error: {e}")
+
+        time.sleep(300)  # cek tiap 5 menit
+
+
+# ---------------------------------------------------------------------------
+# ─── STRATEGI TRADING LOOP ───────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def strategy_loop() -> None:
+    """Post analisis strategi trading AI harian ke topic Strategi Trading.
+    Jadwal:
+    • Jam 01:00 UTC (08:00 WIB) — rangkuman strategi pagi
+    • Jam 13:00 UTC (20:00 WIB) — update strategi malam
+    Berisi: kondisi market regime, pair prioritas, tips risk management.
+    """
+    if not TELEGRAM_STRATEGY_TOPIC_ID:
+        logger.info("⏭ Strategy loop: TELEGRAM_STRATEGY_TOPIC_ID tidak di-set, skip")
+        return
+    logger.info("✅ Strategy loop aktif")
+
+    _posted_hours: set = set()
+
+    while True:
+        try:
+            now  = datetime.now(timezone.utc)
+            hour = now.hour
+            key  = f"{now.strftime('%Y-%m-%d')}-{hour}"
+
+            if hour in (1, 13) and key not in _posted_hours:
+                session = "🌅 Pagi" if hour == 1 else "🌙 Malam"
+                wib_h   = (hour + 7) % 24
+
+                # Ambil context: berita terbaru + top pairs
+                with news_lock:
+                    news_ctx = latest_news[:3]
+                with pairs_lock:
+                    top_pairs = list(active_pairs)[:5]
+
+                news_summary = "\n".join(
+                    f"- {n['title'][:80]}" for n in news_ctx
+                ) if news_ctx else "Tidak ada berita terbaru."
+
+                prompt = (
+                    f"Kamu adalah analis crypto profesional. Buat rangkuman strategi trading "
+                    f"singkat untuk sesi {session} (jam {wib_h}:00 WIB).\n\n"
+                    f"Berita terbaru:\n{news_summary}\n\n"
+                    f"Top pair aktif: {', '.join(top_pairs) if top_pairs else 'BTCUSDT, ETHUSDT'}\n\n"
+                    f"Tulis dalam Bahasa Indonesia, maksimal 250 kata. Fokus pada:\n"
+                    f"1. Kondisi market global hari ini (bullish/bearish/sideways)\n"
+                    f"2. Strategi utama yang disarankan (breakout/pullback/range)\n"
+                    f"3. Risk management tips praktis\n"
+                    f"4. Pair yang perlu diperhatikan\n"
+                    f"Gunakan gaya casual tapi informatif. Jangan gunakan markdown symbol."
+                )
+                try:
+                    ai_resp = _call_9router(
+                        messages=[{"role": "user", "content": prompt}],
+                        model=AI_MODEL,
+                        max_tokens=400,
+                        temperature=0.7,
+                    )
+                    # Escape karakter spesial Telegram MarkdownV2
+                    safe_resp = (ai_resp
+                        .replace(".", "\\.").replace("!", "\\!").replace("-", "\\-")
+                        .replace("(", "\\(").replace(")", "\\)").replace("#", "\\#")
+                        .replace("+", "\\+").replace("=", "\\=").replace(">", "\\>")
+                        .replace("|", "\\|").replace("{", "\\{").replace("}", "\\}")
+                    )
+                    msg = (
+                        f"📈 *Strategi Trading {session} — {now.strftime('%d %b %Y')}*\n\n"
+                        f"{safe_resp}\n\n"
+                        f"_\\— RFSANZ AI Trading Bot_"
+                    )
+                    send_telegram_message(msg, topic_id=TELEGRAM_STRATEGY_TOPIC_ID)
+                    _posted_hours.add(key)
+                    logger.info(f"📈 Strategy post dikirim: sesi {session}")
+                except Exception as e:
+                    logger.warning(f"Strategy AI error: {e}")
+
+        except Exception as e:
+            logger.warning(f"strategy_loop error: {e}")
+
+        time.sleep(300)  # cek tiap 5 menit
+
+
+# ---------------------------------------------------------------------------
+# ─── SEKOLAH TRADING LOOP ────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+_SCHOOL_TIPS: list[dict] = [
+    {"title": "Apa itu Support & Resistance?",
+     "body": "Support adalah level harga di mana banyak pembeli masuk sehingga harga cenderung naik. Resistance adalah sebaliknya — area jual.\n\n*Tips:* Masuk BUY saat harga menyentuh support + ada konfirmasi candle bullish. Exit sebelum resistance."},
+    {"title": "Risk/Reward Ratio (RRR)",
+     "body": "Selalu pastikan potensi profit minimal 2× lebih besar dari potensi rugi.\n\n*Contoh:* SL 1% → TP minimal 2%. Dengan win rate 50% saja, akun kamu tetap profit dalam jangka panjang."},
+    {"title": "Apa itu Candlestick?",
+     "body": "Setiap candlestick menggambarkan 4 harga: Open, High, Low, Close (OHLC).\n\n*Candle penting:*\n• Doji = ragu-ragu pasar\n• Hammer = potensi reversal naik\n• Shooting Star = potensi reversal turun\n• Engulfing = sinyal kuat pembalikan arah"},
+    {"title": "Dollar Cost Averaging (DCA)",
+     "body": "DCA adalah strategi beli aset secara berkala dengan jumlah tetap, tanpa peduli harga saat itu.\n\n*Keuntungan:* Mengurangi risiko beli di puncak. Cocok untuk investasi jangka panjang BTC, ETH, atau gold (XAUT)."},
+    {"title": "Mengenal Timeframe Trading",
+     "body": "• *1m–5m:* Scalping — cepat, risiko tinggi, butuh fokus penuh\n• *15m–1h:* Day trading — buka tutup posisi dalam 1 hari\n• *4h–1D:* Swing trading — tahan 1–7 hari, cocok untuk pemula\n• *1W+:* Position trading — investasi jangka panjang"},
+    {"title": "Apa itu FOMO?",
+     "body": "FOMO (Fear Of Missing Out) = masuk pasar karena takut ketinggalan, bukan karena analisis.\n\n*Dampak:* Beli di puncak, panik saat turun, jual rugi.\n\n*Solusi:* Buat rencana trading sebelum pasar buka. Stick to the plan."},
+    {"title": "Pentingnya Stop Loss",
+     "body": "Stop Loss (SL) adalah perintah jual otomatis saat harga turun ke level tertentu.\n\n*Aturan emas:* Selalu pasang SL sebelum entry. Jangan pernah trade tanpa SL.\n\n*Tips:* Pasang SL di bawah support (untuk BUY) atau di atas resistance (untuk SELL)."},
+    {"title": "Volume dalam Trading",
+     "body": "Volume = jumlah aset yang diperdagangkan dalam periode tertentu.\n\n*Interpretasi:*\n• Harga naik + volume naik = tren kuat (BULLISH)\n• Harga naik + volume turun = tren lemah, waspadai reversal\n• Breakout dengan volume tinggi = sinyal lebih valid"},
+    {"title": "Mengenal RSI (Relative Strength Index)",
+     "body": "RSI adalah indikator momentum (0–100).\n\n• RSI > 70 = overbought (potensi turun)\n• RSI < 30 = oversold (potensi naik)\n• RSI 50 = netral\n\n*Tips:* Jangan langsung jual saat RSI > 70 — tren kuat bisa tetap naik. Tunggu konfirmasi."},
+    {"title": "Market Order vs Limit Order",
+     "body": "• *Market Order:* Beli/jual langsung di harga pasar sekarang. Cepat tapi slippage bisa terjadi.\n• *Limit Order:* Beli/jual hanya di harga yang kamu tentukan. Lebih aman, tapi mungkin tidak tereksekusi.\n\n*Tips:* Gunakan limit order untuk entry, market order hanya untuk exit darurat."},
+    {"title": "Psikologi Trading",
+     "body": "80% sukses trading berasal dari mental, bukan teknikal.\n\n*Musuh terbesar trader:*\n1. Greed (keserakahan) — overleveraging\n2. Fear (ketakutan) — cut loss terlalu cepat\n3. Hope (harapan) — menahan posisi loss terlalu lama\n\n*Solusi:* Trading plan yang tertulis + disiplin eksekusi."},
+    {"title": "Apa itu Leverage?",
+     "body": "Leverage = meminjam modal dari exchange untuk trading lebih besar.\n\n• 10× leverage: modal 100 USDT, bisa trade 1000 USDT\n• Profit 10% = +100 USDT\n• Rugi 10% = -100 USDT (modal habis!)\n\n*Tips untuk pemula:* Mulai dengan leverage 1–3× maksimum."},
+]
+
+def school_loop() -> None:
+    """Kirim tips edukasi trading ke topic Sekolah Trading.
+    Jadwal: sekali per hari jam 02:00 UTC (09:00 WIB), tips berganti setiap hari.
+    """
+    if not TELEGRAM_SCHOOL_TOPIC_ID:
+        logger.info("⏭ School loop: TELEGRAM_SCHOOL_TOPIC_ID tidak di-set, skip")
+        return
+    logger.info("✅ Sekolah Trading loop aktif")
+
+    _last_post_date: Optional[str] = None
+
+    while True:
+        try:
+            now       = datetime.now(timezone.utc)
+            today_str = now.strftime("%Y-%m-%d")
+
+            if now.hour == 2 and now.minute < 10 and _last_post_date != today_str:
+                # Pilih tips berdasarkan hari ke-N (berputar)
+                day_num  = (now - datetime(2025, 1, 1, tzinfo=timezone.utc)).days
+                tip      = _SCHOOL_TIPS[day_num % len(_SCHOOL_TIPS)]
+                tip_num  = (day_num % len(_SCHOOL_TIPS)) + 1
+
+                # Escape untuk MarkdownV2
+                def _esc(s: str) -> str:
+                    for c in r".-!()#+=>|{}":
+                        s = s.replace(c, f"\\{c}")
+                    return s
+
+                title_esc = _esc(tip["title"])
+                body_esc  = tip["body"].replace("!", "\\!").replace(".", "\\.").replace(
+                    "(", "\\(").replace(")", "\\)").replace("-", "\\-").replace(
+                    "+", "\\+").replace("=", "\\=").replace(">", "\\>").replace(
+                    "|", "\\|")
+
+                msg = (
+                    f"🎓 *Sekolah Trading — Tip #{tip_num}*\n\n"
+                    f"📖 *{title_esc}*\n\n"
+                    f"{body_esc}\n\n"
+                    f"_Belajar satu tips setiap hari \\= trader yang lebih baik\\._"
+                )
+                send_telegram_message(msg, topic_id=TELEGRAM_SCHOOL_TOPIC_ID)
+                _last_post_date = today_str
+                logger.info(f"🎓 School tip #{tip_num} dikirim: {tip['title']}")
+
+        except Exception as e:
+            logger.warning(f"school_loop error: {e}")
+
+        time.sleep(300)  # cek tiap 5 menit
+
+
+# ---------------------------------------------------------------------------
 # ─── DATABASE BACKUP LOOP ────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
 
@@ -7325,6 +7602,15 @@ if __name__ == "__main__":
 
     # Backup database berkala (hanya aktif kalau DB_BACKUP_ENABLED=true)
     threading.Thread(target=db_backup_loop, daemon=True).start()
+
+    # Kalender Ekonomi — briefing harian + alert 15 menit sebelum event High/Medium
+    threading.Thread(target=calendar_loop, daemon=True).start()
+
+    # Strategi Trading — analisis AI 2× sehari (pagi & malam WIB)
+    threading.Thread(target=strategy_loop, daemon=True).start()
+
+    # Sekolah Trading — tips edukasi harian bergilir
+    threading.Thread(target=school_loop, daemon=True).start()
 
     # Main trading loop
     main_loop()
