@@ -2657,16 +2657,18 @@ def news_refresher_loop() -> None:
                         seen_news_links.add(n["link"])
 
                 if new_items:
-                    # Hanya posting kalau topic-nya sudah terkonfigurasi
-                    postable = [
-                        n for n in new_items
-                        if _news_topic_for_category(n.get("category", "crypto"))
-                    ]
-                    # Batasi lebih ketat di run pertama biar tidak spam (5 per kategori)
-                    limit = MAX_NEW_NEWS_PER_CYCLE if not first_run else 5
-                    for n in list(reversed(postable))[-limit:]:
-                        _post_news_item(n)
-                        time.sleep(1.5)  # hindari rate-limit Telegram
+                    # Post per kategori agar crypto/forex/saham masing-masing dapat jatah
+                    per_cat_limit = MAX_NEW_NEWS_PER_CYCLE if not first_run else 3
+                    for cat in ("crypto", "forex", "saham"):
+                        cat_items = [
+                            n for n in new_items
+                            if n.get("category") == cat
+                            and _news_topic_for_category(cat)
+                        ]
+                        # urutkan lama → baru, ambil N terbaru
+                        for n in list(reversed(cat_items))[-per_cat_limit:]:
+                            _post_news_item(n)
+                            time.sleep(1.5)  # hindari rate-limit Telegram
 
                 n_crypto = len([n for n in items if n.get("category") == "crypto"])
                 n_forex  = len([n for n in items if n.get("category") == "forex"])
@@ -7314,6 +7316,87 @@ def school_loop() -> None:
 # ---------------------------------------------------------------------------
 # ─── DATABASE BACKUP LOOP ────────────────────────────────────────────────────
 # ---------------------------------------------------------------------------
+# ─── STARTUP GREETINGS ───────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+
+def _send_startup_greetings() -> None:
+    """Kirim pesan aktivasi ke topic yang hanya berisi konten saat ada sinyal/event.
+    Tujuan: user tahu routing sudah benar walau belum ada sinyal trade.
+    Dijalankan 1× saat bot pertama kali start, dengan jeda antar pesan."""
+    time.sleep(5)  # tunggu loop lain selesai kirim pesan startup-nya
+    now_str = datetime.now(timezone.utc).strftime("%d %b %Y, %H:%M UTC")
+
+    greetings = [
+        # (topic_id, pesan)
+        (TELEGRAM_BUY_TOPIC_ID,
+         f"🎯 *BUY SIGNAL — Bot Aktif*\n\n"
+         f"Bot sedang memindai *483 pair USDT* di Binance\\.\n"
+         f"Sinyal BUY akan muncul di sini otomatis saat AI mendeteksi peluang entry dengan "
+         f"confidence di atas threshold\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_SELL_TOPIC_ID,
+         f"🏷️ *SELL SIGNAL — Bot Aktif*\n\n"
+         f"Sinyal SELL \\(close posisi\\) akan muncul di sini otomatis setelah posisi "
+         f"terbuka mencapai target atau kondisi exit terpenuhi\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_HOT_COIN_TOPIC_ID,
+         f"🔥 *Hot Coin — Bot Aktif*\n\n"
+         f"Sinyal untuk pair prioritas \\(XAUTUSDT dan pair hot lainnya\\) "
+         f"akan muncul di sini secara realtime\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_ANALYSIS_TOPIC_ID,
+         f"📊 *Analisis AI — Bot Aktif*\n\n"
+         f"Update analisis AI per pair, termasuk confidence score, market regime, "
+         f"dan alasan sinyal akan tampil di sini\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_BULL_TOPIC_ID,
+         f"💼 *PORTOFOLIO — Bot Aktif*\n\n"
+         f"Update posisi BUY \\(bullish\\) dan perkembangan portfolio akan dicatat di sini\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_BEAR_TOPIC_ID,
+         f"💬 *Diskusi Member — Bot Aktif*\n\n"
+         f"Update sinyal bearish dan notifikasi SELL akan muncul di sini\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_REPORT_TOPIC_ID,
+         f"📋 *Laporan Trading — Bot Aktif*\n\n"
+         f"Laporan P&L harian otomatis dikirim setiap jam 00:00 WIB \\(17:00 UTC\\)\\.\n"
+         f"Laporan mencakup: total profit/loss, win rate, jumlah trade, dan equity harian\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_ALERTS_TOPIC_ID,
+         f"‼️ *Alert Market — Bot Aktif*\n\n"
+         f"Alert otomatis akan muncul di sini saat:\n"
+         f"• Bot diam lebih dari beberapa jam tanpa sinyal\n"
+         f"• Equity drop melebihi batas yang ditentukan\n"
+         f"• Terjadi error kritis pada sistem\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        (TELEGRAM_HOLD_TOPIC_ID,
+         f"⭐ *WATCHLIST — Bot Aktif*\n\n"
+         f"Pair yang dianalisis AI namun belum mencapai confidence threshold "
+         f"akan dicatat di sini sebagai watchlist\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+    ]
+
+    for topic_id, msg in greetings:
+        if not topic_id:
+            continue
+        try:
+            send_telegram_message(msg, topic_id=topic_id)
+            time.sleep(1.5)  # hindari rate-limit Telegram
+        except Exception as e:
+            logger.warning(f"Startup greeting error (topic {topic_id}): {e}")
+
+    logger.info("✅ Startup greetings dikirim ke semua topic")
+
+
+# ---------------------------------------------------------------------------
 
 def db_backup_loop() -> None:
     """Periodic database backup (runs only if DB_BACKUP_ENABLED=true)."""
@@ -7646,6 +7729,9 @@ if __name__ == "__main__":
 
     # Sekolah Trading — tips edukasi harian bergilir
     threading.Thread(target=school_loop, daemon=True).start()
+
+    # Kirim pesan startup ke topic yang hanya aktif saat ada sinyal/event
+    threading.Thread(target=_send_startup_greetings, daemon=True).start()
 
     # Main trading loop
     main_loop()
