@@ -4346,10 +4346,13 @@ def _detect_sentiment(text: str) -> str:
     return "bear" if bear_score > bull_score else "bull"
 
 def send_trend_message(text: str, decision: str = "HOLD", symbol: str = "") -> None:
+    # Sinyal BUY/SELL harus selalu masuk ke topic sinyal masing-masing.
+    # Sebelumnya BUY diarahkan ke topic bullish (PORTOFOLIO), sehingga
+    # watchlist/HOLD dengan keputusan BUY terlihat seperti sinyal entry.
     if decision == "BUY":
-        topic = TELEGRAM_BULL_TOPIC_ID or TELEGRAM_BUY_TOPIC_ID
+        topic = TELEGRAM_BUY_TOPIC_ID
     elif decision == "SELL":
-        topic = TELEGRAM_BEAR_TOPIC_ID or TELEGRAM_SELL_TOPIC_ID
+        topic = TELEGRAM_SELL_TOPIC_ID
     elif decision == "HOLD":
         topic = TELEGRAM_HOLD_TOPIC_ID or TELEGRAM_ANALYSIS_TOPIC_ID
     else:

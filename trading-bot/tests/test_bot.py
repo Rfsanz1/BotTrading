@@ -288,7 +288,33 @@ class TestVacationMode(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 5. SCHEDULE CONFIG
+# 5. TELEGRAM TOPIC ROUTING
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TestTelegramTopicRouting(unittest.TestCase):
+    """Trading signals must stay separate from portfolio/trend updates."""
+
+    def test_buy_watchlist_update_uses_buy_topic(self):
+        import main as bot
+        with patch.object(bot, "TELEGRAM_BUY_TOPIC_ID", 5), \
+             patch.object(bot, "TELEGRAM_BULL_TOPIC_ID", 4), \
+             patch.object(bot, "send_telegram_message") as send:
+            bot.send_trend_message("BUY belum cukup yakin", decision="BUY",
+                                   symbol="BTCUSDT")
+            send.assert_called_once_with("BUY belum cukup yakin", topic_id=5)
+
+    def test_sell_watchlist_update_uses_sell_topic(self):
+        import main as bot
+        with patch.object(bot, "TELEGRAM_SELL_TOPIC_ID", 6), \
+             patch.object(bot, "TELEGRAM_BEAR_TOPIC_ID", 3), \
+             patch.object(bot, "send_telegram_message") as send:
+            bot.send_trend_message("SELL belum cukup yakin", decision="SELL",
+                                   symbol="BTCUSDT")
+            send.assert_called_once_with("SELL belum cukup yakin", topic_id=6)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. SCHEDULE CONFIG
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestScheduleConfig(unittest.TestCase):
@@ -340,7 +366,7 @@ class TestScheduleConfig(unittest.TestCase):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 6. FLASK API ENDPOINTS
+# 7. FLASK API ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TestFlaskAPI(unittest.TestCase):
