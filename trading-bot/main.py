@@ -7358,16 +7358,6 @@ def _send_startup_greetings() -> None:
          f"dan alasan sinyal akan tampil di sini\\.\n\n"
          f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
 
-        (TELEGRAM_BULL_TOPIC_ID,
-         f"💼 *PORTOFOLIO — Bot Aktif*\n\n"
-         f"Update posisi BUY \\(bullish\\) dan perkembangan portfolio akan dicatat di sini\\.\n\n"
-         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
-
-        (TELEGRAM_BEAR_TOPIC_ID,
-         f"💬 *Diskusi Member — Bot Aktif*\n\n"
-         f"Update sinyal bearish dan notifikasi SELL akan muncul di sini\\.\n\n"
-         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
-
         (TELEGRAM_REPORT_TOPIC_ID,
          f"📋 *Laporan Trading — Bot Aktif*\n\n"
          f"Laporan P&L harian otomatis dikirim setiap jam 00:00 WIB \\(17:00 UTC\\)\\.\n"
@@ -7386,6 +7376,17 @@ def _send_startup_greetings() -> None:
          f"⭐ *WATCHLIST — Bot Aktif*\n\n"
          f"Pair yang dianalisis AI namun belum mencapai confidence threshold "
          f"akan dicatat di sini sebagai watchlist\\.\n\n"
+         f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
+
+        # Status startup dikirim ke topic chat/status, bukan ke topic
+        # bullish/bearish, supaya tidak terlihat sebagai sinyal trading.
+        (TELEGRAM_CHAT_TOPIC_ID,
+         f"ℹ️ *Status Bot — Bot Aktif*\n\n"
+         f"Routing sinyal sudah aktif\\.\n"
+         f"BUY utama → topic BUY \\(`{TELEGRAM_BUY_TOPIC_ID or 'general'}`\\)\n"
+         f"SELL utama → topic SELL \\(`{TELEGRAM_SELL_TOPIC_ID or 'general'}`\\)\n"
+         f"Update bullish → topic PORTOFOLIO \\(`{TELEGRAM_BULL_TOPIC_ID or 'general'}`\\)\n"
+         f"Update bearish → topic Diskusi Member \\(`{TELEGRAM_BEAR_TOPIC_ID or 'general'}`\\)\n\n"
          f"_Mode: TESTNET \\| Aktif sejak {now_str}_"),
     ]
 
