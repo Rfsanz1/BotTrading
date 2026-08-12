@@ -9,6 +9,7 @@ export class MT5Adapter extends ExchangeBase {
   async placeOrder(params: OrderParams): Promise<Order> { return { id: `ord-${Date.now()}`, symbol: params.symbol, side: params.side, quantity: params.quantity, filled: '0', createdAt: new Date(), status: 'NEW' } as Order; }
   async cancelOrder(orderId: string): Promise<void> { return; }
   async getOrder(orderId: string): Promise<Order | null> { return null; }
+  async fetchOpenOrders(symbol?: string): Promise<Order[]> { return []; }
   async fetchOpenPositions(): Promise<Position[]> { return []; }
   subscribeTicker(symbol: string): void { this.emit('ticker', { symbol }); }
   unsubscribeTicker(symbol: string): void { }

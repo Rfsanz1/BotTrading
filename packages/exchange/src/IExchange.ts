@@ -10,6 +10,7 @@ export interface IExchange extends EventEmitter {
   placeOrder(params: OrderParams): Promise<Order>;
   cancelOrder(orderId: string): Promise<void>;
   getOrder(orderId: string): Promise<Order | null>;
+  fetchOpenOrders(symbol?: string): Promise<Order[]>;
   fetchOpenPositions(): Promise<Position[]>;
   subscribeTicker(symbol: string): void;
   unsubscribeTicker(symbol: string): void;

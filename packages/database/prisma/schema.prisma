@@ -112,6 +112,7 @@ model User {
   memoryItems        MemoryItem[]
   positions          Position[]
   orders             Order[]
+  balanceHistory     BalanceHistory[] @relation(name: "balanceHistory")
 }
 
 model Role {
@@ -292,9 +293,30 @@ model Position {
   openedAt      DateTime       @default(now())
   closedAt      DateTime?
   meta          Json?
+  stopLoss      Decimal?       @db.Decimal(30, 12)
+  takeProfit    Decimal?       @db.Decimal(30, 12)
 
   @@index([userId])
   @@index([symbol])
+}
+
+// PHASE 2: Balance tracking and history
+model BalanceHistory {
+  id              String   @id @default(uuid())
+  user            User     @relation(name: "balanceHistory", fields: [userId], references: [id])
+  userId          String
+  exchange        String
+  asset           String   // e.g., "USDT", "BTC"
+  free            Decimal  @db.Decimal(30, 12)
+  locked          Decimal  @db.Decimal(30, 12)
+  total           Decimal  @db.Decimal(30, 12)
+  timestamp       DateTime @default(now())
+  meta            Json?    // store any additional data from exchange
+
+  @@index([userId])
+  @@index([exchange])
+  @@index([asset])
+  @@index([timestamp])
 }
 
 // ─── Strategies & Signals ────────────────────────────────────────────────────

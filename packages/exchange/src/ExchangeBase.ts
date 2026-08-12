@@ -31,6 +31,7 @@ export abstract class ExchangeBase extends EventEmitter implements IExchange {
   abstract placeOrder(params: OrderParams): Promise<Order>;
   abstract cancelOrder(orderId: string): Promise<void>;
   abstract getOrder(orderId: string): Promise<Order | null>;
+  abstract fetchOpenOrders(symbol?: string): Promise<Order[]>;
   abstract fetchOpenPositions(): Promise<Position[]>;
   abstract subscribeTicker(symbol: string): void;
   abstract unsubscribeTicker(symbol: string): void;
