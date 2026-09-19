@@ -1,0 +1,69 @@
+BotTrading database target update report
+Date: 2026-09-14
+Repository: /root/BotTrading
+
+Scope
+- Read-only database verification.
+- No migration was applied.
+- No database reset, deletion, or schema modification was performed.
+- No TESTNET order was created or modified.
+- LIVE remains disabled.
+
+A. Old PostgreSQL references
+- No active environment/configuration reference remains for 100.80.133.4.
+- Historical audit reports still mention 100.80.133.4:
+  - P0-DATABASE-RECOVERY-VERIFICATION-2026-09-13.txt
+  - CONTINUATION-AUDIT-2026-09-14.txt
+- Those files are historical evidence, not runtime configuration, and were left unchanged.
+
+B. New PostgreSQL target
+- Host: 192.168.18.77
+- Port: 5432
+- Database: bottrading
+- Schema option: public
+- Credentials: preserved and not printed
+
+C. Configuration files changed
+- apps/api/.env.paper
+- apps/api/.env.testnet
+- Only the PostgreSQL host was changed from 100.80.133.4 to 192.168.18.77.
+- Database name, credentials, port, and schema option were preserved.
+
+D. Sanitized connection result
+- New target probe: BLOCKED
+- TCP result: ECONNREFUSED 192.168.18.77:5432
+- Prisma authentication and database existence could not be tested because the TCP service rejected the connection.
+
+E. doctor:db
+- BLOCKED
+- The configured new PostgreSQL endpoint is not accepting connections from this runtime.
+
+F. Database existence
+- NOT DETERMINED.
+- No connection was established, so no database existence query was issued.
+
+G. Migration history status
+- NOT RUN.
+- The requested migration-status command was not run because doctor:db did not succeed.
+- No migration was applied.
+
+H. Table/schema status
+- NOT DETERMINED.
+- Read-only schema inspection requires a successful PostgreSQL connection.
+
+I. Whether old data appears present
+- NOT DETERMINED.
+- No read-only data query could run while the new server rejects TCP connections.
+
+J. Exact next action required
+1. Make PostgreSQL on 192.168.18.77:5432 reachable from this runtime.
+2. Confirm the server is listening on the expected interface and port and permits this runtime's source address.
+3. Re-run pnpm doctor:db.
+4. Only after doctor:db passes, run Prisma migrate status and read-only checks for migration history, tables, and existing data.
+5. Do not run prisma migrate deploy until the current database state is explicitly reviewed and approved.
+
+Safety result
+- No migration.
+- No database reset or deletion.
+- No TESTNET order.
+- No LIVE enablement.

@@ -1,0 +1,89 @@
+PostgreSQL server recovery diagnostic
+Date: 2026-09-14
+Repository: /root/BotTrading
+Scope: read-only diagnostics only
+
+DATABASE SERVER:
+PostgreSQL: 192.168.18.77:5432
+Listening: NOT VERIFIED SERVER-SIDE
+TCP 5432: REFUSED immediately from the BotTrading host
+Firewall: NOT VERIFIED SERVER-SIDE
+Database: bottrading (configured target; existence not verified)
+User: bottrading (configured user; password not printed)
+Authentication: NOT REACHED; TCP connection was refused before PostgreSQL authentication
+BotTrading schema: NOT VERIFIED
+Migration history: NOT VERIFIED; Prisma migration status was not run because doctor:db was blocked
+Overall status: BLOCKED
+
+1. Local reachability
+- The target address is syntactically valid and TCP port 22 is open.
+- TCP port 5432 returns ConnectionRefusedError / ECONNREFUSED.
+- This is an active refusal, not a timeout, DNS failure, routing failure, or PostgreSQL authentication failure.
+- The local route utility did not provide a route record in this restricted runtime, but the successful SSH TCP connection proves the target host is reachable.
+
+2. Repository database configuration
+- apps/api/.env.paper:
+  host=192.168.18.77
+  port=5432
+  database=bottrading
+  user=bottrading
+  options=schema=public
+- apps/api/.env.testnet:
+  host=192.168.18.77
+  port=5432
+  database=bottrading
+  user=bottrading
+  options=schema=public
+- Passwords and all other secrets were not printed.
+
+3. Repository doctor
+- pnpm doctor:db: BLOCKED
+- Exact result: ECONNREFUSED 192.168.18.77:5432
+
+4. SSH/server inspection
+- 192.168.18.77:22 is reachable.
+- Non-interactive root SSH authentication was rejected:
+  Permission denied (publickey,password).
+- No authorized SSH account was available in this runtime.
+- Therefore the following could not be inspected:
+  PostgreSQL service status, PostgreSQL version, listen_addresses, server-side port binding,
+  pg_hba.conf, firewall rules, or PostgreSQL logs.
+
+5. Database/schema/migration checks
+- No PostgreSQL session was established.
+- No database existence query was executed.
+- No table/schema query was executed.
+- No Prisma migration-status query was executed.
+- No migration, reset, deletion, or data modification was performed.
+
+CLASSIFICATION:
+H) Other — server-side cause is not provable from this runtime.
+
+The observed refusal narrows the likely causes to:
+- PostgreSQL service is down; or
+- PostgreSQL is listening only on localhost/another address; or
+- a server firewall is actively rejecting TCP/5432.
+
+It is not evidence of an authentication failure, missing database, missing schema,
+or missing migrations because PostgreSQL authentication was never reached.
+
+SAFEST NEXT ACTION:
+Have an authorized administrator on 192.168.18.77 run read-only checks:
+1. systemctl status postgresql (or the distribution's PostgreSQL service unit)
+2. pg_lsclusters, if applicable
+3. ss -lntp | grep 5432
+4. SHOW listen_addresses; and SHOW port; using a local administrative psql session
+5. Review pg_hba.conf for the BotTrading host/source network
+6. Review firewall status/rules for TCP/5432
+7. Review recent PostgreSQL startup/listen/error logs
+
+After the server accepts TCP/5432, rerun pnpm doctor:db. Only if that passes,
+run the requested read-only Prisma migration status and schema/data inspection.
+Do not run prisma migrate deploy until that inspection is reviewed.
+
+Safety result:
+- No migration
+- No database reset/drop/delete
+- No password changes
+- No TESTNET order
+- No LIVE enablement

@@ -1,0 +1,36 @@
+{
+  "name": "workspace",
+  "version": "0.0.0",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "testnet:preflight": "pnpm --dir scripts run testnet:preflight",
+    "live:preflight": "pnpm --dir scripts run live:preflight",
+    "credentials:testnet:create": "pnpm --dir apps/api run credentials:testnet:create",
+    "auth:password-reset": "pnpm --dir apps/api run auth:password-reset",
+    "auth:bootstrap-password": "pnpm --dir apps/api run auth:bootstrap-password",
+    "doctor": "pnpm --dir scripts run doctor",
+    "doctor:db": "pnpm --dir scripts run doctor:db",
+    "doctor:redis": "pnpm --dir scripts run doctor:redis",
+    "paper:smoke": "pnpm --dir scripts run paper:smoke",
+    "paper:preflight": "pnpm --dir scripts run paper:preflight",
+    "paper:restart-test": "pnpm --dir scripts run paper:restart-test",
+    "paper:reconnect-test": "pnpm --dir scripts run paper:reconnect-test",
+    "paper:failure-test": "pnpm --dir scripts run paper:failure-test",
+    "paper:offline": "pnpm --dir scripts run paper:offline",
+    "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
+    "build": "pnpm run typecheck && pnpm -r --if-present run build",
+    "typecheck:libs": "tsc --build",
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
+  },
+  "private": true,
+  "dependencies": {
+    "@replit/connectors-sdk": "^0.4.1"
+  },
+  "devDependencies": {
+    "prettier": "^3.9.4",
+    "typescript": "~5.9.3"
+  }
+}

@@ -1,0 +1,151 @@
+P0-CRITICAL DATABASE RECOVERY + VERIFICATION
+Repository: /root/BotTrading
+Date: 2026-09-13
+
+SCOPE
+No source code was modified during this recovery attempt.
+No database reset, drop, deletion, or destructive PostgreSQL operation was run.
+No new TESTNET order was created.
+No existing TESTNET order was canceled or modified.
+LIVE was not enabled.
+
+A. POSTGRESQL HEALTH BEFORE
+
+Command:
+  cd /root/BotTrading
+  pnpm doctor:db
+
+Result:
+  Environment: /root/BotTrading/apps/api/.env.paper
+  BLOCKED PostgreSQL TCP: 100.80.133.4:5432 is unreachable (timeout)
+  Summary: PASS=0 FAIL=0 BLOCKED=1
+
+The current blocker is network reachability/timeout from the Copilot runtime.
+The earlier shared-memory error could not be rechecked because the server did
+not accept a TCP connection.
+
+B. POSTGRESQL RECOVERY REQUIREMENT
+
+Administrative access to gentongmas-server is not available from this runtime.
+The operator must run the following on gentongmas-server as root:
+
+  pg_ctlcluster 15 main restart
+  pg_lsclusters
+
+  sudo -u postgres psql -d postgres \
+    -c "SELECT version();"
+
+  sudo -u postgres psql -d bottrading \
+    -c "SELECT current_database(), current_user, now();"
+
+No SSH attempt was made. No destructive PostgreSQL command is recommended.
+
+C. MIGRATION STATUS BEFORE
+
+Not available because PostgreSQL target 100.80.133.4:5432 timed out.
+
+Pending migration identified from repository:
+  20260913000000_durable_exchange_fills
+
+D. MIGRATION APPLIED
+
+None. Migration was not attempted because the target database was unreachable.
+
+E. MIGRATION STATUS AFTER
+
+Not verifiable until PostgreSQL is healthy.
+
+After recovery, run:
+
+  cd /root/BotTrading
+  pnpm doctor:db
+  pnpm doctor:redis
+  pnpm --dir packages/database exec prisma migrate status \
+    --schema=prisma/schema.prisma
+
+Apply only normal pending migrations:
+
+  pnpm --dir packages/database migrate:deploy
+
+Then verify:
+
+  pnpm doctor:db
+
+Never run prisma migrate reset, DROP DATABASE, DROP TABLE, or delete data.
+
+F. DATABASE-BACKED AUTH TESTS
+
+Not run. PostgreSQL was unreachable. Tests were not replaced with mocks.
+Required cases remain pending:
+- unauthenticated admin rejected
+- normal user cannot assign ADMIN
+- ownership enforced
+- JWT identity cannot be replaced by body/path/x-user-id
+
+G. DATABASE-BACKED FILL TESTS
+
+Not run because PostgreSQL was unreachable. Required cases remain pending:
+- authoritative fill persisted
+- exchangeTradeId uniqueness
+- duplicate REST/WebSocket idempotency
+- restart/replay idempotency
+- UNKNOWN never becomes FILLED
+
+H. DATABASE-BACKED CLOSE TESTS
+
+Not run because PostgreSQL was unreachable. Required cases remain pending:
+- close creates canonical exit order
+- unfilled exit keeps position open
+- authoritative fill closes position
+- client closingPrice ignored
+- over-close rejected
+
+I. EXISTING TESTNET ORDER STATE
+
+Provided existing state:
+  Exchange order: 367647
+  Local order: 62379419-e826-41c6-be55-2d32fe2f4e84
+
+The state was not inspected or modified because the target database and
+reconciliation runtime were unavailable. No new order was submitted.
+
+J. RECONCILIATION STATE
+
+Not verified. PostgreSQL was unreachable, and Redis was not checked during this
+recovery attempt.
+
+K. REGRESSION RESULTS
+
+Last recorded successful regression results before this recovery attempt:
+- packages/exchange Jest: 13 suites / 120 tests passed
+- packages/exchange typecheck: passed
+- packages/database build: passed
+- apps/api build: passed
+- scripts typecheck: passed
+
+These results do not substitute for the blocked PostgreSQL-backed tests.
+
+L. REMAINING CRITICAL BLOCKERS
+
+1. PostgreSQL 100.80.133.4:5432 is unreachable from the runtime.
+2. Durable-fill migration is not applied or verified against the target.
+3. Database-backed auth, fill, and close tests are pending.
+4. Existing TESTNET order state and reconciliation are pending.
+5. Exchange-native SL/TP remains unavailable and must stay fail-closed.
+
+M. REMAINING HIGH BLOCKERS
+
+1. Redis health is not verified in this recovery attempt.
+2. Exchange credential encryption/decryption remains unresolved from the
+   earlier audit.
+3. TESTNET runtime health cannot be established until database, Redis,
+   migration, and reconciliation checks pass.
+
+N. EXACT TESTNET READINESS
+
+BLOCKED / NOT READY TO CLAIM.
+No new order was created. Existing order was not modified.
+
+O. EXACT LIVE READINESS
+
+LIVE DISABLED. LIVE was not enabled.

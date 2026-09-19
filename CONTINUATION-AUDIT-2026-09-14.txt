@@ -1,0 +1,56 @@
+BotTrading continuation audit
+Date: 2026-09-14
+Repository: /root/BotTrading
+
+Scope: read-only audit and stabilization checkpoint. No new orders, no live enablement, no database write/reset, no source-code changes.
+
+1) Database health
+- pnpm doctor:db -> BLOCKED
+- PostgreSQL target configured in apps/api/.env.paper is 100.80.133.4:5432
+- Runtime probe: timeout / unreachable
+- Result: PostgreSQL is not reachable from this execution environment
+
+2) Redis health
+- pnpm doctor:redis -> PASS
+- Redis TCP 127.0.0.1:6379 is reachable
+
+3) Regression status
+- packages/exchange regression: PASS
+- 15 test suites passed, 134 tests passed
+
+4) API integration / DB-backed proof status
+- apps/api full test suite currently fails because Prisma cannot reach PostgreSQL at 100.80.133.4:5432
+- Error pattern: PrismaClientInitializationError / Can't reach database server at 100.80.133.4:5432
+- Root cause is environmental connectivity to the configured PostgreSQL target, not a code-level regression in the exchange package
+
+5) Docker status
+- Docker/Podman unavailable in this runtime
+- Docker validation is blocked
+
+6) Readiness verdict
+- TESTNET readiness: NOT READY
+- LIVE readiness: NOT READY
+- PAPER status: operationally safe only as a non-trading environment with DB dependency unresolved
+
+7) Remaining blockers before first new TESTNET order
+- A reachable PostgreSQL server must be available at the configured DATABASE_URL target
+- The DATABASE_URL host/port/credentials must be validated and reachable from this runtime
+- Postgres migration status must be clean and Prisma must authenticate successfully
+- Real DB-backed integration tests must pass on the actual server
+- Docker-capable environment needed if image validation is required
+
+8) Remaining blockers before LIVE
+- PostgreSQL connectivity + migration proof
+- credential separation and key management validation
+- all DB-backed auth/fill/close integration tests passing
+- environment and deployment validation under a Docker-capable runtime
+- final production gating and manual operational sign-off
+
+9) Security / safety posture
+- No new orders created
+- No LIVE trading enabled
+- No destructive database operations performed
+- No code changes were made in this pass
+
+10) Conclusion
+The repository is currently in a hardened but not operationally ready state. The dominant blocker is external: the configured PostgreSQL target is unreachable, so all DB-backed proof and production gating remain blocked.

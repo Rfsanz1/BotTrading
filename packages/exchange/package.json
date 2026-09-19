@@ -1,0 +1,40 @@
+{
+  "name": "@rfsanz/exchange",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./src/*": {
+      "types": "./dist/*",
+      "require": "./dist/*",
+      "default": "./dist/*"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.10.0",
+    "axios": "^1.4.0",
+    "eventemitter3": "^5.0.0",
+    "ws": "^8.13.0",
+    "@rfsanz/database": "workspace:*"
+  },
+  "devDependencies": {
+    "@nestjs/common": "^10.4.19",
+    "@nestjs/testing": "^10.4.19",
+    "@types/jest": "^29.5.14",
+    "@types/node": "^20.0.0",
+    "@types/ws": "^8.5.4",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.4.12",
+    "typescript": "~5.9.3"
+  }
+}

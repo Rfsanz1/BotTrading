@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pnpm
+        run: npm install -g pnpm
+      - name: Install
+        run: pnpm install --frozen-lockfile
+      - name: Lint & Typecheck
+        run: pnpm -w -s run typecheck
+      - name: Build packages
+        run: pnpm -w -s run build
+      - name: Run tests
+        run: |
+          pnpm --dir packages/exchange exec jest --runInBand
+          pnpm --dir apps/api run test:security
+      - name: Docker build (api)
+        run: |
+          docker build -t rfsanz/api:latest -f Dockerfile .
+          echo "Built api image"

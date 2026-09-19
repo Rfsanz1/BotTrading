@@ -1,0 +1,14 @@
+{
+  "timestamp": "2026-09-19T14:22:06.501Z",
+  "node": true,
+  "pnpm": true,
+  "postgres": true,
+  "redis": true,
+  "prisma": true,
+  "paperConfig": false,
+  "environmentReady": false,
+  "blockingReasons": [
+    "PAPER configuration: TRADING_MODE must be PAPER and LIVE_TRADING_ENABLED must be false",
+    "API port: 127.0.0.1:3001 is already occupied"
+  ]
+}

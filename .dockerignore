@@ -1,0 +1,15 @@
+.git
+.github
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+**/.env
+**/.env.*
+!.env.example
+!apps/api/.env.example
+!apps/api/.env.paper.example
+dump.rdb
+trading-bot
+coverage
+*.log

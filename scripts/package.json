@@ -1,0 +1,29 @@
+{
+  "name": "@workspace/scripts",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "hello": "tsx ./src/hello.ts",
+    "doctor": "node --experimental-strip-types ./src/doctor.ts",
+    "doctor:db": "node --experimental-strip-types ./src/doctor.ts db",
+    "doctor:redis": "node --experimental-strip-types ./src/doctor.ts redis",
+    "paper:smoke": "node --experimental-strip-types ./src/paper-smoke.ts",
+    "paper:preflight": "node --experimental-strip-types ./src/paper-preflight.ts",
+    "paper:restart-test": "node --experimental-strip-types ./src/paper-restart-test.ts",
+    "paper:reconnect-test": "node --experimental-strip-types ./src/paper-reconnect-test.ts",
+    "paper:failure-test": "node --experimental-strip-types ./src/paper-failure-test.ts",
+    "paper:offline": "node --experimental-strip-types ./src/local-offline-paper.ts",
+    "testnet:preflight": "node --experimental-strip-types ./src/testnet-preflight.ts",
+    "live:preflight": "node --experimental-strip-types ./src/live-preflight.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "catalog:",
+    "tsx": "catalog:"
+  },
+  "dependencies": {
+    "@rfsanz/database": "workspace:*",
+    "@rfsanz/exchange": "workspace:*"
+  }
+}

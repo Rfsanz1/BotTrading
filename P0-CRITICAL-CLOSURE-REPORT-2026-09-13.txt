@@ -1,0 +1,144 @@
+P0 CRITICAL CLOSURE REPORT
+Repository: /root/BotTrading
+Date: 2026-09-13
+
+A. C-01 VERIFICATION
+The active NestJS runtime had controller endpoints without authentication,
+including users, notifications, recommendations, alerts, and other modules.
+UsersController role mutation had no authentication or administrator boundary.
+
+B. C-01 FIX
+A global JwtAuthGuard is now registered through APP_GUARD. Only explicitly
+decorated public routes (auth register/login/refresh and health liveness) skip
+authentication. Admin role mutation and user listing require AdminGuard, which
+checks the active user's ADMIN role in PostgreSQL. User lookup is ownership
+restricted unless the verified token identifies an administrator.
+
+C. C-02 VERIFICATION
+ExchangeEventRouter previously kept order, fill, account, and position state
+in memory only. Binance execution reports also discarded trade/fill identity.
+
+D. C-02 FIX
+Trade now has exchange, exchangeAccountId, executionKey, exchangeTimestamp, and
+localEventTimestamp fields. A migration was added. Router callbacks now feed
+TradingService.persistExchangeEvent(). Binance TRADE reports preserve trade ID,
+last fill quantity, cumulative quantity, execution price, commission, and
+timestamps. Fill persistence uses a database transaction and a unique execution
+key. Duplicate websocket/REST/retry events are no-ops. Unknown or unverifiable
+fills are rejected and do not create local FILLED state. clientOrderId is
+persisted before submission to prevent a fast-fill race.
+
+E. C-03 VERIFICATION
+The previous closePosition path only updated Position locally. Exit-level
+updates also changed local SL/TP fields without an exchange order.
+
+F. C-03 FIX
+The controller now creates a canonical CLOSE order and submits it through the
+existing readiness, risk, authorization, execution, order-service, and
+exchange-adapter path. Position closure is driven only by authoritative fill
+processing; client closingPrice is no longer accepted as truth. Direct local
+PositionService closure is disabled. SL/TP updates fail closed because the
+active adapter does not implement exchange-native protection amendment; local
+fields are not changed or falsely reported as protected.
+
+G. CANONICAL FILL FLOW
+Binance user-data event -> adapter normalization -> ExchangeEventRouter ->
+TradingService.persistExchangeEvent -> PostgreSQL transaction:
+Trade/fill insert -> Order cumulative fill/status -> Position quantity/P&L ->
+commit. The executionKey unique constraint provides idempotency.
+
+H. CANONICAL CLOSE FLOW
+Authenticated owner -> TradingService.requestPositionClose -> CLOSE Order
+created with opposite side and bounded current position quantity ->
+submitToExchange -> readiness/mode gate -> RiskEngine -> authorization ->
+OrderService -> ExchangeAdapter. The position remains open/pending until an
+authoritative exchange fill is persisted.
+
+I. SL/TP EXCHANGE FLOW
+Not available in the active Binance adapter. The endpoint now fails closed and
+does not modify local SL/TP. No claim of exchange protection is made.
+
+J. OWNERSHIP/RBAC MODEL
+JWT subject is the only request identity. x-user-id and body/path identity are
+not trusted. Trading routes use owner checks. Admin routes require verified
+JWT identity plus ADMIN role read from PostgreSQL. Normal users cannot assign
+ADMIN or access another user's resources.
+
+K. ADVERSARIAL TESTS
+Existing exchange adversarial/recovery/authorization suites were retained.
+Binance user-data tests now verify TRADE reports become durable-fill-shaped
+events with exchange trade identity and deduplication. Database-backed API
+adversarial integration tests were not runnable because no test PostgreSQL
+service was provisioned in this session.
+
+L. REGRESSION RESULTS
+packages/exchange Jest: 13 suites, 120 tests passed.
+packages/exchange typecheck: passed.
+packages/database build: passed.
+apps/api build: passed.
+scripts typecheck: passed.
+
+M. REMAINING CRITICAL BLOCKERS
+1. Database migration must be deployed before runtime startup.
+2. No production proof exists until PostgreSQL-backed fill and API integration
+   tests execute.
+3. Exchange-native SL/TP support is still absent; protection requests fail
+   closed by design.
+
+N. REMAINING HIGH BLOCKERS
+Credential decryption/encryption implementation remains unresolved in the
+existing codebase. Other previously audited issues outside this P0 scope,
+including mock AI providers, legacy/runtime inconsistencies, and deployment
+hardening, remain.
+
+O. EXACT STATUS
+PAPER: not enabled by this remediation.
+TESTNET: configured in the inspected environment; no new order was submitted.
+LIVE: disabled (LIVE_TRADING_ENABLED=false) and not enabled.
+
+This closure does not claim TESTNET or LIVE readiness.
+
+FINAL VERIFICATION UPDATE - 2026-09-13 10:50 UTC
+
+Database migration status before/after:
+Prisma migration status could not be read or changed. The configured target
+PostgreSQL host was reachable on TCP, but PostgreSQL returned:
+"could not open shared memory segment /PostgreSQL...". No migration was
+applied, no reset was attempted, and no data or tables were dropped.
+
+The pending migration is:
+20260913000000_durable_exchange_fills/migration.sql
+It adds Trade.exchange, Trade.exchangeAccountId, Trade.executionKey,
+Trade.exchangeTimestamp, Trade.localEventTimestamp, and a unique index on
+Trade.executionKey. Prisma schema validation passed locally. Target database
+schema/constraint verification remains blocked until PostgreSQL is healthy.
+
+Database-backed integration tests:
+Not run and not faked. PostgreSQL rejected Prisma startup before tests could
+execute. No test was pointed at the production/testnet database for writes.
+
+Testnet existing-state inspection:
+The preflight confirmed TESTNET mode, LIVE_TRADING_ENABLED=false, the Binance
+TESTNET endpoint, and TCP reachability of PostgreSQL. It stopped before any
+exchange account/state inspection because local Redis at 127.0.0.1:6379 was
+unreachable. No order was submitted, canceled, or modified.
+
+Execution bypass audit:
+The only TypeScript production submission call is OrderService.place(), reached
+from TradingService.submitToExchange(). Direct Binance HTTP POST/DELETE calls
+are confined to the Binance adapter called by OrderService. The legacy Python
+MEXC/Binance execution functions call _reject_legacy_execution() before any
+order operation and remain fail-closed.
+
+Required regression tests were rerun:
+Exchange Jest 13 suites / 120 tests passed; exchange typecheck, database build,
+API build, and scripts typecheck passed. Prisma schema validation passed when
+the configured environment was loaded. Prisma migration status/application,
+schema introspection against target, and PostgreSQL-backed auth/fill/close
+tests remain BLOCKED by the unhealthy PostgreSQL server.
+
+Final exact status:
+PAPER: not enabled.
+TESTNET: no new order; not ready to claim because database migration and
+reconciliation verification are blocked, and Redis preflight is unavailable.
+LIVE: disabled and not enabled.

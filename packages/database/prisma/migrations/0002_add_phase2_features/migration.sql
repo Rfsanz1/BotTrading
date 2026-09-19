@@ -1,0 +1,2 @@
+-- The current schema is installed by 0001_init.
+-- Retained as a no-op for repositories created with the earlier migration layout.

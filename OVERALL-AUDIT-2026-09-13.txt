@@ -1,0 +1,1132 @@
+# Laporan Audit Read-Only `/root/BotTrading`
+
+**Tanggal audit:** 2026-09-13  
+**Metode:** inspeksi kode aktual, konfigurasi, manifest, Docker/CI, schema Prisma, test, dan artefak readiness. Tidak ada file yang diubah atau commit dibuat.
+
+## Kesimpulan eksekutif
+
+Repository **belum siap untuk paper/testnet/live trading tanpa perbaikan besar**.
+
+Temuan paling serius:
+
+1. **CRITICAL — Endpoint administrasi/RBAC NestJS tidak dilindungi autentikasi.** Siapa pun dapat mengubah role user menjadi `ADMIN`.
+2. **CRITICAL — Event fill/order dari exchange hanya disimpan di memory, tidak dipersist ke PostgreSQL.** Saldo, trade, position, dan P&L lokal dapat tertinggal dari exchange setelah order benar-benar terisi.
+3. **CRITICAL — Endpoint close position dan update SL/TP hanya mengubah database lokal, tidak mengirim order exit/proteksi ke exchange.**
+4. **HIGH — AI provider NestJS seluruhnya mock/hardcoded, tetapi dianggap selalu tersedia.**
+5. **HIGH — Risk engine salah memvalidasi SELL/short; semua entry SELL non-exit berpotensi ditolak.**
+6. **HIGH — Webhook alert unauthenticated memakai `userId = "system"` yang tidak memenuhi foreign key User UUID; alur webhook aktif kemungkinan gagal di database.**
+7. **HIGH — Docker dan healthcheck deployment kontradiktif/tidak dapat dipercaya.**
+8. **HIGH — Penyimpanan credential exchange belum aman dan implementasi dekripsi belum ada.**
+9. **HIGH — Event handler memakai nama event berbeda dari event yang benar-benar di-emit, sehingga callback tracking tidak pernah berjalan.**
+10. **HIGH — Test/CI tidak menjadi gate: test gagal karena dependency, test command di-ignore dengan `|| true`, dan root typecheck gagal.**
+
+---
+
+# 1. Struktur proyek dan entrypoint
+
+## Observasi
+
+Repository memiliki beberapa runtime yang tidak sepenuhnya konsisten:
+
+- **NestJS API canonical:** `apps/api/src/main.ts`
+- **Python trading bot lama:** `trading-bot/main.py`
+- **Exchange package:** `packages/exchange`
+- **AI package:** `packages/ai`
+- **Telegram app:** `apps/telegram`
+- **Web/admin:** `apps/web`, `apps/admin`, hampir kosong
+- **Legacy exchange implementation:** `lib/exchanges`
+- Beberapa Dockerfile dan compose menggunakan runtime berbeda.
+
+Working tree juga **sangat kotor**:
+
+- Banyak file modified.
+- Banyak file untracked, termasuk:
+  - `apps/api/.env.paper`
+  - `apps/api/.env.testnet`
+  - `dump.rdb`
+  - `apps/api/dump.rdb`
+  - laporan readiness/audit
+  - source dan test baru
+
+Artinya audit ini merefleksikan **working tree saat ini**, bukan hanya commit `HEAD`. Sebelum deployment, semua perubahan harus direview dan dipisahkan dari artefak lokal.
+
+---
+
+# 2. Temuan CRITICAL
+
+## C-01 — RBAC/admin API tidak memiliki authentication guard
+
+**Severity:** CRITICAL  
+**File:**
+
+- `apps/api/src/modules/users/users.controller.ts:6-17`
+- `apps/api/src/modules/users/users.service.ts:16-31`
+
+Controller user tidak memakai `@UseGuards(JwtAuthGuard)` atau guard role.
+
+```ts
+@Post(':id/roles')
+async setRoles(@Param('id') id: string, @Body() body: RolesDto) {
+  return this.svc.setRoles(id, body.roles);
+}
+```
+
+Service menerima role apa pun yang valid dari enum, termasuk `ADMIN`.
+
+### Dampak
+
+Unauthenticated attacker dapat:
+
+- Melihat daftar seluruh user melalui `GET /users`.
+- Mengambil user berdasarkan ID.
+- Menetapkan role `ADMIN` ke akun mana pun.
+- Mengubah model otorisasi sistem secara langsung.
+
+### Rekomendasi
+
+- Terapkan global authentication guard.
+- Tambahkan `RolesGuard`/permission guard.
+- Batasi `POST /users/:id/roles` hanya untuk admin terotorisasi.
+- Jangan menerima `userId` arbitrary dari body/path tanpa validasi ownership.
+
+---
+
+## C-02 — Exchange user-data event tidak dipersist ke database
+
+**Severity:** CRITICAL  
+**File:**
+
+- `apps/api/src/modules/trading/trading.service.ts:40-62`
+- `apps/api/src/modules/trading/trading-lifecycle.service.ts:83-97`
+- `packages/exchange/src/services/exchange-event-router.ts:128-186`
+
+`TradingService.wireExchangeAdapter()` hanya memanggil:
+
+```ts
+this.exchangeRouter.handle(payload);
+```
+
+`ExchangeEventRouter` menyimpan order, fill, account, dan position di `Map` memory-only:
+
+```ts
+private readonly orders = new Map<string, OrderRecord>();
+private readonly accounts = new Map<string, Record<string, any>>();
+private readonly positions = new Map<string, Record<string, any>>();
+```
+
+Tidak ada operasi Prisma pada pemrosesan event fill/order tersebut.
+
+### Dampak
+
+Setelah order Binance terisi:
+
+- `Order.filled` dapat tetap `0`.
+- `Trade` tidak tercatat.
+- `Position` tidak dibuat/di-update.
+- P&L lokal tidak akurat.
+- Restart process menghilangkan state event router.
+- Sistem dapat mengira posisi masih open/canceled padahal exchange sudah filled.
+
+Ini sangat berbahaya untuk live trading dan reconciliation.
+
+### Rekomendasi
+
+- Satu canonical event consumer harus memetakan exchange event ke order internal berdasarkan `clientOrderId`/`externalOrderId`.
+- Persist event secara idempotent ke PostgreSQL.
+- Gunakan unique key pada `(exchange, accountId, exchangeOrderId, exchangeTradeId)`.
+- Semua fill harus melewati transaction:
+  1. insert trade,
+  2. update order cumulative fill/status,
+  3. update position,
+  4. audit event.
+- Event router tidak boleh hanya bergantung pada memory.
+
+---
+
+## C-03 — Close position dan update SL/TP hanya mengubah database lokal
+
+**Severity:** CRITICAL  
+**File:**
+
+- `apps/api/src/modules/trading/trading.controller.ts:441-500`
+- `apps/api/src/modules/trading/trading.service.ts:1442-1483`
+- `packages/exchange/src/services/position.service.ts:242-285`
+
+`closePosition()` memanggil:
+
+```ts
+this.tradingService.positionService.closePosition(...)
+```
+
+Implementasinya hanya mengubah `Position.status = CLOSED` dan mencatat `realizedPnL`. Tidak ada `orderService.place()`, `cancel()`, atau market exit order ke exchange.
+
+Demikian juga update SL/TP hanya:
+
+```ts
+prisma.position.update(...)
+```
+
+### Dampak
+
+API dapat mengembalikan “Position closed successfully”, tetapi posisi riil masih terbuka di exchange.
+
+SL/TP yang diperbarui di database tidak menjadi stop order di exchange. Jika aplikasi mati, tidak ada proteksi aktif.
+
+### Rekomendasi
+
+- Close endpoint harus membuat dan mengirim order exit canonical.
+- Posisi hanya boleh berstatus `CLOSED` setelah exchange mengonfirmasi fill.
+- Update SL/TP harus melakukan amend/cancel-replace order proteksi di exchange.
+- Bedakan status lokal:
+  - `CLOSE_REQUESTED`
+  - `EXIT_SUBMITTED`
+  - `EXIT_FILLED`
+  - `CLOSED`
+- Jangan menerima `closingPrice` dari client sebagai sumber kebenaran; ambil execution price dari exchange.
+
+---
+
+# 3. Temuan HIGH — trading dan risk
+
+## H-01 — Risk engine salah memvalidasi SELL
+
+**Severity:** HIGH  
+**File:** `packages/exchange/src/services/risk-engine.ts:436-440`
+
+```ts
+if (!isExit && input.trade.takeProfit <= input.trade.entry && input.trade.action !== 'HOLD') {
+  fail('TAKE_PROFIT_VALIDATION', ...)
+}
+```
+
+Untuk SELL yang valid:
+
+- entry = 100
+- stop loss = 105
+- take profit = 90
+
+`takeProfit <= entry` selalu benar, sehingga SELL entry ditolak.
+
+### Dampak
+
+- Semua short/SELL entry non-exit berpotensi gagal risk check.
+- Sistem menjadi hanya long-biased tanpa dokumentasi eksplisit.
+- Hasil AI SELL tidak dapat dieksekusi secara konsisten.
+
+### Rekomendasi
+
+Validasi berdasarkan arah:
+
+- BUY: `stopLoss < entry < takeProfit`
+- SELL: `takeProfit < entry < stopLoss`
+- EXIT/REDUCE/CLOSE memakai validasi berbeda.
+
+Tambahkan test eksplisit untuk BUY, SELL, REDUCE, CLOSE, dan REVERSAL.
+
+---
+
+## H-02 — P&L posisi short salah dan partial close tidak mencatat realized P&L
+
+**Severity:** HIGH  
+**File:** `apps/api/src/modules/trading/trading.service.ts:805-826`
+
+Saat posisi berlawanan ditutup:
+
+```ts
+realizedPnL: (price - position.entryPrice) * quantity
+```
+
+Formula ini hanya benar untuk posisi BUY. Untuk posisi SELL, seharusnya:
+
+```ts
+(position.entryPrice - price) * quantity
+```
+
+Pada partial close, quantity dikurangi tetapi tidak ada realized P&L yang dicatat.
+
+### Dampak
+
+- P&L short dapat terbalik.
+- Statistik win/loss salah.
+- Risk limit berdasarkan P&L dapat salah.
+- Partial exits kehilangan hasil finansial.
+
+### Rekomendasi
+
+Gunakan helper P&L directional yang sama untuk seluruh jalur. Catat realized P&L setiap partial fill dan akumulasikan secara atomik.
+
+---
+
+## H-03 — Daily loss limit memakai P&L total, bukan P&L harian
+
+**Severity:** HIGH  
+**File:**
+
+- `apps/api/src/modules/trading/trading.service.ts:300-320`
+- `packages/exchange/src/services/pnl-calculation.service.ts:45-75`
+
+`calculatePnLMetrics()` mengambil seluruh posisi user tanpa filter tanggal. Nilai `realizedPnL` tersebut dipakai sebagai `dailyMetrics.realizedPnL`.
+
+### Dampak
+
+- Loss historis dapat dianggap sebagai loss hari ini.
+- Atau loss hari ini tidak terukur dengan benar jika posisi/event belum dipersist.
+- Kill switch dan daily loss limit tidak dapat dipercaya.
+
+### Rekomendasi
+
+Implementasikan query harian berbasis `closedAt`/trade timestamp, timezone eksplisit, dan termasuk unrealized loss sesuai kebijakan risk.
+
+---
+
+## H-04 — Duplicate fill dapat menggandakan quantity trade
+
+**Severity:** HIGH  
+**File:** `apps/api/src/modules/trading/trading.service.ts:620-658`
+
+Jika `fillQuantity <= 0`, kode mengambil trade pertama lalu mengubah:
+
+```ts
+quantity: newFilled
+```
+
+Jika order sebelumnya mempunyai beberapa partial fills, `newFilled` adalah cumulative quantity, bukan quantity delta. Mengubah satu trade lama menjadi cumulative value dapat menggandakan total quantity.
+
+### Dampak
+
+- P&L dan position quantity membengkak.
+- Duplicate atau replay event dapat merusak accounting.
+- Reconciliation menjadi tidak deterministik.
+
+### Rekomendasi
+
+- Simpan setiap exchange trade/fill dengan `exchangeTradeId` unik.
+- Duplicate event harus menjadi no-op.
+- Jangan memperbarui quantity fill lama menjadi cumulative quantity.
+- Gunakan cumulative fill hanya untuk update `Order.filled`.
+
+---
+
+## H-05 — Event handler tidak pernah menerima event yang di-emit
+
+**Severity:** HIGH  
+**File:**
+
+- Emit: `apps/api/src/modules/trading/trading.service.ts:167,538,695,840`
+- Listener: `apps/api/src/modules/trading/event-handlers.ts:16,25,34,45,54,74`
+
+Service meng-emit:
+
+- `trading.order.validation_started`
+- `trading.order.submitted_to_exchange`
+- `trading.trade.recorded`
+- `trading.position.updated`
+
+Tetapi handler mendengarkan:
+
+- `order.validation.started`
+- `order.submitted.to.exchange`
+- `trade.recorded`
+- `position.updated`
+
+Prefix `trading.` dan format nama berbeda.
+
+Selain mismatch, handler masih berisi TODO.
+
+### Dampak
+
+- Tracking order tidak berjalan.
+- Callback position/notification/error tidak berjalan.
+- Dokumentasi “event-driven architecture” tidak sesuai runtime.
+
+### Rekomendasi
+
+- Gunakan konstanta event tunggal dari domain event classes.
+- Tambahkan integration test yang memverifikasi setiap emit memiliki listener aktif.
+- Jangan memakai string event yang ditulis manual di banyak tempat.
+
+---
+
+## H-06 — Credential exchange belum memiliki implementasi dekripsi
+
+**Severity:** HIGH  
+**File:**
+
+- `packages/database/prisma/schema.prisma:186-198`
+- `apps/api/src/modules/trading/trading.service.ts:430-445`
+- `apps/api/src/modules/trading/trading.service.ts:723-733`
+
+Kode menggunakan:
+
+```ts
+apiKey: apiKey.keyHash
+apiSecret: apiKey.secretEncrypted
+```
+
+Komentarnya sendiri menyatakan:
+
+```ts
+// TODO: In production, decrypt the actual key
+```
+
+### Dampak
+
+- Jika `keyHash` benar-benar hash, API key tidak dapat dipakai untuk request Binance.
+- Jika field berisi plaintext, credential sebenarnya tidak hashed/encrypted.
+- Secret dapat tersebar ke memory, log, dump, atau crash report.
+
+### Rekomendasi
+
+- Simpan API key identifier secara terpisah dari secret.
+- Enkripsi secret dengan KMS/envelope encryption.
+- Implementasikan decrypt hanya di boundary exchange.
+- Validasi permission: read-only vs trade/withdraw.
+- Rotasi/revoke credential dan audit setiap penggunaan.
+
+---
+
+## H-07 — Adapter Bybit/MEXC/OKX/MT5 adalah stub yang mengembalikan hasil palsu
+
+**Severity:** HIGH  
+**File:**
+
+- `packages/exchange/src/adapters/bybit.adapter.ts:7-15`
+- `packages/exchange/src/adapters/mexc.adapter.ts`
+- `packages/exchange/src/adapters/okx.adapter.ts:7-15`
+- `packages/exchange/src/adapters/mt5.adapter.ts`
+
+Contoh:
+
+```ts
+async placeOrder(...) {
+  return { id: `ord-${Date.now()}`, status: 'NEW' } as Order;
+}
+async getOrder(...) { return null; }
+async fetchBalances() { return []; }
+```
+
+### Dampak
+
+Pemanggil dapat menerima “order berhasil” tanpa order exchange sungguhan. Reconciliation dan balance sync juga tidak merepresentasikan account riil.
+
+### Rekomendasi
+
+- Hapus adapter dari production factory sampai benar-benar terimplementasi.
+- Atau fail-closed dengan `NotSupportedError`, bukan fake success.
+- Tambahkan contract test terhadap sandbox/testnet setiap exchange.
+
+---
+
+## H-08 — AI provider API aktif tetapi seluruhnya hardcoded/mock
+
+**Severity:** HIGH  
+**File:** `apps/api/src/modules/analysis/providers/ai-providers.ts:22-230`
+
+`isAvailable()` selalu `true`, sementara provider mengembalikan fixed output:
+
+- OpenAI: BUY
+- Claude: HOLD
+- Gemini: BUY
+- Groq: SELL
+- DeepSeek: BUY
+- Ollama: HOLD
+
+Contoh:
+
+```ts
+// TODO: Implement actual OpenAI API call
+const mockAnalysis = this.getMockAnalysis(symbol);
+```
+
+### Dampak
+
+- AI analysis tidak memakai market data aktual.
+- Consensus dapat menghasilkan rekomendasi palsu.
+- Provider statistics tidak mencerminkan kualitas model.
+- Sangat berbahaya bila recommendation approval kelak terhubung ke execution.
+
+### Rekomendasi
+
+- Provider harus unavailable bila credential/API tidak tersedia.
+- Validasi response terstruktur.
+- Fail closed ke HOLD jika provider tidak tersedia.
+- Jangan klaim AI readiness hanya karena mock provider terdaftar.
+
+---
+
+## H-09 — Webhook alert aktif tanpa auth dan memakai foreign key invalid
+
+**Severity:** HIGH  
+**File:**
+
+- `apps/api/src/modules/alerts/alerts.controller.ts:14-26`
+- `apps/api/src/modules/alerts/services/alert.service.ts:44-52`
+- `packages/database/prisma/schema.prisma:448-451`
+
+Controller menyatakan “No authentication required”. Jika tidak ada user:
+
+```ts
+const userId = req.user?.id || 'system';
+```
+
+Namun `Alert.userId` adalah required relation ke `User`, dengan ID UUID. `"system"` bukan UUID/user valid.
+
+### Dampak
+
+- Webhook unauthenticated dapat gagal saat insert Prisma.
+- Jika dibuat user dummy, semua alert publik dapat masuk ke satu akun.
+- Tidak ada HMAC/signature/rate-limit khusus webhook.
+- Webhook dapat menjadi DoS atau spam pipeline AI.
+
+### Rekomendasi
+
+- Gunakan secret/HMAC per webhook account.
+- Map webhook credential ke user/account sebelum insert.
+- Jangan gunakan sentinel `"system"` untuk foreign key required.
+- Tambahkan idempotency key dan replay protection.
+
+---
+
+## H-10 — Entry point Python legacy bertentangan dengan dokumentasi dan canonical gate
+
+**Severity:** HIGH  
+**File:** `trading-bot/main.py:1-15,148-154,5676-5680`
+
+Header menyatakan mode LIVE dan Binance market order, tetapi file juga menyatakan runtime tersebut legacy/not authorized. Semua fungsi eksekusi memanggil:
+
+```python
+_reject_legacy_execution(...)
+```
+
+### Dampak
+
+- Deployment Python yang mengikuti dokumentasi tampak live, tetapi order selalu ditolak.
+- Jika guard dihapus/diubah untuk “mengaktifkan” bot, jalur direct Binance/OCO akan bypass canonical NestJS risk/authorization/reconciliation.
+- Dua execution architecture meningkatkan risiko konfigurasi salah.
+
+### Rekomendasi
+
+- Hapus runtime legacy dari deployment aktif.
+- Atau migrasikan seluruh signal/execution ke API canonical.
+- Pisahkan package legacy dari production image.
+- Tambahkan startup fatal error jika Python runtime dijalankan dengan `LIVE_MODE=true`.
+
+---
+
+# 4. Temuan HIGH — API/auth/security
+
+## H-11 — Global API tidak memakai authentication guard
+
+**Severity:** HIGH/CRITICAL tergantung exposure  
+**File:** `apps/api/src/app.module.ts`, seluruh controller non-trading
+
+`JwtAuthGuard` hanya dipasang pada:
+
+```ts
+@Controller('api/trading')
+@UseGuards(JwtAuthGuard)
+```
+
+Controller berikut tidak guarded:
+
+- `users`
+- `alerts`
+- `analysis`
+- `consensus`
+- `recommendations`
+- `notifications`
+- `audit`
+- `research`
+- `market-intelligence`
+- `tradingview`
+
+Contoh dampak langsung:
+
+- `POST /recommendations/:id/approve`
+- `POST /recommendations/:id/reject`
+- `POST /notifications/send`
+- `POST /audit/log`
+- `GET /audit/user/:userId`
+- `GET /notifications/user/:userId`
+- `POST /alerts/:id/status`
+
+### Rekomendasi
+
+Pasang global guard dan explicit public decorator hanya untuk:
+
+- login/register
+- health liveness
+- webhook yang diverifikasi signature
+
+Tambahkan ownership check berbasis `req.user.id`, bukan `userId` dari request.
+
+---
+
+## H-12 — Refresh token kemungkinan tidak pernah terbaca
+
+**Severity:** HIGH  
+**File:**
+
+- `apps/api/src/modules/auth/auth.controller.ts:23-31`
+- `apps/api/package.json`
+
+Kode membaca:
+
+```ts
+req.cookies?.refresh_token
+```
+
+Tetapi tidak ada dependency/middleware `cookie-parser` yang dipasang. `res.cookie()` dapat mengirim cookie, tetapi `req.cookies` tidak otomatis tersedia di Express tanpa parser.
+
+Selain itu cookie tidak memakai:
+
+- `secure: true` di production
+- `maxAge`
+- `domain/path` eksplisit
+- rotation/revocation
+
+### Dampak
+
+- Refresh flow dapat selalu mengembalikan `missing refresh`.
+- Token refresh 7 hari tidak dapat dicabut.
+- Risiko session replay meningkat.
+
+### Rekomendasi
+
+- Tambahkan cookie parser atau gunakan signed cookie middleware.
+- Implement refresh-token rotation dan revocation store.
+- Atur `secure`, `httpOnly`, `sameSite`, `path`, dan expiry.
+
+---
+
+## H-13 — CORS default membuka semua origin
+
+**Severity:** HIGH  
+**File:** `apps/api/src/main.ts:18-21`
+
+```ts
+app.enableCors({ origin: process.env.CORS_ORIGIN || true });
+```
+
+Jika `CORS_ORIGIN` kosong, origin menjadi `true`, yaitu mode permissive.
+
+### Dampak
+
+- Browser client dari origin mana pun dapat memanggil API.
+- Memperbesar dampak jika ada token/cookie atau endpoint publik yang lemah.
+
+### Rekomendasi
+
+- Fail startup jika production tidak memiliki allowlist.
+- Gunakan array origin eksplisit.
+- Jangan pakai `true` sebagai fallback production.
+
+---
+
+# 5. Temuan HIGH — deployment/operasional
+
+## H-14 — Dockerfile dan compose memakai runtime berbeda
+
+**Severity:** HIGH  
+**File:**
+
+- `Dockerfile:1-11`
+- `docker-compose.yml:17-27`
+- `apps/api/Dockerfile:1-8`
+- `docker-compose.prod.yml:28-45`
+
+Root `Dockerfile` adalah Python:
+
+```dockerfile
+FROM python:3.12-slim
+COPY trading-bot/ ...
+CMD ["python3", "main.py"]
+```
+
+Namun `docker-compose.yml` menyebut service tersebut `api` dan mengisi konfigurasi PostgreSQL/Redis untuk API NestJS.
+
+`apps/api/Dockerfile` menggunakan:
+
+```dockerfile
+COPY package.json pnpm-lock.yaml ./
+```
+
+Dengan build context `./apps/api`, `pnpm-lock.yaml` root berada di luar context dan kemungkinan tidak tersedia. Workspace dependency `@rfsanz/database`/`@rfsanz/exchange` juga tidak ikut dicopy.
+
+### Dampak
+
+- Compose default menjalankan runtime Python, bukan NestJS canonical API.
+- CI `docker build ./apps/api` berpotensi gagal saat `COPY pnpm-lock.yaml`.
+- Deployment yang berhasil dibangun belum tentu menjalankan service yang diaudit.
+
+### Rekomendasi
+
+- Pilih satu runtime production.
+- Gunakan root build context untuk monorepo atau buat Dockerfile multi-stage yang benar.
+- Tambahkan integration test build image di CI.
+- Pisahkan image Python legacy dari image API.
+
+---
+
+## H-15 — Healthcheck production menunjuk endpoint yang tidak ada
+
+**Severity:** HIGH  
+**File:**
+
+- `docker-compose.prod.yml:44-45`
+- `apps/api/src/modules/health/health.controller.ts:8-27`
+
+Compose memanggil:
+
+```text
+/healthz
+```
+
+Controller hanya menyediakan:
+
+- `/health/live`
+- `/health/ready`
+- `/health/readiness`
+
+### Dampak
+
+Container API akan dianggap unhealthy walaupun proses hidup, memicu restart/traffic removal.
+
+### Rekomendasi
+
+Samakan healthcheck dengan `/health/live` atau buat `/healthz`. Pisahkan liveness dari readiness.
+
+---
+
+## H-16 — Redis outage dapat memblokir semua request API
+
+**Severity:** MEDIUM/HIGH  
+**File:** `apps/api/src/main.ts:29-34`
+
+Rate limiter memakai Redis dan menolak request apa pun jika `rateLimiter.consume()` gagal, termasuk health endpoint.
+
+Redis client juga dibuat di beberapa tempat tanpa lifecycle shutdown yang jelas.
+
+### Dampak
+
+- Redis outage berubah menjadi outage total API.
+- Health/readiness tidak dapat digunakan untuk diagnosis.
+- Semua client dapat menerima 429 saat Redis tidak tersedia.
+
+### Rekomendasi
+
+- Pisahkan rate limiter dari health endpoint.
+- Pilih kebijakan fail-open terbatas atau local fallback.
+- Atur timeout/retry dan close connection saat shutdown.
+- Redis production wajib password/TLS/network isolation.
+
+---
+
+# 6. Temuan MEDIUM — kualitas implementasi
+
+## M-01 — Position-size endpoint selalu mencoba update order `temp-id`
+
+**File:**
+
+- `apps/api/src/modules/trading/trading.controller.ts:286-305`
+- `apps/api/src/modules/trading/trading.service.ts:217-227`
+
+Controller memanggil service dengan:
+
+```ts
+orderId: 'temp-id'
+```
+
+Service lalu menjalankan `prisma.order.update({ where: { id: 'temp-id' } })`.
+
+### Dampak
+
+Endpoint kalkulasi ukuran posisi gagal kecuali ada order dengan ID literal tersebut.
+
+### Rekomendasi
+
+Pisahkan fungsi pure calculation dari persistensi. Endpoint kalkulasi tidak boleh membutuhkan order ID dummy.
+
+---
+
+## M-02 — Error login mengembalikan HTTP 200
+
+**File:** `apps/api/src/modules/auth/auth.controller.ts:17-24`
+
+Invalid credential menghasilkan:
+
+```ts
+return { error: 'invalid credentials' };
+```
+
+dengan status 200.
+
+### Dampak
+
+Client, monitoring, dan brute-force detector sulit membedakan sukses/gagal.
+
+### Rekomendasi
+
+Gunakan `UnauthorizedException`/401 dan rate limit khusus login.
+
+---
+
+## M-03 — DTO auth dan banyak endpoint tidak tervalidasi
+
+`RegisterDto` dan `LoginDto` hanya class TypeScript tanpa decorator `class-validator`. Banyak controller memakai `body: any`.
+
+### Dampak
+
+- Password kosong/lemah dapat diterima.
+- Payload berukuran besar/field tidak terduga masuk ke service.
+- Kontrak API tidak enforced walaupun `ValidationPipe` aktif.
+
+### Rekomendasi
+
+Tambahkan DTO eksplisit dengan `IsEmail`, `MinLength`, `IsString`, `IsUUID`, `MaxLength`, dan validasi nested metadata.
+
+---
+
+## M-04 — Metrics/readiness detail terbuka
+
+**File:** `apps/api/src/main.ts:36-45`, `health.controller.ts:14-27`
+
+`/metrics` dan `/health/ready` tidak guarded, dan readiness mengungkap:
+
+- mode trading
+- phase internal
+- checks
+- reason error
+
+### Rekomendasi
+
+- `/health/live` boleh publik.
+- `/health/ready` dan `/metrics` batasi internal network/auth.
+- Jangan expose reason yang memuat detail koneksi/konfigurasi ke internet.
+
+---
+
+## M-05 — Queue abstraction sebenarnya synchronous
+
+**File:** `apps/api/src/modules/research/services/research-queue.service.ts:11-17`
+
+`enqueue()` langsung memanggil:
+
+```ts
+await this.researchService.runResearch(...)
+```
+
+Tidak memakai BullMQ queue/worker meskipun dokumentasi menyebut queue.
+
+### Dampak
+
+Request dapat lama/blocking dan tidak ada retry/durable job semantics.
+
+### Rekomendasi
+
+Gunakan BullMQ secara nyata atau rename service agar tidak misleading.
+
+---
+
+## M-06 — Telegram/web/admin surfaces masih placeholder
+
+**File:**
+
+- `apps/telegram/src/services/menu.service.ts`
+- `apps/telegram/src/index.ts`
+- `apps/web/package.json`
+- `apps/admin/package.json`
+
+Menu Telegram mengembalikan teks seperti:
+
+```text
+Overview metrics (placeholder)
+Open trading actions
+Your holdings summary
+```
+
+Web/admin tidak memiliki halaman source yang bermakna.
+
+### Dampak
+
+Dokumentasi menyiratkan dashboard/admin/Telegram operasional, tetapi implementasi belum terhubung ke API dan belum memiliki authorization per user/chat.
+
+### Rekomendasi
+
+- Implementasikan API client resmi.
+- Map Telegram chat ID ke user account.
+- Tambahkan authorization per chat.
+- Jangan menampilkan action trading sebelum confirmation/idempotency tersedia.
+
+---
+
+# 7. Temuan Python trading bot
+
+## P-01 — Jalur SELL menggunakan sizing dan TP/SL BUY
+
+**Severity:** HIGH jika legacy path diaktifkan  
+**File:** `trading-bot/main.py:7432-7467`
+
+Kode hanya memeriksa limit posisi untuk BUY:
+
+```python
+if decision == "BUY":
+    allowed, reason_denied = _is_position_allowed(symbol)
+```
+
+Untuk SELL:
+
+- posisi existing tidak diverifikasi,
+- quantity dihitung seperti entry BUY,
+- SL tetap di bawah entry,
+- TP tetap di atas entry.
+
+### Dampak
+
+Jika legacy execution diaktifkan:
+
+- dapat mengirim SELL naked/oversized,
+- dapat membuat TP/SL salah arah,
+- risiko short/exit tidak benar.
+
+Saat ini `_reject_legacy_execution()` memblokir order, tetapi masalah tetap harus diperbaiki sebelum runtime diaktifkan.
+
+---
+
+## P-02 — Config menyimpan credential plaintext
+
+**File:** `trading-bot/main.py:120-135,1436-1448`
+
+`/api/config/save` menyimpan API key/secret ke `config.json` secara langsung.
+
+### Dampak
+
+Credential dapat terbaca dari:
+
+- filesystem,
+- backup,
+- dump,
+- accidental artifact,
+- akses lokal/container.
+
+### Rekomendasi
+
+Gunakan secret manager/KMS atau environment secret. Jika harus file, permission 0600, atomic write, encrypted-at-rest, dan jangan backup tanpa encryption.
+
+---
+
+## P-03 — Banyak endpoint Flask read-only tidak memerlukan auth
+
+Contoh:
+
+- `/api/config`
+- `/api/events`
+- `/api/audit`
+- `/api/backup/list`
+- `/api/vacation`
+- `/api/schedule`
+- `/api/dca`
+- `/api/trades`
+- `/api/news`
+- `/api/ai/code`
+- `/api/auth/required`
+
+Mutation tertentu memakai `DASHBOARD_API_KEY`, tetapi `/api/ai/code` tidak.
+
+### Dampak
+
+- Kebocoran posisi, P&L, audit, konfigurasi.
+- Penyalahgunaan biaya AI.
+- Endpoint dapat dipanggil dari internet karena Flask bind `0.0.0.0` (`main.py:2672-2674`).
+
+### Rekomendasi
+
+Terapkan auth default untuk seluruh `/api/*`, dengan allowlist eksplisit untuk health/public webhook. Gunakan `hmac.compare_digest()` untuk API key.
+
+---
+
+# 8. Database, Redis, dan secrets
+
+## Temuan
+
+- Schema API key memiliki `keyHash` dan `secretEncrypted`, tetapi tidak ada encryption/decryption service.
+- `.env.paper` dan `.env.testnet` berisi nilai terisi dan **untracked**.
+- `.gitignore` tidak memiliki aturan umum untuk `.env*`; hanya contoh tertentu yang tracked.
+- `dump.rdb` dan `apps/api/dump.rdb` untracked dapat berisi data Redis.
+- Compose default memakai:
+  - PostgreSQL password `changeme`
+  - Redis tanpa konfigurasi keamanan yang konsisten
+  - port database/Redis exposed ke host.
+- `docker-compose.prod.yml` Redis healthcheck tidak memakai password ketika `requirepass` dapat aktif.
+
+### Rekomendasi prioritas
+
+1. Rotate semua credential yang pernah berada di `.env.testnet`, dump, atau working tree.
+2. Tambahkan `.env*` ke ignore, dengan exception hanya untuk `.env.example`.
+3. Hapus dump/database artifacts dari repository/workspace sebelum distribusi.
+4. Gunakan secret manager.
+5. Jangan expose PostgreSQL/Redis ke public interface.
+6. Tambahkan backup encryption dan restore test.
+
+---
+
+# 9. Testing dan dependency health
+
+## Hasil validasi yang dijalankan
+
+### Berhasil
+
+- `pnpm --filter @rfsanz/exchange typecheck`
+- `pnpm --filter @rfsanz/exchange build`
+- `pnpm --filter @rfsanz/api build`
+- `pnpm --filter @rfsanz/ai test -- --runInBand`
+
+### Gagal
+
+#### Root typecheck gagal
+
+`pnpm run typecheck` gagal di `artifacts/api-server` dengan banyak error, termasuk:
+
+- declaration types hilang untuk `swagger-ui-express`, `swagger-jsdoc`, `uuid`, `jsonwebtoken`, `bcryptjs`, `supertest`
+- `QueueScheduler` tidak tersedia di BullMQ versi terpasang
+- return path tidak lengkap
+- type mismatch route query
+- test globals `describe/it/expect` tidak tersedia
+
+#### Python tests tidak dapat dijalankan
+
+- `pytest` tidak terinstall.
+- `python3 -m unittest discover -s trading-bot/tests -q` gagal import karena `requests` tidak tersedia, meskipun tercantum di `trading-bot/requirements.txt`.
+
+#### CI tidak fail-closed
+
+- `.github/workflows/ci.yml:25-26`
+- `.github/workflows/ci-cd.yml:26-27`
+
+Keduanya menjalankan:
+
+```yaml
+pnpm ... test || true
+```
+
+Artinya test gagal tetap menghasilkan CI sukses.
+
+### Rekomendasi
+
+- Tambahkan test script nyata untuk `packages/exchange`, API, Python.
+- Jalankan exchange Jest tests di CI.
+- Hapus `|| true`.
+- Jalankan `pnpm install --frozen-lockfile`.
+- Tambahkan dependency/type declarations yang benar.
+- Tambahkan test integration dengan PostgreSQL/Redis ephemeral.
+- Tambahkan test untuk:
+  - RBAC/IDOR
+  - SELL risk
+  - duplicate fill
+  - restart recovery
+  - close position exchange confirmation
+  - websocket-to-DB persistence
+  - real Binance testnet, tanpa order live.
+
+---
+
+# 10. Logging dan monitoring
+
+## Observasi
+
+Ada:
+
+- Pino HTTP logging.
+- Helmet/compression.
+- Prometheus default metrics.
+- Health endpoints.
+- Python logging dan health monitor.
+
+Namun:
+
+- `/metrics` publik.
+- Banyak error mengembalikan `e.message` langsung.
+- Exchange event state hanya memory-only.
+- Tidak ada durable audit event untuk setiap transition execution.
+- Tidak ada alerting yang memastikan local state == exchange state.
+- Readiness bisa menjadi `SYSTEM_READY` meskipun AI provider hanya mock.
+- Redis error listener sering hanya mengabaikan error atau log warning.
+- Tidak ada circuit breaker global untuk exchange/account mismatch.
+
+### Rekomendasi
+
+- Tambahkan execution ledger append-only.
+- Metrics harus mencakup:
+  - order submit latency
+  - unknown orders
+  - fill reconciliation lag
+  - local/exchange mismatch
+  - rejected risk decisions
+  - stale websocket
+  - failed exit attempts
+- Lindungi metrics/readiness.
+- Redact credential dan payload webhook sensitif secara konsisten.
+
+---
+
+# 11. Dokumentasi-vs-implementasi
+
+Kontradiksi utama:
+
+1. `COMPLETION-SUMMARY.md:3-18,522-533` menyatakan **100% complete/production-ready**, encryption tersedia, dan 60+ test passing.
+2. `README-PHASE2.md:3-5,145-199,325-328` menyatakan baru **60%**, provider masih stub, pipeline belum terintegrasi, dan production belum siap.
+3. `PRODUCTION-READINESS.md:479-513` masih mencatat authentication, E2E test, load test, dan integrasi sebagai TODO, tetapi bagian kesimpulan tetap mengklaim production-ready.
+4. `trading-bot/main.py:4` menyebut mode LIVE, tetapi `main.py:12-15` menyatakan legacy dan tidak authorized.
+5. `docker-compose.prod.yml` menganggap API memiliki `/healthz`, sedangkan implementasi memiliki `/health/live` dan `/health/ready`.
+6. Dokumentasi menyebut multi-provider AI aktif, sementara provider NestJS mengembalikan mock.
+
+Dokumentasi release/readiness harus diturunkan dari hasil CI dan smoke test aktual, bukan deklarasi manual.
+
+---
+
+# 12. Kesiapan trading
+
+| Mode | Status | Penilaian |
+|---|---|---|
+| **Paper** | **BLOCKED / belum terverifikasi** | Harness dan fake adapter tersedia, tetapi artefak `readiness-report.json` menyatakan PostgreSQL/Redis tidak tersedia. AI masih mock. |
+| **Testnet** | **NOT READY** | Binance testnet adapter dan preflight tersedia, tetapi belum ada bukti order end-to-end nyata; fill persistence, credential handling, SELL risk, dan exit path bermasalah. |
+| **Live** | **DO NOT DEPLOY** | State execution tidak durable, close/SLTP tidak mengirim exchange order, auth/RBAC lemah, AI mock, P&L salah, dan deployment tidak konsisten. |
+| **Python legacy live** | **DISABLED / UNSAFE** | Saat ini order ditolak oleh guard; jika guard dibuka, jalur direct exchange bypass canonical controls. |
+
+---
+
+# 13. Prioritas perbaikan
+
+## P0 — Sebelum environment trading apa pun
+
+1. Tutup semua endpoint NestJS yang tidak semestinya publik.
+2. Implementasikan global JWT + RBAC + ownership checks.
+3. Rotasi seluruh exchange/JWT/Telegram/AI secret yang pernah ada di working tree atau dump.
+4. Persist exchange fills/order events secara idempotent ke PostgreSQL.
+5. Pastikan close/update SL/TP mengirim order nyata dan menunggu konfirmasi exchange.
+6. Perbaiki Docker context/runtime/healthcheck.
+7. Nonaktifkan seluruh legacy Python runtime dari deployment.
+
+## P1 — Sebelum testnet order
+
+1. Perbaiki SELL risk validation.
+2. Perbaiki P&L short dan partial close.
+3. Perbaiki duplicate fill handling.
+4. Implementasikan credential encryption/decryption.
+5. Samakan event name dengan konstanta domain.
+6. Ganti AI mocks dengan provider nyata atau fail-closed ke HOLD.
+7. Perbaiki position-size endpoint.
+8. Tambahkan integration test dengan PostgreSQL, Redis, dan Binance testnet.
+
+## P2 — Sebelum live
+
+1. Durable execution ledger dan reconciliation worker.
+2. Kill switch yang mencakup open positions dan exit failures.
+3. Metrics/alerting untuk mismatch, unknown order, websocket loss, stale data.
+4. Refresh-token rotation dan session revocation.
+5. Production secret manager, encrypted backup, network isolation.
+6. Complete Telegram/web/admin integration dengan authorization per user.
+7. CI wajib fail jika build/test gagal; hapus semua `|| true`.
+8. Perbarui seluruh dokumentasi readiness berdasarkan bukti test aktual.
+
+**Verdict akhir: sistem ini cocok diperlakukan sebagai prototype/integration work-in-progress, bukan sistem trading yang siap menerima dana riil.**
