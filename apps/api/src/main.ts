@@ -18,7 +18,8 @@ async function bootstrap() {
   // Security & performance
   app.use(helmet());
   app.use(compression());
-  app.enableCors({ origin: process.env.CORS_ORIGIN || true });
+  const corsOrigin = process.env.CORS_ORIGIN;
+  app.enableCors(corsOrigin ? { origin: corsOrigin.split(',').map((value) => value.trim()).filter(Boolean) } : { origin: false });
   app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }));
 
   // Logging (pino-http middleware)

@@ -9,6 +9,7 @@
     "testnet:preflight": "pnpm --dir scripts run testnet:preflight",
     "live:preflight": "pnpm --dir scripts run live:preflight",
     "credentials:testnet:create": "pnpm --dir apps/api run credentials:testnet:create",
+    "credentials:live:create": "pnpm --dir apps/api run credentials:live:create",
     "auth:password-reset": "pnpm --dir apps/api run auth:password-reset",
     "auth:bootstrap-password": "pnpm --dir apps/api run auth:bootstrap-password",
     "doctor": "pnpm --dir scripts run doctor",
@@ -21,9 +22,9 @@
     "paper:failure-test": "pnpm --dir scripts run paper:failure-test",
     "paper:offline": "pnpm --dir scripts run paper:offline",
     "preinstall": "sh -c 'rm -f package-lock.json yarn.lock; case \"$npm_config_user_agent\" in pnpm/*) ;; *) echo \"Use pnpm instead\" >&2; exit 1 ;; esac'",
-    "build": "pnpm run typecheck && pnpm -r --if-present run build",
+    "build": "pnpm run typecheck && pnpm -r --filter \"./apps/**\" --filter \"./packages/**\" --filter \"./scripts\" --if-present run build",
     "typecheck:libs": "tsc --build",
-    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
+    "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./apps/**\" --filter \"./packages/**\" --filter \"./scripts\" --if-present run typecheck"
   },
   "private": true,
   "dependencies": {

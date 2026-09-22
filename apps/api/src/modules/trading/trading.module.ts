@@ -6,6 +6,7 @@ import { TradingController } from './trading.controller';
 import { TradingEventHandlers } from './event-handlers';
 import { PaperSmokeService } from './paper-smoke.service';
 import { PaperFailureService } from './paper-failure.service';
+import { KillSwitchController } from './kill-switch.controller';
 import {
   SymbolValidator,
   PositionService,
@@ -26,7 +27,7 @@ import {
     BalanceSyncService,
     PnLCalculationService,
   ],
-  controllers: [TradingController],
+  controllers: [TradingController, KillSwitchController],
   exports: [TradingService],
 })
 export class TradingModule {}

@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS "KillSwitchState" (
+  "id" TEXT NOT NULL PRIMARY KEY,
+  "active" BOOLEAN NOT NULL DEFAULT FALSE,
+  "reason" TEXT,
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "updatedBy" TEXT
+);
+INSERT INTO "KillSwitchState" ("id", "active") VALUES ('global', FALSE)
+ON CONFLICT ("id") DO NOTHING;

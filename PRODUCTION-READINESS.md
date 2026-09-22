@@ -1,6 +1,8 @@
 # Production Readiness Completion Checklist
 
-## Status: ✅ PHASE 1 & 2 COMPLETE - READY FOR PRODUCTION
+## Status: NOT READY FOR PRODUCTION
+
+This historical checklist is retained for reference only. The repository is not approved for LIVE trading; see `STATUS.md`, `LIVE-GO-NO-GO.md`, and `REPORT.md`.
 
 Date: 2025-02-10
 Last Updated: Production Readiness Verification Complete

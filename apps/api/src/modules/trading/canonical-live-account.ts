@@ -21,7 +21,7 @@ export async function resolveCanonicalLiveAccount(
     exchange: 'binance',
     accountId: databaseAccount.accountId,
     credentials: {
-      apiKey: credential.keyHash,
+      apiKey: credential.keyEncrypted ? crypto.decrypt(credential.keyEncrypted) : credential.keyHash,
       apiSecret: crypto.decrypt(credential.secretEncrypted),
     },
     isActive: databaseAccount.isActive,

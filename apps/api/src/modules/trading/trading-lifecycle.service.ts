@@ -3,6 +3,7 @@ import {
   SystemReadinessService,
   ExchangeEventRouter,
   ExchangeReconciliationService,
+  validateLivePreflight,
   createExchange,
   ExchangeName,
   FakePaperExchangeAdapter,
@@ -120,7 +121,25 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
       } else if (mode === 'TESTNET') {
         this.readiness.setCheck('TESTNET_READY', true, 'testnet application initialized');
       } else if (mode === 'LIVE') {
-        this.readiness.setCheck('LIVE_READY', true, 'live application initialized');
+        const livePreflight = validateLivePreflight({
+          tradingMode: process.env.TRADING_MODE,
+          liveTradingEnabled: process.env.LIVE_TRADING_ENABLED,
+          liveAccountId: process.env.LIVE_EXCHANGE_ACCOUNT_ID,
+          encryptionKey: process.env.EXCHANGE_CREDENTIAL_ENCRYPTION_KEY,
+          riskConfigVersion: process.env.RISK_CONFIG_VERSION,
+          risk: process.env,
+          databaseReachable: true,
+          redisReachable: Boolean(process.env.REDIS_URL),
+          canonicalAccountValid: Boolean(account.id && account.accountId),
+          credentialValid: Boolean(account.credentials?.apiKey && account.credentials?.apiSecret),
+          symbolMetadataValid: false,
+          reconciliationAvailable: result.status === 'HEALTHY',
+          killSwitchAvailable: process.env.KILL_SWITCH_STORAGE === 'postgres',
+          exchange: this.adapter,
+        });
+        this.readiness.setCheck('LIVE_READY', livePreflight.ok, livePreflight.ok
+          ? 'runtime LIVE preflight passed'
+          : `runtime LIVE preflight blocked: ${livePreflight.failures.join('; ')}`);
       }
       this.readiness.setPhase('SYSTEM_READY', 'runtime lifecycle initialized');
 

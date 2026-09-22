@@ -17,6 +17,7 @@ export type {
   Session,
   ExchangeAccount,
   ApiKey,
+  KillSwitchState,
   Portfolio,
   Position,
   Order,

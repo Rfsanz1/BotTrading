@@ -1,13 +1,9 @@
 import { BinanceAdapter } from './adapters/binance.adapter';
-import { BybitAdapter } from './adapters/bybit.adapter';
-import { OkxAdapter } from './adapters/okx.adapter';
-import { MexcAdapter } from './adapters/mexc.adapter';
-import { MT5Adapter } from './adapters/mt5.adapter';
 import { ExchangeAccount } from './types';
 import { FakePaperExchangeAdapter } from './adapters/fake-paper.adapter';
 import { resolveExecutionCapability } from './services/execution-mode.service';
 
-export type ExchangeName = 'binance'|'bybit'|'okx'|'mexc'|'mt5'|'paper';
+export type ExchangeName = 'binance'|'paper';
 
 export function createExchange(name: ExchangeName, account?: ExchangeAccount) {
   if (!account?.tradingMode) {
@@ -22,10 +18,6 @@ export function createExchange(name: ExchangeName, account?: ExchangeAccount) {
   }
   switch (name) {
     case 'binance': return new BinanceAdapter(account);
-    case 'bybit': return new BybitAdapter(account);
-    case 'okx': return new OkxAdapter(account);
-    case 'mexc': return new MexcAdapter(account);
-    case 'mt5': return new MT5Adapter(account);
     case 'paper': {
       if (capability.mode !== 'PAPER') throw new Error('Paper adapter requires TRADING_MODE=PAPER');
       const mode = process.env.TRADING_MODE === 'PAPER' ? process.env.PAPER_TEST_FILL_MODE : undefined;
@@ -48,6 +40,6 @@ export function createExchange(name: ExchangeName, account?: ExchangeAccount) {
   }
 }
 
-export function listSupported() { return ['binance','bybit','okx','mexc','mt5','paper'] as ExchangeName[]; }
+export function listSupported() { return ['binance','paper'] as ExchangeName[]; }
 
 export default { createExchange, listSupported };

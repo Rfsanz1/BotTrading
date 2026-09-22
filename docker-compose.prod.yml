@@ -30,16 +30,28 @@ services:
       context: .
       dockerfile: Dockerfile
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-rfsanz}}
-      REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD}@redis:6379}
+      DATABASE_URL: ${DATABASE_URL:?required}
+      REDIS_URL: ${REDIS_URL:?required}
       NODE_ENV: production
       PORT: ${API_PORT:-3001}
-      TRADING_MODE: ${TRADING_MODE:-PAPER}
-      TESTNET_EXCHANGE_ACCOUNT_ID: ${TESTNET_EXCHANGE_ACCOUNT_ID-}
-      LIVE_TRADING_ENABLED: ${LIVE_TRADING_ENABLED:-false}
+      TRADING_MODE: ${TRADING_MODE:?required}
+      TESTNET_EXCHANGE_ACCOUNT_ID: ${TESTNET_EXCHANGE_ACCOUNT_ID:?required}
+      LIVE_TRADING_ENABLED: ${LIVE_TRADING_ENABLED:?required}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?required}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?required}
+      JWT_ISSUER: ${JWT_ISSUER:?required}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:?required}
+      LIVE_EXCHANGE_ACCOUNT_ID: ${LIVE_EXCHANGE_ACCOUNT_ID:?required}
+      RISK_CONFIG_VERSION: ${RISK_CONFIG_VERSION:?required}
+      TRADING_MIN_ACCOUNT_BALANCE_USD: ${TRADING_MIN_ACCOUNT_BALANCE_USD:?required}
+      TRADING_MAX_ORDER_VALUE_USD: ${TRADING_MAX_ORDER_VALUE_USD:?required}
+      TRADING_DAILY_LOSS_LIMIT_USD: ${TRADING_DAILY_LOSS_LIMIT_USD:?required}
+      TRADING_MAX_POSITION_SIZE_PERCENT: ${TRADING_MAX_POSITION_SIZE_PERCENT:?required}
+      TRADING_MAX_CONCURRENT_POSITIONS: ${TRADING_MAX_CONCURRENT_POSITIONS:?required}
       EXCHANGE_CREDENTIAL_ENCRYPTION_KEY: ${EXCHANGE_CREDENTIAL_ENCRYPTION_KEY:?required}
       WEBHOOK_HMAC_SECRET: ${WEBHOOK_HMAC_SECRET:?required}
       WEBHOOK_USER_ID: ${WEBHOOK_USER_ID:?required}
+      CORS_ORIGIN: ${CORS_ORIGIN:?required}
     ports:
       - "${API_PORT:-3001}:${API_PORT:-3001}"
     depends_on:
@@ -48,6 +60,7 @@ services:
       redis:
         condition: service_healthy
     restart: unless-stopped
+    command: ["sh", "-c", "pnpm --dir /workspace/packages/database migrate:deploy && node dist/main.js"]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:${API_PORT:-3001}/health/live"]
       interval: 30s

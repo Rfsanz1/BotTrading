@@ -27,4 +27,5 @@ export * from './services/protection-order.service';
 export * from './services/live-preflight.service';
 export * from './services/market-snapshot.service';
 export * from './adapters/fake-paper.adapter';
+export * from './adapters/binance.adapter';
 export * from './websocket/client';

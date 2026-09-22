@@ -57,6 +57,29 @@ describe('BinanceAdapter - Phase 1', () => {
   });
 
   describe('Order Submission', () => {
+    it('submits native OCO protection as one order list with deterministic client IDs', async () => {
+      const mockPost = jest.fn().mockResolvedValue({
+        data: { orderListId: 99, listStatusType: 'EXEC_STARTED', transactionTime: Date.now() },
+      });
+      const mockGet = jest.fn().mockResolvedValue({ data: { balances: [] } });
+      (axios.create as jest.Mock).mockReturnValue({ get: mockGet, post: mockPost });
+      await adapter.connect(mockAccount);
+      const result = await adapter.createProtectionOco({
+        symbol: 'BTCUSDT',
+        side: 'sell',
+        quantity: '0.5',
+        stopLossTriggerPrice: '44000',
+        stopLossLimitPrice: '43900',
+        takeProfitTriggerPrice: '46000',
+        takeProfitLimitPrice: '45900',
+        listClientOrderId: 'pos-p1-oco',
+        stopLossClientOrderId: 'pos-p1-oco-sl',
+        takeProfitClientOrderId: 'pos-p1-oco-tp',
+      });
+      expect(result.externalId).toBe('99');
+      expect(mockPost.mock.calls.some(([url]) => String(url).includes('/v3/orderList/oco'))).toBe(true);
+    });
+
     it('should format and submit order correctly', async () => {
       // Mock axios.create and post
       const mockPost = jest.fn().mockResolvedValue({

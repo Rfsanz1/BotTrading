@@ -15,6 +15,7 @@ import {
   MarketKline,
   ProtectionOrder,
   ProtectionOrderParams,
+  ProtectionOcoOrderParams,
 } from '../types';
 import { ExchangeSymbolInfo } from '../IExchange';
 
@@ -27,6 +28,7 @@ interface BinanceExchangeAccount extends ExchangeAccount {
 
 export class BinanceAdapter extends ExchangeBase {
   readonly supportsPositionReconciliation = false;
+  readonly nativeProtectionVerified = process.env.BINANCE_OCO_ENDPOINT_VERIFIED === 'true';
 
   name = 'binance';
   private client: AxiosInstance | null = null;
@@ -45,6 +47,9 @@ export class BinanceAdapter extends ExchangeBase {
   private lastResetTime: number = Date.now();
   private readonly MAX_WEIGHT = 1200; // Binance 1 min weight limit
   private readonly WEIGHT_RESET_INTERVAL = 60000; // 1 minute
+  private static readonly OCO_ORDER_LIST_ENDPOINT = '/v3/orderList/oco';
+  private static readonly OCO_CANCEL_ENDPOINT = '/v3/orderList';
+  private static readonly API_RESTRICTIONS_ENDPOINT = '/sapi/v1/account/apiRestrictions';
 
   constructor(account?: BinanceExchangeAccount) {
     super(account);
@@ -567,10 +572,29 @@ export class BinanceAdapter extends ExchangeBase {
     if (!info || info.symbol !== symbol) {
       throw new Error(`Binance symbol metadata unavailable for ${symbol}`);
     }
+
     return {
       symbol: info.symbol,
       status: info.status,
       filters: info.filters,
+    };
+  }
+
+  async fetchApiRestrictions(): Promise<{ enableWithdrawals: boolean; ipRestrict: boolean }> {
+    if (!this.client) throw new Error('Not connected to Binance');
+    if (process.env.BINANCE_API_RESTRICTIONS_ENDPOINT_VERIFIED !== 'true') {
+      throw new Error('Binance apiRestrictions endpoint is UNVERIFIED; credential onboarding is blocked');
+    }
+    const timestamp = Date.now();
+    const query = `timestamp=${timestamp}&recvWindow=5000`;
+    const response = await this.makeRequest('GET', BinanceAdapter.API_RESTRICTIONS_ENDPOINT, {
+      timestamp,
+      recvWindow: 5000,
+      signature: this.generateSignature(query),
+    });
+    return {
+      enableWithdrawals: response.data?.enableWithdrawals === true,
+      ipRestrict: response.data?.ipRestrict === true,
     };
   }
 
@@ -751,77 +775,54 @@ export class BinanceAdapter extends ExchangeBase {
     }
   }
 
-  async createProtectionOrder(params: ProtectionOrderParams): Promise<ProtectionOrder> {
-    const type = params.kind === 'STOP_LOSS' ? 'stop_loss_limit' : 'take_profit_limit';
-    const order = await this.placeOrder({
-      symbol: params.symbol,
-      side: params.side,
-      type,
-      quantity: params.quantity,
-      price: params.limitPrice,
-      triggerPrice: params.triggerPrice,
-      clientOrderId: params.clientOrderId,
-      timeInForce: params.timeInForce ?? 'GTC',
-    });
-    if (!order.externalId && !order.id) {
-      throw new Error('Binance protection order acknowledgement is missing exchange identity');
-    }
-    return {
-      id: order.id,
-      clientOrderId: order.clientOrderId,
-      externalId: order.externalId,
-      symbol: order.symbol,
-      side: order.side,
-      quantity: order.quantity,
-      triggerPrice: params.triggerPrice,
-      limitPrice: params.limitPrice,
-      kind: params.kind,
-      status: order.status,
-      state: 'CONFIRMED',
-      createdAt: order.createdAt,
-      updatedAt: order.updatedAt ?? order.createdAt,
-    };
-  }
-
-  async amendProtectionOrder(orderId: string, params: Partial<ProtectionOrderParams>): Promise<ProtectionOrder> {
+  async createProtectionOco(params: ProtectionOcoOrderParams): Promise<ProtectionOrder> {
     if (!this.client) throw new Error('Not connected to Binance');
-    if (!params.symbol || !params.kind || !params.triggerPrice || !params.limitPrice || !params.quantity) {
-      throw new Error('Protection amendment requires symbol, kind, triggerPrice, limitPrice, and quantity');
+    if (!this.nativeProtectionVerified) {
+      throw new Error('Binance OCO endpoint is UNVERIFIED; native protection is blocked');
     }
     const orderParams: Record<string, string | number> = {
       symbol: params.symbol,
-      side: params.side?.toUpperCase() ?? 'SELL',
+      side: params.side.toUpperCase(),
       quantity: params.quantity,
-      price: params.limitPrice,
-      stopPrice: params.triggerPrice,
-      timeInForce: params.timeInForce ?? 'GTC',
+      listClientOrderId: params.listClientOrderId,
+      aboveType: 'LIMIT_MAKER',
+      abovePrice: params.takeProfitLimitPrice,
+      aboveClientOrderId: params.takeProfitClientOrderId,
+      belowType: 'STOP_LOSS_LIMIT',
+      belowPrice: params.stopLossLimitPrice,
+      belowStopPrice: params.stopLossTriggerPrice,
+      belowTimeInForce: 'GTC',
+      belowClientOrderId: params.stopLossClientOrderId,
       timestamp: Date.now(),
       recvWindow: 5000,
     };
     const query = new URLSearchParams(orderParams as Record<string, string>).toString();
-    const response = await this.makeRequest('PUT', '/v3/order', {
+    const response = await this.makeRequest('POST', BinanceAdapter.OCO_ORDER_LIST_ENDPOINT, {
       ...orderParams,
-      orderId: /^\d+$/.test(orderId) ? orderId : undefined,
-      origClientOrderId: /^\d+$/.test(orderId) ? undefined : orderId,
       signature: this.generateSignature(query),
     });
     const data = response.data;
-    if (!data?.orderId) throw new Error('Binance protection amendment acknowledgement is missing exchange identity');
+    if (!data?.orderListId) throw new Error('Binance OCO acknowledgement is missing orderListId');
     return {
-      id: String(data.orderId),
-      clientOrderId: data.clientOrderId,
-      externalId: String(data.orderId),
-      symbol: data.symbol,
-      side: String(data.side).toLowerCase() as 'buy' | 'sell',
-      quantity: data.origQty,
-      triggerPrice: params.triggerPrice,
-      limitPrice: params.limitPrice,
-      kind: params.kind,
-      status: data.status,
+      id: String(data.orderListId),
+      externalId: String(data.orderListId),
+      clientOrderId: params.listClientOrderId,
+      listClientOrderId: params.listClientOrderId,
+      symbol: params.symbol,
+      side: params.side,
+      quantity: params.quantity,
+      triggerPrice: params.stopLossTriggerPrice,
+      limitPrice: params.stopLossLimitPrice,
+      kind: 'STOP_LOSS',
+      status: String(data.listStatusType ?? 'EXEC_STARTED'),
       state: 'CONFIRMED',
-      createdAt: new Date(data.transactTime ?? Date.now()),
-      updatedAt: new Date(data.updateTime ?? Date.now()),
+      createdAt: new Date(data.transactionTime ?? Date.now()),
+      updatedAt: new Date(data.transactionTime ?? Date.now()),
     };
+  }
+
+  async createProtectionOrder(_params: ProtectionOrderParams): Promise<ProtectionOrder> {
+    throw new Error('Binance Spot protection requires one native OCO order list');
   }
 
   async cancelProtectionOrder(orderId: string, symbol?: string): Promise<void> {
@@ -830,11 +831,11 @@ export class BinanceAdapter extends ExchangeBase {
       timestamp: Date.now(),
       recvWindow: 5000,
     };
-    if (/^\d+$/.test(orderId)) params.orderId = orderId;
-    else params.origClientOrderId = orderId;
+    if (/^\d+$/.test(orderId)) params.orderListId = orderId;
+    else params.listClientOrderId = orderId;
     if (symbol) params.symbol = symbol;
     const query = new URLSearchParams(params as Record<string, string>).toString();
-    await this.makeRequest('DELETE', '/v3/order', {
+    await this.makeRequest('DELETE', BinanceAdapter.OCO_CANCEL_ENDPOINT, {
       ...params,
       signature: this.generateSignature(query),
     });

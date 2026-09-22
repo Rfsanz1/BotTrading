@@ -16,6 +16,8 @@ node_modules
 !apps/api/.env.example
 !apps/api/.env.paper.example
 dump.rdb
+attached_assets/
+=2.0
 
 # IDEs and editors
 /.idea

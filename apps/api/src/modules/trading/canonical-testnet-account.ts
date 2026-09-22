@@ -15,7 +15,7 @@ export async function resolveCanonicalTestnetAccount(
   const credential = databaseAccount.apiKeys[0];
   const crypto = new CredentialCryptoService();
   const credentials = {
-    apiKey: credential.keyHash,
+    apiKey: credential.keyEncrypted ? crypto.decrypt(credential.keyEncrypted) : credential.keyHash,
     apiSecret: crypto.decrypt(credential.secretEncrypted),
   };
 

@@ -2,277 +2,124 @@ import { Injectable, Logger } from '@nestjs/common';
 import { IAIProvider } from '../../../domain/interfaces';
 import { AIAnalysisFailedException, AIProviderNotAvailableException } from '../../../domain/exceptions';
 
-/**
- * Base class for all AI providers
- */
+type Analysis = {
+  recommendation: 'BUY' | 'SELL' | 'HOLD';
+  confidence: number;
+  analysis: string;
+  riskLevel: string;
+  sentiment?: string;
+  keyPoints?: string[];
+};
+
 export abstract class BaseAIProvider implements IAIProvider {
   protected readonly logger = new Logger(this.constructor.name);
-
   abstract getName(): string;
+  abstract analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis>;
 
-  abstract analyzeMarket(symbol: string, data: Record<string, any>): Promise<{
-    recommendation: 'BUY' | 'SELL' | 'HOLD';
-    confidence: number;
-    analysis: string;
-    riskLevel: string;
-    sentiment?: string;
-    keyPoints?: string[];
-  }>;
+  protected abstract endpointEnv: string;
+  protected abstract keyEnv?: string;
 
   async isAvailable(): Promise<boolean> {
-    return true;
+    const endpoint = process.env[this.endpointEnv];
+    const key = this.keyEnv ? process.env[this.keyEnv] : 'configured';
+    return Boolean(endpoint && key);
   }
 
-  protected parseRecommendation(text: string): 'BUY' | 'SELL' | 'HOLD' {
-    const upperText = text.toUpperCase();
-    if (upperText.includes('BUY') || upperText.includes('BULLISH')) {
-      return 'BUY';
+  protected async callConfiguredProvider(symbol: string, data: Record<string, any>): Promise<Analysis> {
+    const endpoint = process.env[this.endpointEnv];
+    const key = this.keyEnv ? process.env[this.keyEnv] : undefined;
+    if (!endpoint || (this.keyEnv && !key)) {
+      throw new AIProviderNotAvailableException(this.getName());
     }
-    if (upperText.includes('SELL') || upperText.includes('BEARISH')) {
-      return 'SELL';
+    const response = await fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(key ? { authorization: `Bearer ${key}` } : {}),
+      },
+      body: JSON.stringify({
+        symbol,
+        market: data,
+        response_format: 'json',
+      }),
+    });
+    if (!response.ok) throw new Error(`${this.getName()} returned HTTP ${response.status}`);
+    const payload = await response.json() as Record<string, unknown>;
+    const candidate = (payload.result ?? payload.output ?? payload) as Record<string, unknown>;
+    const recommendation = candidate.recommendation;
+    if (recommendation !== 'BUY' && recommendation !== 'SELL' && recommendation !== 'HOLD') {
+      throw new Error(`${this.getName()} returned an invalid recommendation`);
     }
-    return 'HOLD';
+    const confidence = Number(candidate.confidence);
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      throw new Error(`${this.getName()} returned an invalid confidence`);
+    }
+    return {
+      recommendation,
+      confidence,
+      analysis: String(candidate.analysis ?? ''),
+      riskLevel: String(candidate.riskLevel ?? 'UNKNOWN'),
+      sentiment: candidate.sentiment ? String(candidate.sentiment) : undefined,
+      keyPoints: Array.isArray(candidate.keyPoints) ? candidate.keyPoints.map(String) : [],
+    };
   }
 
-  protected extractConfidence(text: string): number {
-    const regex = /confidence[:\s]+(\d+(?:\.\d+)?)/i;
-    const match = text.match(regex);
-    if (match) {
-      const value = parseFloat(match[1]);
-      return Math.min(1, Math.max(0, value > 1 ? value / 100 : value));
+  protected async analyzeOrFail(symbol: string, data: Record<string, any>): Promise<Analysis> {
+    try {
+      return await this.callConfiguredProvider(symbol, data);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      this.logger.error(`${this.getName()} analysis failed: ${message}`);
+      if (error instanceof AIProviderNotAvailableException) throw error;
+      throw new AIAnalysisFailedException(this.getName(), message);
     }
-    return 0.5; // Default medium confidence
-  }
-
-  protected extractRiskLevel(text: string): string {
-    const upperText = text.toUpperCase();
-    if (upperText.includes('HIGH RISK') || upperText.includes('RISKY')) {
-      return 'HIGH';
-    }
-    if (upperText.includes('LOW RISK') || upperText.includes('SAFE')) {
-      return 'LOW';
-    }
-    return 'MEDIUM';
   }
 }
 
-/**
- * OpenAI provider implementation
- */
 @Injectable()
 export class OpenAIProvider extends BaseAIProvider {
-  getName(): string {
-    return 'OPENAI';
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual OpenAI API call
-      // This is a placeholder that will be implemented with real API
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('OPENAI', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'BUY' as const,
-      confidence: 0.75,
-      analysis: `OpenAI analysis for ${symbol}: Technical indicators suggest a bullish trend with strong support levels.`,
-      riskLevel: 'MEDIUM',
-      sentiment: 'BULLISH',
-      keyPoints: [
-        'RSI above 50 indicates bullish momentum',
-        'Price above 200-day MA confirms uptrend',
-        'Volume increasing on up moves',
-      ],
-    };
-  }
+  protected endpointEnv = 'AI_OPENAI_ENDPOINT';
+  protected keyEnv = 'OPENAI_API_KEY';
+  getName(): string { return 'OPENAI'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }
 
-/**
- * Claude provider implementation
- */
 @Injectable()
 export class ClaudeProvider extends BaseAIProvider {
-  getName(): string {
-    return 'CLAUDE';
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual Claude API call
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('CLAUDE', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'HOLD' as const,
-      confidence: 0.65,
-      analysis: `Claude analysis for ${symbol}: Market shows mixed signals with consolidation pattern forming.`,
-      riskLevel: 'MEDIUM',
-      sentiment: 'NEUTRAL',
-      keyPoints: [
-        'Price consolidating within resistance and support',
-        'Wait for breakout confirmation',
-        'Mixed momentum indicators',
-      ],
-    };
-  }
+  protected endpointEnv = 'AI_CLAUDE_ENDPOINT';
+  protected keyEnv = 'ANTHROPIC_API_KEY';
+  getName(): string { return 'CLAUDE'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }
 
-/**
- * Gemini provider implementation
- */
 @Injectable()
 export class GeminiProvider extends BaseAIProvider {
-  getName(): string {
-    return 'GEMINI';
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual Gemini API call
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('GEMINI', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'BUY' as const,
-      confidence: 0.70,
-      analysis: `Gemini analysis for ${symbol}: Fundamental metrics and technical analysis align for potential upside.`,
-      riskLevel: 'LOW',
-      sentiment: 'BULLISH',
-      keyPoints: [
-        'Strong fundamental outlook',
-        'Technical breakout confirmed',
-        'Market sentiment positive',
-      ],
-    };
-  }
+  protected endpointEnv = 'AI_GEMINI_ENDPOINT';
+  protected keyEnv = 'GEMINI_API_KEY';
+  getName(): string { return 'GEMINI'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }
 
-/**
- * Groq provider implementation
- */
 @Injectable()
 export class GroqProvider extends BaseAIProvider {
-  getName(): string {
-    return 'GROQ';
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual Groq API call
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('GROQ', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'SELL' as const,
-      confidence: 0.68,
-      analysis: `Groq analysis for ${symbol}: Overbought conditions detected with weakening momentum.`,
-      riskLevel: 'HIGH',
-      sentiment: 'BEARISH',
-      keyPoints: [
-        'RSI at extreme overbought levels',
-        'Divergence between price and indicators',
-        'Reversal patterns forming',
-      ],
-    };
-  }
+  protected endpointEnv = 'AI_GROQ_ENDPOINT';
+  protected keyEnv = 'GROQ_API_KEY';
+  getName(): string { return 'GROQ'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }
 
-/**
- * DeepSeek provider implementation
- */
 @Injectable()
 export class DeepSeekProvider extends BaseAIProvider {
-  getName(): string {
-    return 'DEEPSEEK';
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual DeepSeek API call
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('DEEPSEEK', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'BUY' as const,
-      confidence: 0.72,
-      analysis: `DeepSeek analysis for ${symbol}: Detailed market analysis shows strong buy signals with good risk-reward ratio.`,
-      riskLevel: 'MEDIUM',
-      sentiment: 'BULLISH',
-      keyPoints: [
-        'Support level identified for entry',
-        'Target resistance at key levels',
-        'Stop loss below structure',
-      ],
-    };
-  }
+  protected endpointEnv = 'AI_DEEPSEEK_ENDPOINT';
+  protected keyEnv = 'DEEPSEEK_API_KEY';
+  getName(): string { return 'DEEPSEEK'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }
 
-/**
- * Ollama provider implementation (Local LLM)
- */
 @Injectable()
 export class OllamaProvider extends BaseAIProvider {
-  getName(): string {
-    return 'OLLAMA';
-  }
-
-  async isAvailable(): Promise<boolean> {
-    try {
-      // Check if Ollama is running locally
-      // TODO: Implement actual availability check
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  async analyzeMarket(symbol: string, data: Record<string, any>) {
-    try {
-      // TODO: Implement actual Ollama API call
-      const mockAnalysis = this.getMockAnalysis(symbol);
-      return mockAnalysis;
-    } catch (error) {
-      throw new AIAnalysisFailedException('OLLAMA', error.message);
-    }
-  }
-
-  private getMockAnalysis(symbol: string) {
-    return {
-      recommendation: 'HOLD' as const,
-      confidence: 0.60,
-      analysis: `Ollama analysis for ${symbol}: Local analysis indicates market in consolidation phase.`,
-      riskLevel: 'LOW',
-      sentiment: 'NEUTRAL',
-      keyPoints: [
-        'Awaiting market confirmation',
-        'Monitor key levels',
-        'Prepare for volatility',
-      ],
-    };
-  }
+  protected endpointEnv = 'OLLAMA_ENDPOINT';
+  protected keyEnv = undefined;
+  getName(): string { return 'OLLAMA'; }
+  analyzeMarket(symbol: string, data: Record<string, any>): Promise<Analysis> { return this.analyzeOrFail(symbol, data); }
 }

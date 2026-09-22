@@ -10,6 +10,7 @@ import {
   MarketOrderBook,
   MarketKline,
   ProtectionOrderParams,
+  ProtectionOcoOrderParams,
   ProtectionOrder,
 } from './types';
 
@@ -47,10 +48,11 @@ export interface IExchange extends EventEmitter {
   fetchOpenOrders(symbol?: string): Promise<Order[]>;
   fetchOpenPositions(): Promise<Position[]>;
   createProtectionOrder?(params: ProtectionOrderParams): Promise<ProtectionOrder>;
-  amendProtectionOrder?(orderId: string, params: Partial<ProtectionOrderParams>): Promise<ProtectionOrder>;
+  createProtectionOco?(params: ProtectionOcoOrderParams): Promise<ProtectionOrder>;
   cancelProtectionOrder?(orderId: string, symbol?: string): Promise<void>;
   getProtectionOrder?(orderId: string, symbol?: string): Promise<ProtectionOrder | null>;
   supportsPositionReconciliation?: boolean;
+  nativeProtectionVerified?: boolean;
   subscribeTicker(symbol: string): void;
   unsubscribeTicker(symbol: string): void;
 }

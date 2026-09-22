@@ -2,8 +2,7 @@ import { validateLivePreflight } from '../services/live-preflight.service';
 
 const exchange = {
   name: 'binance',
-  createProtectionOrder: jest.fn(),
-  amendProtectionOrder: jest.fn(),
+  createProtectionOco: jest.fn(),
   cancelProtectionOrder: jest.fn(),
   getProtectionOrder: jest.fn(),
 } as any;

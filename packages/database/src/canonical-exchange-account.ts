@@ -11,6 +11,7 @@ export type CanonicalExchangeAccount = {
     userId: string;
     exchangeAccountId: string | null;
     keyHash: string;
+    keyEncrypted: string | null;
     secretEncrypted: string;
     permissions: unknown;
     revoked: boolean;

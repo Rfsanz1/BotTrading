@@ -57,7 +57,10 @@ export function validateLivePreflight(input: LivePreflightInput): LivePreflightR
   if (!input.reconciliationAvailable) failures.push('reconciliation service is unavailable');
   if (!input.killSwitchAvailable) failures.push('kill switch is unavailable');
   if (input.exchange.name !== 'binance') failures.push('LIVE preflight requires Binance adapter');
-  if (!input.exchange.createProtectionOrder || !input.exchange.amendProtectionOrder || !input.exchange.cancelProtectionOrder || !input.exchange.getProtectionOrder) {
+  if (!input.exchange.nativeProtectionVerified
+    || !input.exchange.createProtectionOco
+    || !input.exchange.cancelProtectionOrder
+    || !input.exchange.getProtectionOrder) {
     failures.push('native protection capability is incomplete');
   }
   return { ok: failures.length === 0, failures };

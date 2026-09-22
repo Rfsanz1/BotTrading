@@ -191,6 +191,7 @@ model ApiKey {
   exchangeAccountId String?
   // Legacy field name; stores the exchange API key identifier used at request time.
   keyHash           String
+  keyEncrypted      String?
   // Versioned application-encrypted ciphertext; never store plaintext secrets here.
   secretEncrypted   String?
   permissions       String[]
@@ -278,6 +279,7 @@ model Trade {
   price     Decimal  @db.Decimal(30, 12)
   quantity  Decimal  @db.Decimal(30, 12)
   fee       Decimal? @db.Decimal(30, 12)
+  feeAsset  String?
   side      Side
   timestamp DateTime @default(now())
   exchangeTimestamp DateTime?
@@ -406,6 +408,14 @@ model AuditLog {
 
   @@index([userId])
   @@index([action])
+}
+
+model KillSwitchState {
+  id        String   @id
+  active    Boolean  @default(false)
+  reason    String?
+  updatedAt DateTime @updatedAt
+  updatedBy String?
 }
 
 // ─── Conversations & Memory ───────────────────────────────────────────────────

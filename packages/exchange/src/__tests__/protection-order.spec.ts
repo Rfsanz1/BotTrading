@@ -80,8 +80,9 @@ describe('ProtectionOrderService', () => {
   it('blocks duplicates, supports amend/cancel, and reconciles restart state', async () => {
     const service = new ProtectionOrderService();
     const ex = exchange({
-      createProtectionOrder: jest.fn().mockResolvedValue(acknowledged),
-      amendProtectionOrder: jest.fn().mockResolvedValue({ ...acknowledged, triggerPrice: '40100' }),
+      createProtectionOrder: jest.fn()
+        .mockResolvedValueOnce(acknowledged)
+        .mockResolvedValueOnce({ ...acknowledged, triggerPrice: '40100' }),
       cancelProtectionOrder: jest.fn().mockResolvedValue(undefined),
       getProtectionOrder: jest.fn().mockResolvedValue(acknowledged),
     });

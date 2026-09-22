@@ -47,6 +47,19 @@ export type ProtectionOrderParams = {
   timeInForce?: 'GTC' | 'IOC' | 'FOK';
 };
 
+export type ProtectionOcoOrderParams = {
+  symbol: string;
+  side: 'buy' | 'sell';
+  quantity: string;
+  stopLossTriggerPrice: string;
+  stopLossLimitPrice: string;
+  takeProfitTriggerPrice: string;
+  takeProfitLimitPrice: string;
+  listClientOrderId: string;
+  stopLossClientOrderId: string;
+  takeProfitClientOrderId: string;
+};
+
 export type ProtectionOrder = {
   id: string;
   clientOrderId?: string;
@@ -61,6 +74,7 @@ export type ProtectionOrder = {
   state: ProtectionState;
   createdAt: Date;
   updatedAt: Date;
+  listClientOrderId?: string;
 };
 
 export type Order = {

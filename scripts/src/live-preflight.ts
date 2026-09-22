@@ -97,7 +97,7 @@ async function main(): Promise<void> {
     credentialValid,
     symbolMetadataValid,
     reconciliationAvailable: Boolean(new ExchangeReconciliationService()),
-    killSwitchAvailable: true,
+    killSwitchAvailable: env.KILL_SWITCH_STORAGE === 'postgres',
     exchange,
   });
 

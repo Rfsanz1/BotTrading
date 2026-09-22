@@ -42,6 +42,7 @@ import {
 } from '../../domain/exceptions';
 import { resolveCanonicalTestnetAccount } from './canonical-testnet-account';
 import { resolveCanonicalLiveAccount } from './canonical-live-account';
+import { getKillSwitch, setKillSwitch } from './kill-switch';
 
 @Injectable()
 export class TradingService {
@@ -97,6 +98,7 @@ export class TradingService {
         averagePrice?: number;
         price?: number;
         fee?: number;
+        feeAsset?: string;
         timestamp?: number;
       }): Promise<void> {
         if (event.kind !== 'FILL' && event.kind !== 'ORDER') return;
@@ -121,7 +123,13 @@ export class TradingService {
             },
           },
         });
-        if (!order) return;
+        if (!order) {
+          const handled = await this.handleProtectionFill(event);
+          if (!handled) {
+            this.logger.warn(`UNKNOWN exchange event: source=${event.source} orderId=${event.orderId ?? 'none'} clientOrderId=${event.clientOrderId ?? 'none'}`);
+          }
+          return;
+        }
 
         if (event.kind === 'ORDER') {
           if (!event.status) return;
@@ -158,7 +166,10 @@ export class TradingService {
           if (existing) return;
 
           const currentFilled = Number(order.filled);
-          const fillQuantity = calculateFillDelta(cumulative, currentFilled);
+          const rawFillQuantity = calculateFillDelta(cumulative, currentFilled);
+          const baseAsset = order.symbol.replace(/USDT$|USDC$|BUSD$|BTC$|ETH$/, '');
+          const feeInBaseAsset = event.feeAsset?.toUpperCase() === baseAsset;
+          const fillQuantity = Math.max(0, rawFillQuantity - (feeInBaseAsset ? Number(event.fee ?? 0) : 0));
           if (fillQuantity <= 0 || fillQuantity > Number(order.quantity) - currentFilled + 1e-9) {
             throw new Error('Cumulative fill is inconsistent with local order state');
           }
@@ -174,6 +185,7 @@ export class TradingService {
               price: executionPrice,
               quantity: fillQuantity,
               fee: event.fee,
+              feeAsset: event.feeAsset,
               side: order.side,
               timestamp: event.timestamp ? new Date(event.timestamp) : new Date(),
               exchangeTimestamp: event.timestamp ? new Date(event.timestamp) : null,
@@ -233,6 +245,113 @@ export class TradingService {
               : { quantity: remaining, realizedPnL: Number(position.realizedPnL ?? 0) + pnl },
           });
         });
+        if (order.side === 'BUY' && ((order.meta as Record<string, unknown> | null | undefined)?.intent ?? 'ENTRY') === 'ENTRY') {
+          const position = await prisma.position.findFirst({
+            where: { userId: order.userId, symbol: order.symbol, status: 'OPEN' },
+          });
+          if (position) await this.ensureEntryProtection(order, position);
+        }
+  }
+
+  private async ensureEntryProtection(order: any, position: any): Promise<void> {
+    const meta = (order.meta ?? {}) as Record<string, unknown>;
+    const stopLoss = Number(meta.stopLoss);
+    const takeProfit = Number(meta.targetPrice);
+    if (!Number.isFinite(stopLoss) || !Number.isFinite(takeProfit) || stopLoss <= 0 || takeProfit <= 0) {
+      await setKillSwitch(true, `Entry ${order.id} has no valid SL/TP protection`);
+      await this.eventEmitter.emitAsync('trading.protection.failed', { orderId: order.id, positionId: position.id, reason: 'missing SL/TP' });
+      return;
+    }
+    const account = await this.resolveExecutionAccount(order.userId, order.exchange);
+    const { createExchange } = await import('@rfsanz/exchange');
+    const adapter: any = createExchange(order.exchange as any, account);
+    if (!adapter.nativeProtectionVerified || typeof adapter.createProtectionOco !== 'function') {
+      await setKillSwitch(true, `Protection capability is unverified for entry ${order.id}`);
+      await this.eventEmitter.emitAsync('trading.protection.failed', { orderId: order.id, positionId: position.id, reason: 'unverified OCO capability' });
+      return;
+    }
+    const listClientOrderId = `pos-${position.id}-oco`;
+    const positionMeta = (position.meta ?? {}) as Record<string, unknown>;
+    if (positionMeta.protectionListClientOrderId === listClientOrderId && positionMeta.protectionState === 'CONFIRMED') return;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        await adapter.connect(account);
+        const protection = await adapter.createProtectionOco({
+          symbol: position.symbol,
+          side: 'sell',
+          quantity: String(position.quantity),
+          stopLossTriggerPrice: String(stopLoss),
+          stopLossLimitPrice: String(stopLoss),
+          takeProfitTriggerPrice: String(takeProfit),
+          takeProfitLimitPrice: String(takeProfit),
+          listClientOrderId,
+          stopLossClientOrderId: `${listClientOrderId}-sl`,
+          takeProfitClientOrderId: `${listClientOrderId}-tp`,
+        });
+        await prisma.position.update({
+          where: { id: position.id },
+          data: {
+            meta: {
+              ...positionMeta,
+              protectionState: 'CONFIRMED',
+              protectionListClientOrderId: listClientOrderId,
+              protectionListId: protection.externalId ?? protection.id,
+              stopLossProtectionClientOrderId: `${listClientOrderId}-sl`,
+              takeProfitProtectionClientOrderId: `${listClientOrderId}-tp`,
+            } as any,
+          },
+        });
+        await adapter.disconnect();
+        return;
+      } catch (error) {
+        lastError = error;
+        try { await adapter.disconnect(); } catch { /* preserve original protection failure */ }
+      }
+    }
+    await prisma.position.update({
+      where: { id: position.id },
+      data: { meta: { ...positionMeta, protectionState: 'FAILED' } as any },
+    });
+    await setKillSwitch(true, `Protection failed for entry ${order.id}: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
+    await this.eventEmitter.emitAsync('trading.protection.failed', { orderId: order.id, positionId: position.id, reason: String(lastError) });
+  }
+
+  private async handleProtectionFill(event: {
+    source: string;
+    orderId?: string;
+    clientOrderId?: string;
+    symbol?: string;
+    averagePrice?: number;
+    price?: number;
+    filledQuantity?: number;
+    fee?: number;
+    feeAsset?: string;
+    timestamp?: number;
+  }): Promise<boolean> {
+    if (!event.clientOrderId && !event.orderId) return false;
+    const positions = await prisma.position.findMany({ where: { status: 'OPEN', ...(event.symbol ? { symbol: event.symbol } : {}) } });
+    const position = positions.find((candidate) => {
+      const meta = (candidate.meta ?? {}) as Record<string, unknown>;
+      return [meta.protectionListId, meta.protectionListClientOrderId, meta.stopLossProtectionClientOrderId, meta.takeProfitProtectionClientOrderId]
+        .some((value) => value === event.clientOrderId || value === event.orderId);
+    });
+    if (!position) return false;
+    const quantity = Math.min(Number(position.quantity), Number(event.filledQuantity ?? 0));
+    const exitPrice = Number(event.averagePrice ?? event.price ?? 0);
+    if (quantity <= 0 || !Number.isFinite(exitPrice) || exitPrice <= 0) throw new Error('Unverifiable protection fill values rejected');
+    const pnl = calculateDirectionalPnL(Number(position.entryPrice), exitPrice, quantity, position.side as 'BUY' | 'SELL', Number(event.fee ?? 0));
+    await prisma.position.update({
+      where: { id: position.id },
+      data: {
+        quantity: Math.max(0, Number(position.quantity) - quantity),
+        status: quantity >= Number(position.quantity) ? 'CLOSED' : 'OPEN',
+        closedAt: quantity >= Number(position.quantity) ? new Date() : null,
+        realizedPnL: Number(position.realizedPnL ?? 0) + pnl,
+      },
+    });
+    await this.eventEmitter.emitAsync('trading.protection.filled', { positionId: position.id, source: event.source, quantity, pnl });
+    return true;
   }
 
   /**
@@ -256,6 +375,9 @@ export class TradingService {
 
       // Validate order
       this.validateOrder(params);
+      if (params.side === 'SELL' && (!params.positionId || !['EXIT', 'REDUCE', 'CLOSE'].includes(params.intent ?? ''))) {
+        throw new OrderValidationFailedException('Binance Spot is long-only: SELL entry requires an existing long position and an explicit exit intent');
+      }
       if (params.positionId) {
         const position = await prisma.position.findUnique({ where: { id: params.positionId } });
         if (!position || position.status !== 'OPEN' || position.userId !== params.userId || position.symbol !== params.symbol) {
@@ -452,6 +574,12 @@ export class TradingService {
     let pendingSymbol: string | undefined;
     
     try {
+      const killSwitch = await getKillSwitch();
+      const requestedOrder = await prisma.order.findUnique({ where: { id: orderId }, select: { meta: true } });
+      const requestedIntent = (requestedOrder?.meta as Record<string, unknown> | null | undefined)?.intent;
+      if (killSwitch.active && !['EXIT', 'REDUCE', 'CLOSE'].includes(String(requestedIntent))) {
+        throw new RiskLimitExceededException(`Kill switch active: ${killSwitch.reason ?? 'entry blocked'}`);
+      }
       const order = (await prisma.order.findUnique({
         where: { id: orderId },
         include: {
@@ -593,7 +721,7 @@ export class TradingService {
           stopLoss: Number(order.meta?.stopLoss || order.price || 0),
           takeProfit: Number(order.meta?.targetPrice || order.price || 0),
           requestedPositionSize: Number(order.quantity || 0),
-          riskAmount: Number(order.quantity || 0),
+          riskAmount: Math.abs(Number(order.price || 0) - Number(order.meta?.stopLoss || order.price || 0)) * Number(order.quantity || 0),
           portfolioHeatBefore: Number(order.meta?.portfolioHeatBefore || 0),
           symbolExposureBefore: Number(order.meta?.symbolExposureBefore || 0),
           correlatedExposureBefore: Number(order.meta?.correlatedExposureBefore || 0),
@@ -619,7 +747,7 @@ export class TradingService {
           weeklyPnL: Number(dailyRealizedPnL || 0),
           consecutiveLosses: 0,
           tradingEnabled: true,
-          killSwitch: false,
+          killSwitch: process.env.KILL_SWITCH_ACTIVE === 'true',
         },
         positions: (await this.positionService.getOpenPositions(order.userId) || []).map((p: any) => ({
           symbol: p.symbol,
@@ -702,7 +830,15 @@ export class TradingService {
       assertLiveEntryProtectionReady(
         account.tradingMode,
         isExit,
-        { nativeStopLossTakeProfit: false },
+        {
+          nativeStopLossTakeProfit: Boolean(
+            (exchangeAdapter as any).nativeProtectionVerified === true
+            &&
+            typeof (exchangeAdapter as any).createProtectionOco === 'function'
+            && typeof (exchangeAdapter as any).cancelProtectionOrder === 'function'
+            && typeof (exchangeAdapter as any).getProtectionOrder === 'function',
+          ),
+        },
       );
       pendingClientOrderId = validatedParams.clientOrderId;
       pendingSymbol = order.symbol;
@@ -735,7 +871,10 @@ export class TradingService {
           stopLoss: Number(normalizedMeta.stopLoss ?? validatedParams.price ?? order.price ?? 0),
           takeProfit: Number(normalizedMeta.targetPrice ?? validatedParams.price ?? order.price ?? 0),
           requestedPositionSize: Number(validatedParams.quantity || 0),
-          riskAmount: Number(validatedParams.quantity || 0),
+          riskAmount: Math.abs(
+            Number(validatedParams.price ?? order.price ?? 0)
+            - Number(normalizedMeta.stopLoss ?? validatedParams.price ?? order.price ?? 0),
+          ) * Number(validatedParams.quantity || 0),
           portfolioHeatBefore: Number(normalizedMeta.portfolioHeatBefore || 0),
           symbolExposureBefore: Number(normalizedMeta.symbolExposureBefore || 0),
           correlatedExposureBefore: Number(normalizedMeta.correlatedExposureBefore || 0),
@@ -761,7 +900,7 @@ export class TradingService {
           weeklyPnL: Number(dailyRealizedPnL || 0),
           consecutiveLosses: 0,
           tradingEnabled: true,
-          killSwitch: false,
+          killSwitch: process.env.KILL_SWITCH_ACTIVE === 'true',
         },
         positions: (await this.positionService.getOpenPositions(order.userId) || []).map((p: any) => ({
           symbol: p.symbol,
@@ -849,6 +988,9 @@ export class TradingService {
 
       return { success: true, externalOrderId: exchangeOrder.externalId || exchangeOrder.id };
     } catch (error) {
+      if (error instanceof Error && /protection|unprotected/i.test(error.message)) {
+        await setKillSwitch(true, `Protection failure during order ${orderId}`);
+      }
       if (exchangeAdapter && pendingClientOrderId && pendingSymbol) {
         try {
           const reconciled = await exchangeAdapter.getOrder(pendingClientOrderId, pendingSymbol);
@@ -1765,7 +1907,27 @@ export class TradingService {
         protectionUpdatedAt: new Date().toISOString(),
       };
 
-      if (adapter && typeof (adapter as any).createProtectionOrder === 'function') {
+      if (adapter && typeof (adapter as any).createProtectionOco === 'function'
+        && normalizedStopLoss !== undefined && normalizedTakeProfit !== undefined) {
+        const listClientOrderId = `pos-${position.id}-oco`;
+        const order = await (adapter as any).createProtectionOco({
+          symbol: position.symbol,
+          side: position.side === 'BUY' ? 'sell' : 'buy',
+          quantity: String(position.quantity),
+          stopLossTriggerPrice: String(normalizedStopLoss),
+          stopLossLimitPrice: String(normalizedStopLoss),
+          takeProfitTriggerPrice: String(normalizedTakeProfit),
+          takeProfitLimitPrice: String(normalizedTakeProfit),
+          listClientOrderId,
+          stopLossClientOrderId: `${listClientOrderId}-sl`,
+          takeProfitClientOrderId: `${listClientOrderId}-tp`,
+        });
+        persisted.protectionState = order.state;
+        persisted.protectionListClientOrderId = listClientOrderId;
+        persisted.protectionListId = order.externalId ?? order.id;
+        persisted.stopLossProtectionClientOrderId = `${listClientOrderId}-sl`;
+        persisted.takeProfitProtectionClientOrderId = `${listClientOrderId}-tp`;
+      } else if (adapter && typeof (adapter as any).createProtectionOrder === 'function') {
         const submissionIds: string[] = [];
         if (normalizedStopLoss !== undefined) {
           const order = await protectionService.create(adapter as any, {
@@ -1843,6 +2005,17 @@ export class TradingService {
       let marketSnapshot: Record<string, unknown>;
       try {
         await marketAdapter.connect(account);
+        const protectionListId = typeof positionMeta.protectionListId === 'string'
+          ? positionMeta.protectionListId
+          : typeof positionMeta.protectionListClientOrderId === 'string'
+            ? positionMeta.protectionListClientOrderId
+            : undefined;
+        const protectionAdapter = marketAdapter as {
+          cancelProtectionOrder?: (orderId: string, symbol?: string) => Promise<void>;
+        };
+        if (protectionListId && typeof protectionAdapter.cancelProtectionOrder === 'function') {
+          await protectionAdapter.cancelProtectionOrder(protectionListId, position.symbol);
+        }
         const snapshot = await fetchCanonicalMarketSnapshot(marketAdapter, {
           symbol: position.symbol,
           side,

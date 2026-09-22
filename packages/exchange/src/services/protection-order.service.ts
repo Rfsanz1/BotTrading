@@ -83,12 +83,24 @@ export class ProtectionOrderService {
   async amend(exchange: IExchange, clientOrderId: string, params: Partial<ProtectionOrderParams>): Promise<ProtectionRecord> {
     const current = this.records.get(clientOrderId);
     if (!current) throw new Error(`Protection order ${clientOrderId} is not known`);
-    if (!exchange.amendProtectionOrder) throw new Error('Exchange does not support native protection amendment');
-    const amended = await exchange.amendProtectionOrder(current.externalId ?? clientOrderId, params);
-    if (!amended.externalId && !amended.id) throw new Error('Protection amendment acknowledgement has no exchange identity');
-    const confirmed = { ...amended, state: 'CONFIRMED' as const, updatedAt: new Date() };
-    this.records.set(clientOrderId, confirmed);
-    return confirmed;
+    if (!exchange.cancelProtectionOrder || !exchange.createProtectionOrder) {
+      throw new Error('Exchange does not support cancel-and-recreate protection amendment');
+    }
+    await this.cancel(exchange, clientOrderId, params.symbol ?? current.symbol);
+    try {
+      return await this.create(exchange, {
+        symbol: params.symbol ?? current.symbol,
+        side: params.side ?? current.side,
+        quantity: params.quantity ?? current.quantity,
+        triggerPrice: params.triggerPrice ?? current.triggerPrice,
+        limitPrice: params.limitPrice ?? current.limitPrice,
+        clientOrderId: params.clientOrderId ?? clientOrderId,
+        kind: params.kind ?? current.kind,
+        timeInForce: params.timeInForce,
+      });
+    } catch (error) {
+      throw new Error(`Protection amendment failed after cancellation; position is unprotected: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   get(clientOrderId: string): ProtectionRecord | undefined {

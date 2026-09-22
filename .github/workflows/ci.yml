@@ -2,25 +2,43 @@ name: CI
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
 
 jobs:
-  build-test:
+  validate:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: rfsanz
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres -d rfsanz"
+          --health-interval 10s --health-timeout 5s --health-retries 5
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/rfsanz
+      REDIS_URL: redis://localhost:6379
+      EXCHANGE_CREDENTIAL_ENCRYPTION_KEY: 01234567890123456789012345678901
+      TRADING_MODE: PAPER
     steps:
       - uses: actions/checkout@v4
-      - name: Use Node.js
-        uses: actions/setup-node@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: 'pnpm'
-      - name: Install pnpm
-        run: npm install -g pnpm
-      - name: Install dependencies
-        run: pnpm install --recursive
-      - name: Typecheck
-        run: pnpm -w -s run -C artifacts/api-server typecheck
-      - name: Run tests
-        run: pnpm -w -s test || true
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --dir packages/database prisma:generate
+      - run: pnpm run typecheck
+      - run: pnpm run build
+      - run: pnpm --dir packages/exchange exec jest --runInBand
+      - run: pnpm --dir apps/api run test:all

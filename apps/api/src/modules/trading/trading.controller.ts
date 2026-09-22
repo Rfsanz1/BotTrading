@@ -180,7 +180,7 @@ export class TradingController {
       await this.tradingService.assertOrderOwner(orderId, this.getUserId(req));
       const result = await this.tradingService.submitToExchange(orderId);
       return {
-        success: result.success || true,
+        success: result.success,
         data: result,
         message: 'Order submitted to exchange',
       };
@@ -209,7 +209,7 @@ export class TradingController {
       await this.tradingService.assertOrderOwner(orderId, this.getUserId(req));
       const result = await this.tradingService.cancelOrder(orderId);
       return {
-        success: result.success || true,
+        success: result.success,
         data: result,
         message: 'Order canceled successfully',
       };

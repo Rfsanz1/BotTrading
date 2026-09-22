@@ -10,6 +10,7 @@
     "test:all": "set -a && if [ -f ./.env.paper ]; then . ./.env.paper; else . ./.env.paper.example; fi && set +a && pnpm --dir ../../packages/exchange exec jest --config ../../apps/api/jest.config.js --runInBand",
     "start": "node dist/main.js",
     "credentials:testnet:create": "pnpm run build && node dist/modules/credentials/operator-cli-entry.js",
+    "credentials:live:create": "pnpm run build && node dist/modules/credentials/live-operator-cli-entry.js",
     "auth:password-reset": "pnpm run build && node dist/modules/auth/password-reset-operator-entry.js",
     "auth:bootstrap-password": "pnpm run build && node dist/modules/auth/password-bootstrap-operator-entry.js",
     "dev": "ts-node-dev --respawn --transpile-only src/main.ts",
