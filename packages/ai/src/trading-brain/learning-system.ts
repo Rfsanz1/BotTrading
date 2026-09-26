@@ -88,7 +88,7 @@ export class LearningSystem {
         setup: snapshot.setup ?? undefined,
         action: snapshot.decision ?? 'HOLD',
         rawConfidence: Number(snapshot.rawConfidence ?? 0),
-        predictedProbability: Number(snapshot.calibratedProbability ?? snapshot.rawConfidence ?? 0),
+        predictedProbability: snapshot.calibratedProbability == null ? null : Number(snapshot.calibratedProbability),
         actualOutcome: outcomes.find((outcome: any) => outcome.decisionId === snapshot.decisionId)?.winLoss ?? 'pending',
         realizedPnL: Number(outcomes.find((outcome: any) => outcome.decisionId === snapshot.decisionId)?.realizedPnL ?? 0),
         realizedR: Number(outcomes.find((outcome: any) => outcome.decisionId === snapshot.decisionId)?.realizedR ?? 0),
@@ -139,8 +139,10 @@ export class LearningSystem {
   private normalizePrediction(input: Partial<PredictionRecord>): PredictionRecord {
     const rawValue = input.rawConfidence != null ? Number(input.rawConfidence) : 0;
     const rawConfidence = clamp(Number.isFinite(rawValue) ? rawValue : 0, 0, 1);
-    const predictedValue = input.predictedProbability != null ? Number(input.predictedProbability) : rawConfidence;
-    const predictedProbability = clamp(Number.isFinite(predictedValue) ? predictedValue : rawConfidence, 0, 1);
+    const predictedValue = input.predictedProbability != null ? Number(input.predictedProbability) : null;
+    const predictedProbability = predictedValue !== null && Number.isFinite(predictedValue)
+      ? clamp(predictedValue, 0, 1)
+      : null;
 
     return {
       decisionId: input.decisionId ?? `decision-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -351,12 +353,13 @@ export class LearningSystem {
 
     this.state.calibrationBuckets = buckets.map((bucket) => {
       const matches = completed.filter((p) => {
+        if (p.predictedProbability === null) return false;
         const conf = Math.round(p.predictedProbability * 100);
         return conf >= bucket.min && conf <= bucket.max;
       });
       if (matches.length === 0) return { bucket: bucket.bucket, samples: 0, predicted_probability: 0, actual_win_rate: 0, calibration_error: 0 };
 
-      const expected = matches.reduce((sum, p) => sum + p.predictedProbability, 0) / matches.length;
+      const expected = matches.reduce((sum, p) => sum + (p.predictedProbability ?? 0), 0) / matches.length;
       const actual = matches.filter((p) => p.actualOutcome === 'win').length / matches.length;
       return {
         bucket: bucket.bucket,

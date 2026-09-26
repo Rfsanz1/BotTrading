@@ -33,4 +33,23 @@ describe('symbol price normalization', () => {
     expect(validator.normalizeProtectionPrice(100.001, info, 'SELL', 'stop')).toBe(100.01);
     expect(validator.normalizeProtectionPrice(99.999, info, 'SELL', 'target')).toBe(99.99);
   });
+
+  it('uses MARKET_LOT_SIZE and validates market notional with a reference price', () => {
+    const validator = new SymbolValidator();
+    const info = {
+      symbol: 'BTCUSDT',
+      status: 'TRADING',
+      filters: [
+        { filterType: 'LOT_SIZE', stepSize: '0.0001', minQty: '0.0001', maxQty: '100' },
+        { filterType: 'MARKET_LOT_SIZE', stepSize: '0.001', minQty: '0.001', maxQty: '10' },
+        { filterType: 'NOTIONAL', minNotional: '10', applyMinToMarket: true },
+      ],
+    };
+    expect(validator.validateOrderAgainstSymbolFilters({
+      symbol: 'BTCUSDT', side: 'buy', type: 'market', quantity: '0.0019',
+    }, info, '10000').quantity).toBe('0.001');
+    expect(() => validator.validateOrderAgainstSymbolFilters({
+      symbol: 'BTCUSDT', side: 'buy', type: 'market', quantity: '0.001',
+    }, info, '9000')).toThrow('below minimum');
+  });
 });

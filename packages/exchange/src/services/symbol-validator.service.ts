@@ -76,8 +76,27 @@ export class SymbolValidator {
     if (!symbolInfo) return params;
     let validated = this.validateLotSize(params, symbolInfo);
     if (validated.price) validated = this.validatePrice(validated, symbolInfo);
-    if (validated.price) validated = this.validateNotional(validated, symbolInfo);
+    if (validated.price || validated.type === 'market') validated = this.validateNotional(validated, symbolInfo);
     return validated;
+  }
+
+  validateOrderAgainstSymbolFilters(
+    params: OrderParams,
+    symbolInfo: ExchangeSymbolInfo,
+    referencePrice?: string,
+  ): OrderParams {
+    const validated = this.validateLotSize(params, symbolInfo);
+    const priced = validated.price ? this.validatePrice(validated, symbolInfo) : validated;
+    if (priced.price || (priced.type === 'market' && referencePrice)) {
+      return this.validateNotional(priced, symbolInfo, referencePrice);
+    }
+    if (priced.type === 'market' && !referencePrice) {
+      const notionalFilter = this.findFilter(symbolInfo, 'NOTIONAL') ?? this.findFilter(symbolInfo, 'MIN_NOTIONAL');
+      if (notionalFilter?.applyToMarket || notionalFilter?.applyMinToMarket) {
+        throw new Error(`Reference price is required to validate market notional for ${symbolInfo.symbol}`);
+      }
+    }
+    return priced;
   }
 
   normalizeProtectionPrice(price: number | undefined, exchangeInfo: ExchangeSymbolInfo, side: 'BUY' | 'SELL', kind: 'stop' | 'target'): number | undefined {
@@ -99,7 +118,9 @@ export class SymbolValidator {
   }
 
   private validateLotSize(params: OrderParams, symbolInfo: ExchangeSymbolInfo): OrderParams {
-    const filter = this.findFilter(symbolInfo, 'LOT_SIZE');
+    const filter = params.type === 'market'
+      ? this.findFilter(symbolInfo, 'MARKET_LOT_SIZE') ?? this.findFilter(symbolInfo, 'LOT_SIZE')
+      : this.findFilter(symbolInfo, 'LOT_SIZE');
     if (!filter?.stepSize) return params;
     const quantity = Number(params.quantity);
     const min = Number(filter.minQty ?? '0');
@@ -129,12 +150,19 @@ export class SymbolValidator {
     return { ...params, price: normalized };
   }
 
-  private validateNotional(params: OrderParams, symbolInfo: ExchangeSymbolInfo): OrderParams {
+  private validateNotional(params: OrderParams, symbolInfo: ExchangeSymbolInfo, referencePrice?: string): OrderParams {
     const filter = this.findFilter(symbolInfo, 'NOTIONAL') ?? this.findFilter(symbolInfo, 'MIN_NOTIONAL');
-    if (!filter?.minNotional || params.price === undefined) return params;
-    const notional = Number(params.quantity) * Number(params.price);
-    if (!Number.isFinite(notional) || notional < Number(filter.minNotional)) {
+    if (!filter) return params;
+    const effectivePrice = params.price ?? referencePrice;
+    if (!effectivePrice) return params;
+    const notional = Number(params.quantity) * Number(effectivePrice);
+    const minApplies = params.type !== 'market' || filter.applyToMarket !== false && filter.applyMinToMarket !== false;
+    const maxApplies = params.type !== 'market' || filter.applyToMarket !== false && filter.applyMaxToMarket === true;
+    if (minApplies && filter.minNotional && (!Number.isFinite(notional) || notional < Number(filter.minNotional))) {
       throw new Error(`Order value ${notional} below minimum ${filter.minNotional} for ${symbolInfo.symbol}`);
+    }
+    if (maxApplies && filter.maxNotional && (!Number.isFinite(notional) || notional > Number(filter.maxNotional))) {
+      throw new Error(`Order value ${notional} above maximum ${filter.maxNotional} for ${symbolInfo.symbol}`);
     }
     return params;
   }

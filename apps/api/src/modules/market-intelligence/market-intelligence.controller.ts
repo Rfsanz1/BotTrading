@@ -30,6 +30,11 @@ export class MarketIntelligenceController {
     return this.symbols.list();
   }
 
+  @Get('symbols/health')
+  async symbolsHealth() {
+    return this.symbols.health();
+  }
+
   @Get('timeframes')
   async timeframesList() {
     return this.timeframes.list();

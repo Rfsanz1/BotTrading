@@ -7658,13 +7658,18 @@ def health_monitor_loop() -> None:
                         if drop_pct >= HEALTH_EQUITY_DROP_PCT and (now - last_equity_alert) >= 3600:
                             with bot_paused_lock:
                                 is_paused = bot_paused
+                            hard_stop_status = (
+                                "⏸ bot sudah di\\-pause"
+                                if is_paused
+                                else f"⚠️ belum tercapai \\(masih {HARD_STOP_LOSS_PCT - drop_pct:.1f}% lagi\\)"
+                            )
                             send_telegram_message(
                                 f"🚨 *Alert: Equity turun `{drop_pct:.2f}%` hari ini\\!*\n\n"
                                 f"Equity awal    : `{daily_start_equity:.4f} USDT`\n"
                                 f"Equity sekarang: `{equity:.4f} USDT`\n"
                                 f"Penurunan      : `{drop_pct:.2f}%`\n\n"
                                 f"Hard stop di `{HARD_STOP_LOSS_PCT}%` — "
-                                f"{'⏸ bot sudah di\\-pause' if is_paused else f'⚠️ belum tercapai \\(masih {HARD_STOP_LOSS_PCT - drop_pct:.1f}% lagi\\)'}\\.",
+                                f"{hard_stop_status}\\.",
                                 topic_id=TELEGRAM_ALERTS_TOPIC_ID or TELEGRAM_REPORT_TOPIC_ID,
                             )
                             last_equity_alert = now

@@ -2,7 +2,11 @@
 Test koneksi Telegram Bot
 Jalankan: python3 test_telegram.py
 """
-import os, requests, json
+import os, requests, json, sys
+
+if "pytest" in sys.modules and not os.getenv("TELEGRAM_BOT_TOKEN"):
+    import pytest
+    pytest.skip("Telegram credential is not configured in the test environment", allow_module_level=True)
 
 TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")

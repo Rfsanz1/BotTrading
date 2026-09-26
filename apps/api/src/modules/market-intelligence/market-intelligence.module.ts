@@ -25,9 +25,35 @@ import { QuantitativeAnalysisController } from './quantitative-analysis.controll
 import { QuantitativeAnalysisGateway } from './quantitative-analysis.gateway';
 import { QuantitativeAnalysisRepository } from './quantitative-analysis.repository';
 import { QuantitativeAnalysisService } from './services/quantitative-analysis.service';
+import { BinanceMarketClient } from './collectors/binance-market-client';
+import { DataQualityService } from './services/data-quality.service';
+import { LocalOrderBookEngine } from './services/local-order-book.engine';
+import { TradeFlowService } from './services/trade-flow.service';
+import { CanonicalMarketCacheService } from './services/canonical-market-cache.service';
+import { MarketStreamEventRouterService } from './services/market-stream-event-router.service';
+import { BinanceMarketDataService } from './services/binance-market-data.service';
+import { MultiTimeframeService } from './services/multi-timeframe.service';
+import { RegimeService } from './services/regime.service';
+import { OpportunityService } from './services/opportunity.service';
+import { FuturesIntelligenceService } from './services/futures-intelligence.service';
+import { LiquidationService } from './services/liquidation.service';
+import { MarketAnalysisService } from './services/market-analysis.service';
+import { MarketStructureService } from './services/market-structure.service';
+import { AiValidationService } from './services/ai-validation.service';
+import { ExpectedValueService } from './services/expected-value.service';
+import { EntryExitService } from './services/entry-exit.service';
+import { TradingDecisionPipelineService } from './services/trading-decision-pipeline.service';
+import { PaperTradingService } from './services/paper-trading.service';
+import { PaperOutcomePersistenceService } from './services/paper-outcome-persistence.service';
+import { UniverseScannerService } from './services/universe-scanner.service';
+import { MarketObservabilityService } from './services/market-observability.service';
+import { RecoverySchedulerService } from './services/recovery-scheduler.service';
+import { BinanceShardManagerService } from './services/binance-shard-manager.service';
+import { PaperForwardValidationService } from './services/paper-forward-validation.service';
+import { AnalysisModule } from '../analysis/analysis.module';
 
 @Module({
-  imports: [EventEmitterModule.forRoot()],
+  imports: [EventEmitterModule.forRoot(), AnalysisModule],
   controllers: [MarketIntelligenceController, QuantitativeAnalysisController],
   providers: [
     PrismaService,
@@ -52,6 +78,34 @@ import { QuantitativeAnalysisService } from './services/quantitative-analysis.se
     MarketIntelligenceScheduler,
     QuantitativeAnalysisService,
     QuantitativeAnalysisRepository,
+    {
+      provide: BinanceMarketClient,
+      useFactory: () => new BinanceMarketClient(),
+    },
+    DataQualityService,
+    LocalOrderBookEngine,
+    TradeFlowService,
+    LiquidationService,
+    FuturesIntelligenceService,
+    CanonicalMarketCacheService,
+    MarketStreamEventRouterService,
+    BinanceMarketDataService,
+    MultiTimeframeService,
+    RegimeService,
+    OpportunityService,
+    MarketAnalysisService,
+    MarketStructureService,
+    AiValidationService,
+    ExpectedValueService,
+    EntryExitService,
+    TradingDecisionPipelineService,
+    PaperTradingService,
+    PaperForwardValidationService,
+    PaperOutcomePersistenceService,
+    UniverseScannerService,
+    MarketObservabilityService,
+    RecoverySchedulerService,
+    BinanceShardManagerService,
     QuantitativeAnalysisGateway,
     {
       provide: 'MARKET_COLLECTORS',
@@ -95,6 +149,17 @@ import { QuantitativeAnalysisService } from './services/quantitative-analysis.se
       ],
     },
   ],
-  exports: [MarketSyncService, MarketAggregatorService, SymbolRegistryService, TimeframeRegistryService, QuantitativeAnalysisService],
+  exports: [
+    MarketSyncService,
+    MarketAggregatorService,
+    SymbolRegistryService,
+    TimeframeRegistryService,
+    QuantitativeAnalysisService,
+    PrismaService,
+    BinanceMarketClient,
+    PaperTradingService,
+    UniverseScannerService,
+    MarketObservabilityService,
+  ],
 })
 export class MarketIntelligenceModule {}

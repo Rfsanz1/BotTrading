@@ -442,44 +442,45 @@ export class AITradingBrain {
   private parseAIResponse(response: string): any {
     const raw = typeof response === 'string' ? response.trim() : '';
     if (!raw) {
-      return { recommendation: 'HOLD', entryPrice: 0, targetPrice: 0, stopLoss: 0, takeProfit: 0, riskRewardRatio: 2, consensusDetails: { providers: [], aggregationMethod: 'structured-fallback', agreementScore: 0 } };
+      throw new Error('AI_UNAVAILABLE: provider returned an empty response');
     }
 
     try {
       const parsed = JSON.parse(raw);
       if (parsed && typeof parsed === 'object') {
+        const direction = parsed.direction;
+        const confidenceRaw = Number(parsed.confidenceRaw);
+        const arrays = ['supportingFactors', 'conflictingFactors', 'riskWarnings'];
+        if (
+          !['LONG', 'SHORT', 'NEUTRAL'].includes(direction)
+          || !Number.isFinite(confidenceRaw)
+          || confidenceRaw < 0
+          || confidenceRaw > 1
+          || typeof parsed.setupType !== 'string'
+          || typeof parsed.invalidation !== 'string'
+          || typeof parsed.rationale !== 'string'
+          || arrays.some((key) => !Array.isArray(parsed[key]) || parsed[key].some((item: unknown) => typeof item !== 'string'))
+        ) {
+          throw new Error('AI_INVALID: structured response schema validation failed');
+        }
         const normalized = {
-          recommendation: ['BUY', 'SELL', 'HOLD'].includes(parsed.decision || parsed.action) ? (parsed.decision || parsed.action) : 'HOLD',
-          entryPrice: Number.isFinite(Number(parsed.entry ?? parsed.entryPrice)) ? Number(parsed.entry ?? parsed.entryPrice) : 0,
-          targetPrice: Number.isFinite(Number(parsed.target ?? parsed.takeProfit ?? 0)) ? Number(parsed.target ?? parsed.takeProfit ?? 0) : 0,
-          stopLoss: Number.isFinite(Number(parsed.stopLoss ?? parsed.stop_loss ?? 0)) ? Number(parsed.stopLoss ?? parsed.stop_loss ?? 0) : 0,
-          takeProfit: Number.isFinite(Number(parsed.takeProfit ?? parsed.target ?? 0)) ? Number(parsed.takeProfit ?? parsed.target ?? 0) : 0,
-          riskRewardRatio: Number.isFinite(Number(parsed.riskRewardRatio ?? parsed.risk_reward ?? 2)) ? Number(parsed.riskRewardRatio ?? parsed.risk_reward ?? 2) : 2,
-          reasoning: parsed.reasoning || parsed.analysis || '',
+          recommendation: direction === 'LONG' ? 'BUY' : direction === 'SHORT' ? 'SELL' : 'HOLD',
+          confidenceRaw,
+          setupType: parsed.setupType,
+          supportingFactors: parsed.supportingFactors,
+          conflictingFactors: parsed.conflictingFactors,
+          riskWarnings: parsed.riskWarnings,
+          invalidation: parsed.invalidation,
+          reasoning: parsed.rationale,
           consensusDetails: { providers: [], aggregationMethod: 'structured-json', agreementScore: 0 },
         };
         return normalized;
       }
-    } catch {
-      // Falls back to a conservative text-based parser for non-JSON provider output.
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith('AI_INVALID')) throw error;
+      throw new Error('AI_INVALID: response was not valid structured JSON');
     }
-
-    const lowered = raw.toUpperCase();
-    const recommendation = lowered.includes('BUY') ? 'BUY' : lowered.includes('SELL') ? 'SELL' : 'HOLD';
-    const entryMatch = raw.match(/entry\s*[:=]\s*\$?([0-9]*\.?[0-9]+)/i);
-    const targetMatch = raw.match(/target\s*[:=]\s*\$?([0-9]*\.?[0-9]+)/i);
-    const stopMatch = raw.match(/stop(?:loss)?\s*[:=]\s*\$?([0-9]*\.?[0-9]+)/i);
-    const tpMatch = raw.match(/take[- ]?profit\s*[:=]\s*\$?([0-9]*\.?[0-9]+)/i);
-
-    return {
-      recommendation,
-      entryPrice: entryMatch ? Number(entryMatch[1]) : 0,
-      targetPrice: targetMatch ? Number(targetMatch[1]) : 0,
-      stopLoss: stopMatch ? Number(stopMatch[1]) : 0,
-      takeProfit: tpMatch ? Number(tpMatch[1]) : 0,
-      riskRewardRatio: 2,
-      consensusDetails: { providers: [], aggregationMethod: 'text-fallback', agreementScore: 0 },
-    };
+    throw new Error('AI_INVALID: unsupported provider response');
   }
 
   /**

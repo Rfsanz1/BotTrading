@@ -23,7 +23,14 @@ export type ExchangeSymbolFilter = {
   maxQty?: string;
   stepSize?: string;
   minNotional?: string;
+  maxNotional?: string;
   applyToMarket?: boolean;
+  applyMinToMarket?: boolean;
+  applyMaxToMarket?: boolean;
+  bidMultiplierUp?: string;
+  bidMultiplierDown?: string;
+  askMultiplierUp?: string;
+  askMultiplierDown?: string;
   avgPriceMins?: number;
 };
 

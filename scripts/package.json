@@ -14,6 +14,8 @@
     "paper:reconnect-test": "node --experimental-strip-types ./src/paper-reconnect-test.ts",
     "paper:failure-test": "node --experimental-strip-types ./src/paper-failure-test.ts",
     "paper:offline": "node --experimental-strip-types ./src/local-offline-paper.ts",
+    "paper:status": "node --experimental-strip-types ./src/paper-status.ts",
+    "paper:dry-run": "node --experimental-strip-types ./src/paper-dry-run.ts",
     "testnet:preflight": "node --experimental-strip-types ./src/testnet-preflight.ts",
     "live:preflight": "node --experimental-strip-types ./src/live-preflight.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"

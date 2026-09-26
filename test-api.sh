@@ -6,7 +6,7 @@
 # ═════════════════════════════════════════════════════════════════
 
 # Configuration
-HOST="http://localhost:3000"
+HOST="http://localhost:${PORT:-3001}"
 TOKEN="your_bearer_token_here"  # Replace with actual token
 USER_ID="user-123"              # Replace with actual user ID
 USER_EMAIL="user@example.com"   # Replace with actual email

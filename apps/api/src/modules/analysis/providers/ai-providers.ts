@@ -11,6 +11,13 @@ type Analysis = {
   keyPoints?: string[];
 };
 
+export interface ProviderRuntimeStatus {
+  provider: string;
+  endpointConfigured: boolean;
+  credentialConfigured: boolean;
+  modelConfigured: boolean;
+}
+
 export abstract class BaseAIProvider implements IAIProvider {
   protected readonly logger = new Logger(this.constructor.name);
   abstract getName(): string;
@@ -25,24 +32,43 @@ export abstract class BaseAIProvider implements IAIProvider {
     return Boolean(endpoint && key);
   }
 
+  runtimeStatus(): ProviderRuntimeStatus {
+    return {
+      provider: this.getName(),
+      endpointConfigured: Boolean(process.env[this.endpointEnv]),
+      credentialConfigured: this.keyEnv ? Boolean(process.env[this.keyEnv]) : Boolean(process.env.OLLAMA_ENDPOINT),
+      modelConfigured: Boolean(process.env.AI_MODEL || process.env[`${this.getName()}_MODEL`]),
+    };
+  }
+
   protected async callConfiguredProvider(symbol: string, data: Record<string, any>): Promise<Analysis> {
     const endpoint = process.env[this.endpointEnv];
     const key = this.keyEnv ? process.env[this.keyEnv] : undefined;
     if (!endpoint || (this.keyEnv && !key)) {
       throw new AIProviderNotAvailableException(this.getName());
     }
-    const response = await fetch(endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        ...(key ? { authorization: `Bearer ${key}` } : {}),
-      },
-      body: JSON.stringify({
-        symbol,
-        market: data,
-        response_format: 'json',
-      }),
-    });
+    const controller = new AbortController();
+    const timeoutMs = Math.max(1_000, Math.min(30_000, Number(process.env.AI_REQUEST_TIMEOUT_MS ?? 8_000)));
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    let response: Response;
+    try {
+      response = await fetch(endpoint, {
+        method: 'POST',
+        signal: controller.signal,
+        headers: {
+          'content-type': 'application/json',
+          ...(key ? { authorization: `Bearer ${key}` } : {}),
+        },
+        body: JSON.stringify({
+          symbol,
+          market: data,
+          model: process.env.AI_MODEL || process.env[`${this.getName()}_MODEL`],
+          response_format: 'json',
+        }),
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
     if (!response.ok) throw new Error(`${this.getName()} returned HTTP ${response.status}`);
     const payload = await response.json() as Record<string, unknown>;
     const candidate = (payload.result ?? payload.output ?? payload) as Record<string, unknown>;

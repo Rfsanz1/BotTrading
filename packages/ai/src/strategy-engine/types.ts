@@ -146,7 +146,42 @@ export interface BacktestReport {
   maxDrawdown: number;
   profitFactor: number;
   sharpeRatio: number;
+  sortinoRatio?: number;
+  expectancy?: number;
+  fees?: number;
+  slippage?: number;
+  funding?: number;
   trades: BacktestTrade[];
+}
+
+export interface BacktestExecutionConfig {
+  spreadBps: number;
+  slippageBps: number;
+  feeBps: number;
+  fundingBpsPerBar?: number;
+}
+
+export interface BacktestAuditResult {
+  report: BacktestReport;
+  lookaheadFree: boolean;
+  parityChecked: boolean;
+  executionPolicy: string;
+}
+
+export type IntrabarExit = 'STOP_LOSS' | 'TAKE_PROFIT' | 'NONE';
+
+export interface WalkForwardSegment {
+  train: BacktestReport;
+  validation: BacktestReport;
+  test: BacktestReport;
+  selectedStrategyId: string;
+}
+
+export interface WalkForwardAuditResult {
+  strategyId: string;
+  segments: WalkForwardSegment[];
+  lookaheadFree: boolean;
+  testDataUsedForSelection: boolean;
 }
 
 export interface OptimizationResult {

@@ -247,7 +247,7 @@ export interface PredictionRecord {
   setup?: string;
   action: 'BUY' | 'SELL' | 'HOLD';
   rawConfidence: number; // 0-1
-  predictedProbability: number; // 0-1
+  predictedProbability: number | null; // 0-1, unavailable until calibrated
   actualOutcome?: 'win' | 'loss' | 'neutral' | 'pending';
   realizedPnL?: number;
   realizedR?: number;

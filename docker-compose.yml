@@ -44,8 +44,16 @@ services:
     environment:
       NODE_ENV: production
       PORT: "3001"
-      TRADING_MODE: TESTNET
+      TRADING_MODE: PAPER
       LIVE_TRADING_ENABLED: "false"
+      PAPER_COLD_START_ENABLED: "false"
+      ENABLE_BINANCE_MARKET_STREAMS: "true"
+      BINANCE_WS_MAX_STREAMS_PER_SHARD: "80"
+      BINANCE_WS_MAX_URL_BYTES: "6000"
+      BINANCE_WS_MAX_SHARDS: "64"
+    dns:
+      - 1.1.1.1
+      - 8.8.8.8
     ports:
       - "3001:3001"
     networks:

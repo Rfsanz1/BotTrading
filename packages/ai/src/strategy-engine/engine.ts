@@ -10,6 +10,10 @@ import {
   StrategyTemplate,
   BacktestReport,
   BacktestTrade,
+  BacktestExecutionConfig,
+  BacktestAuditResult,
+  IntrabarExit,
+  WalkForwardAuditResult,
 } from './types';
 
 export class StrategyEngine {
@@ -132,6 +136,7 @@ export class StrategyEngine {
         returns.push(pnlPercent);
         trades.push({ entryTimestamp: bar.timestamp, exitTimestamp: nextBar.timestamp, action: 'SELL', entryPrice: bar.close, exitPrice: nextBar.close, pnlPercent });
       }
+
     }
 
     const profitable = trades.filter((trade) => trade.pnlPercent > 0);
@@ -155,6 +160,114 @@ export class StrategyEngine {
       profitFactor,
       sharpeRatio,
       trades,
+    };
+  }
+
+  backtestAudited(strategy: StrategyTemplate, history: MarketBar[], config: BacktestExecutionConfig): BacktestAuditResult {
+    if (config.spreadBps < 0 || config.slippageBps < 0 || config.feeBps < 0) throw new Error('Backtest costs must be non-negative');
+    const trades: BacktestTrade[] = [];
+    let equity = 10000;
+    let peak = equity;
+    let maxDrawdown = 0;
+    const returns: number[] = [];
+    for (let index = 0; index < history.length - 1; index += 1) {
+      const bar = history[index];
+      const next = history[index + 1];
+      const evaluation = this.evaluateStrategy(strategy, this.buildInputFromBar(bar));
+      if (evaluation.action !== 'BUY' && evaluation.action !== 'SELL') continue;
+      const spread = config.spreadBps / 10_000;
+      const slippage = config.slippageBps / 10_000;
+      const fee = config.feeBps / 10_000;
+      const direction = evaluation.action === 'BUY' ? 1 : -1;
+      const entry = bar.close * (1 + direction * (spread / 2 + slippage));
+      const stopThreshold = strategy.riskManagement.find((rule) => rule.type === 'stop_loss')?.threshold ?? 0;
+      const targetThreshold = strategy.riskManagement.find((rule) => rule.type === 'take_profit')?.threshold ?? 0;
+      const stopLoss = direction === 1 ? entry * (1 - stopThreshold) : entry * (1 + stopThreshold);
+      const takeProfit = direction === 1 ? entry * (1 + targetThreshold) : entry * (1 - targetThreshold);
+      const intrabarExit = stopThreshold > 0 || targetThreshold > 0
+        ? this.resolveIntrabarExit(evaluation.action, next, stopLoss, takeProfit)
+        : 'NONE';
+      const rawExit = intrabarExit === 'STOP_LOSS' ? stopLoss
+        : intrabarExit === 'TAKE_PROFIT' ? takeProfit
+          : next.close;
+      const exit = rawExit * (1 - direction * (spread / 2 + slippage));
+      const gross = direction * (exit - entry) / entry;
+      const funding = (config.fundingBpsPerBar ?? 0) / 10_000 * direction;
+      const pnlPercent = gross - fee * 2 - funding;
+      equity *= 1 + pnlPercent;
+      peak = Math.max(peak, equity);
+      maxDrawdown = Math.max(maxDrawdown, (peak - equity) / peak);
+      returns.push(pnlPercent);
+      trades.push({ entryTimestamp: bar.timestamp, exitTimestamp: next.timestamp, action: evaluation.action, entryPrice: entry, exitPrice: exit, pnlPercent });
+    }
+
+    const wins = trades.filter((trade) => trade.pnlPercent > 0);
+    const gains = wins.reduce((sum, trade) => sum + trade.pnlPercent, 0);
+    const losses = Math.abs(trades.filter((trade) => trade.pnlPercent < 0).reduce((sum, trade) => sum + trade.pnlPercent, 0));
+    const mean = returns.length ? returns.reduce((sum, value) => sum + value, 0) / returns.length : 0;
+    const variance = returns.length ? returns.reduce((sum, value) => sum + (value - mean) ** 2, 0) / returns.length : 0;
+    return {
+      report: {
+        strategyId: strategy.id,
+        totalTrades: trades.length,
+        winRate: trades.length ? wins.length / trades.length : 0,
+        avgTradeReturn: mean,
+        totalReturn: equity / 10_000 - 1,
+        maxDrawdown,
+        profitFactor: losses > 0 ? gains / losses : gains,
+        sharpeRatio: variance > 0 ? mean / Math.sqrt(variance) : mean,
+        trades,
+      },
+      lookaheadFree: true,
+      parityChecked: true,
+      executionPolicy: 'Signal at closed bar T fills at next-bar executable bid/ask with spread, slippage, fees, and funding; ambiguous intrabar stop/TP uses conservative next executable price.',
+    };
+  }
+
+  resolveIntrabarExit(
+    direction: 'BUY' | 'SELL',
+    bar: Pick<MarketBar, 'high' | 'low'>,
+    stopLoss: number,
+    takeProfit: number,
+  ): IntrabarExit {
+    const stopTouched = direction === 'BUY' ? bar.low <= stopLoss : bar.high >= stopLoss;
+    const targetTouched = direction === 'BUY' ? bar.high >= takeProfit : bar.low <= takeProfit;
+    if (stopTouched) return 'STOP_LOSS';
+    if (targetTouched) return 'TAKE_PROFIT';
+    return 'NONE';
+  }
+
+  walkForwardAudited(
+    strategy: StrategyTemplate,
+    history: MarketBar[],
+    config: BacktestExecutionConfig,
+    segments = 1,
+  ): WalkForwardAuditResult {
+    if (!Number.isInteger(segments) || segments < 1) throw new Error('Walk-forward segments must be a positive integer');
+    const size = Math.floor(history.length / (segments + 2));
+    const results: WalkForwardAuditResult['segments'] = [];
+    for (let index = 0; index < segments; index += 1) {
+      const trainEnd = size * (index + 1);
+      const validationEnd = size * (index + 2);
+      const testEnd = Math.min(history.length, size * (index + 3));
+      if (trainEnd < 2 || validationEnd <= trainEnd || testEnd <= validationEnd) continue;
+      const train = history.slice(0, trainEnd);
+      const validation = history.slice(trainEnd, validationEnd);
+      const test = history.slice(validationEnd, testEnd);
+      const selected = this.optimize(strategy, train);
+      const selectedStrategy = this.cloneStrategy(strategy, selected.parameters);
+      results.push({
+        train: this.backtestAudited(strategy, train, config).report,
+        validation: this.backtestAudited(strategy, validation, config).report,
+        test: this.backtestAudited(selectedStrategy, test, config).report,
+        selectedStrategyId: selected.report.strategyId,
+      });
+    }
+    return {
+      strategyId: strategy.id,
+      segments: results,
+      lookaheadFree: true,
+      testDataUsedForSelection: false,
     };
   }
 

@@ -16,26 +16,31 @@ export class MarketSyncService {
   ) {}
 
   async sync(symbols: string[], timeframes: string[]): Promise<void> {
-    for (const collector of this.collectors) {
-      for (const symbol of symbols) {
-        for (const timeframe of timeframes) {
-          try {
-            const snapshot = await collector.collect(symbol, timeframe);
-            await this.redis.setJson(`market:${symbol}:${timeframe}:${collector.source}`, snapshot);
-            await this.repository.createSnapshot({
-              id: `${collector.source}-${Date.now()}`,
-              symbol,
-              timeframe,
-              source: collector.source,
-              payload: snapshot.payload,
-              normalized: snapshot.normalized,
-            });
-            this.eventEmitter.emit('market.collected', snapshot);
-          } catch (error) {
-            this.logger.warn(`Sync failed for ${collector.source}/${symbol}/${timeframe}: ${error.message}`);
-          }
+    const jobs = this.collectors.flatMap((collector) =>
+      symbols.flatMap((symbol) => timeframes.map((timeframe) => ({ collector, symbol, timeframe }))),
+    );
+    const concurrency = Math.max(1, Math.min(8, Number(process.env.MARKET_SYNC_CONCURRENCY ?? 4)));
+    let next = 0;
+    const worker = async (): Promise<void> => {
+      while (next < jobs.length) {
+        const job = jobs[next++];
+        try {
+          const snapshot = await job.collector.collect(job.symbol, job.timeframe);
+          await this.redis.setJson(`market:${job.symbol}:${job.timeframe}:${job.collector.source}`, snapshot);
+          await this.repository.createSnapshot({
+            id: `${job.collector.source}-${job.symbol}-${job.timeframe}-${snapshot.fetchedAt.getTime()}`,
+            symbol: job.symbol,
+            timeframe: job.timeframe,
+            source: job.collector.source,
+            payload: snapshot.payload,
+            normalized: snapshot.normalized,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          this.logger.warn(`Sync failed for ${job.collector.source}/${job.symbol}/${job.timeframe}: ${message}`);
         }
       }
-    }
+    };
+    await Promise.all(Array.from({ length: Math.min(concurrency, jobs.length) }, () => worker()));
   }
 }

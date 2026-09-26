@@ -12,6 +12,7 @@ import tempfile
 import threading
 import time
 import unittest
+from datetime import datetime, timezone, timedelta
 from unittest.mock import patch, MagicMock
 
 # Add bot directory to path
@@ -117,13 +118,18 @@ class TestAnalyticsEngine(unittest.TestCase):
         os.unlink(self.db_path)
 
     def _create_db(self, rows=None):
+        def ts(days_ago: int, hour: int) -> str:
+            return (datetime.now(timezone.utc) - timedelta(days=days_ago)).replace(
+                hour=hour, minute=0, second=0, microsecond=0
+            ).isoformat()
+
         if rows is None:
             rows = [
-                ("2026-07-15T10:00:00+00:00", "BTCUSDT",  5.0, "CLOSED_TP"),
-                ("2026-07-15T11:00:00+00:00", "BTCUSDT", -2.0, "CLOSED_SL"),
-                ("2026-07-16T10:00:00+00:00", "ETHUSDT",  3.0, "CLOSED_TP"),
-                ("2026-07-16T11:00:00+00:00", "ETHUSDT", -1.0, "CLOSED_SL"),
-                ("2026-07-17T10:00:00+00:00", "BTCUSDT",  4.0, "CLOSED_TP"),
+                (ts(8, 10), "BTCUSDT",  5.0, "CLOSED_TP"),
+                (ts(8, 11), "BTCUSDT", -2.0, "CLOSED_SL"),
+                (ts(7, 10), "ETHUSDT",  3.0, "CLOSED_TP"),
+                (ts(7, 11), "ETHUSDT", -1.0, "CLOSED_SL"),
+                (ts(6, 10), "BTCUSDT",  4.0, "CLOSED_TP"),
             ]
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("""
@@ -164,8 +170,8 @@ class TestAnalyticsEngine(unittest.TestCase):
 
     def test_compute_analytics_all_wins(self):
         rows = [
-            ("2026-07-17T10:00:00+00:00", "BTCUSDT", 3.0, "CLOSED_TP"),
-            ("2026-07-17T11:00:00+00:00", "ETHUSDT", 2.0, "CLOSED_TP"),
+            ((datetime.now(timezone.utc) - timedelta(days=6)).replace(hour=10, minute=0, second=0, microsecond=0).isoformat(), "BTCUSDT", 3.0, "CLOSED_TP"),
+            ((datetime.now(timezone.utc) - timedelta(days=6)).replace(hour=11, minute=0, second=0, microsecond=0).isoformat(), "ETHUSDT", 2.0, "CLOSED_TP"),
         ]
         self._create_db(rows=rows)
         import main as bot

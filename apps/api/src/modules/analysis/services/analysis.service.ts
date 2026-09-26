@@ -13,6 +13,7 @@ import {
   OllamaProvider,
   BaseAIProvider,
 } from '../providers/ai-providers';
+import type { StructuredAiValidation } from '../../market-intelligence/services/ai-validation.service';
 
 @Injectable()
 export class AnalysisService {
@@ -162,12 +163,40 @@ export class AnalysisService {
         if (available) {
           availableProviders.push(provider);
         }
+
       } catch (error) {
         this.logger.warn(`Provider ${name} availability check failed: ${error.message}`);
       }
     }
 
     return availableProviders;
+  }
+
+  async validateCandidate(
+    symbol: string,
+    marketData: Record<string, unknown>,
+    setupType: string,
+  ): Promise<StructuredAiValidation> {
+    const providers = await this.getAvailableProviders();
+    if (providers.length === 0) throw new AIProviderNotAvailableException('No configured AI providers');
+    const result = await providers[0].analyzeMarket(symbol, marketData);
+    if (!result.analysis.trim() || !Array.isArray(result.keyPoints)) {
+      throw new Error(`${providers[0].getName()} returned incomplete structured output`);
+    }
+    return {
+      direction: result.recommendation === 'BUY' ? 'LONG' : result.recommendation === 'SELL' ? 'SHORT' : 'NEUTRAL',
+      setupType,
+      confidenceRaw: result.confidence,
+      supportingFactors: result.keyPoints,
+      conflictingFactors: [],
+      riskWarnings: result.riskLevel.toUpperCase() === 'HIGH' ? ['provider-risk-high'] : [],
+      invalidation: 'AI validation does not override deterministic invalidation',
+      rationale: result.analysis,
+    };
+  }
+
+  getRuntimeStatus() {
+    return [...this.providers.values()].map((provider) => provider.runtimeStatus());
   }
 
   /**

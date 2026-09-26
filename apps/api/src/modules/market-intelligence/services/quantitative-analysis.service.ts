@@ -123,16 +123,8 @@ export class QuantitativeAnalysisService {
 
   private calculateEma(closes: number[]): { value: number | null; last: number | null } {
     const period = 14;
-    const multiplier = 2 / (period + 1);
-    const initialSma = closes.slice(0, period).reduce((sum, v) => sum + v, 0) / period;
-    const emaValues: number[] = [];
-    closes.forEach((value, index) => {
-      if (index === 0) {
-        emaValues.push(initialSma);
-        return;
-      }
-      emaValues.push(value * multiplier + (emaValues[index - 1] ?? initialSma) * (1 - multiplier));
-    });
+    const emaValues = this.emaSeries(closes, period);
+    if (closes.length < period) return { value: null, last: null };
     const last = emaValues.at(-1) ?? null;
     return { value: last, last };
   }
@@ -152,10 +144,13 @@ export class QuantitativeAnalysisService {
   }
 
   private calculateMacd(closes: number[]): { macdLine: number | null; signalLine: number | null; histogram: number | null } {
+    if (closes.length < 26) return { macdLine: null, signalLine: null, histogram: null };
     const ema12 = this.emaSeries(closes, 12);
     const ema26 = this.emaSeries(closes, 26);
-    const macdLine = ema12.at(-1)! - ema26.at(-1)!;
-    const signalLine = this.emaSeries([macdLine], 9).at(-1) ?? null;
+    const macdSeries = ema26.map((value, index) => ema12[index + (26 - 12)] - value);
+    const macdLine = macdSeries.at(-1) ?? null;
+    const signalSeries = this.emaSeries(macdSeries, 9);
+    const signalLine = macdSeries.length >= 9 ? signalSeries.at(-1) ?? null : null;
     return {
       macdLine,
       signalLine,
@@ -164,12 +159,13 @@ export class QuantitativeAnalysisService {
   }
 
   private calculateRsi(closes: number[]): { value: number | null } {
-    if (closes.length < 2) {
+    const period = 14;
+    if (closes.length <= period) {
       return { value: null };
     }
     let gains = 0;
     let losses = 0;
-    for (let index = 1; index < closes.length; index += 1) {
+    for (let index = 1; index <= period; index += 1) {
       const change = closes[index] - closes[index - 1];
       if (change >= 0) {
         gains += change;
@@ -177,23 +173,28 @@ export class QuantitativeAnalysisService {
         losses += Math.abs(change);
       }
     }
-    const avgGain = gains / (closes.length - 1);
-    const avgLoss = losses / (closes.length - 1);
-    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss;
-    const value = 100 - 100 / (1 + rs);
-    return { value };
+    let avgGain = gains / period;
+    let avgLoss = losses / period;
+    for (let index = period + 1; index < closes.length; index += 1) {
+      const change = closes[index] - closes[index - 1];
+      avgGain = (avgGain * (period - 1) + Math.max(change, 0)) / period;
+      avgLoss = (avgLoss * (period - 1) + Math.max(-change, 0)) / period;
+    }
+    return { value: this.rsiValue(avgGain, avgLoss) };
   }
 
   private calculateAtr(candles: Candle[]): { value: number | null } {
-    if (candles.length < 2) {
+    const period = 14;
+    if (candles.length <= period) {
       return { value: null };
     }
     const trValues = candles.slice(1).map((candle, index) => {
       const prev = candles[index];
       return Math.max(candle.high - candle.low, Math.abs(candle.high - prev.close), Math.abs(candle.low - prev.close));
     });
-    const value = trValues.reduce((sum, item) => sum + item, 0) / trValues.length;
-    return { value };
+    let value = trValues.slice(0, period).reduce((sum, item) => sum + item, 0) / period;
+    for (const trueRange of trValues.slice(period)) value = (value * (period - 1) + trueRange) / period;
+    return { value: Number.isFinite(value) ? value : null };
   }
 
   private calculateAdx(candles: Candle[]): { value: number | null } {
@@ -226,12 +227,19 @@ export class QuantitativeAnalysisService {
 
   private calculateStochasticRsi(closes: number[]): { value: number | null } {
     const period = 14;
-    const window = closes.slice(-period);
-    if (!window.length) return { value: null };
+    if (closes.length < period * 2) return { value: null };
+    const rsiValues: number[] = [];
+    for (let index = period; index < closes.length; index += 1) {
+      const window = closes.slice(index - period, index + 1);
+      const changes = window.slice(1).map((value, changeIndex) => value - window[changeIndex]);
+      const gain = changes.reduce((sum, change) => sum + Math.max(change, 0), 0) / period;
+      const loss = changes.reduce((sum, change) => sum + Math.max(-change, 0), 0) / period;
+      rsiValues.push(this.rsiValue(gain, loss));
+    }
+    const window = rsiValues.slice(-period);
     const min = Math.min(...window);
     const max = Math.max(...window);
-    const value = max === min ? 50 : ((window.at(-1)! - min) / (max - min)) * 100;
-    return { value };
+    return { value: max === min ? 50 : ((window.at(-1)! - min) / (max - min)) * 100 };
   }
 
   private calculateBollingerBands(closes: number[]): { upper: number | null; middle: number | null; lower: number | null } {
@@ -272,10 +280,12 @@ export class QuantitativeAnalysisService {
 
   private calculateObv(candles: Candle[]): { value: number | null } {
     let value = 0;
-    for (const candle of candles) {
-      if (candle.close > candle.open) {
+    for (let index = 1; index < candles.length; index += 1) {
+      const candle = candles[index];
+      const previous = candles[index - 1];
+      if (candle.close > previous.close) {
         value += candle.volume;
-      } else if (candle.close < candle.open) {
+      } else if (candle.close < previous.close) {
         value -= candle.volume;
       }
     }
@@ -283,7 +293,10 @@ export class QuantitativeAnalysisService {
   }
 
   private calculateCmf(candles: Candle[]): { value: number | null } {
-    const moneyFlow = candles.reduce((sum, candle) => sum + (candle.close - candle.open) * candle.volume, 0);
+    const moneyFlow = candles.reduce((sum, candle) => {
+      const range = candle.high - candle.low;
+      return sum + (range === 0 ? 0 : ((2 * candle.close - candle.high - candle.low) / range) * candle.volume);
+    }, 0);
     const totalVolume = candles.reduce((sum, candle) => sum + candle.volume, 0);
     return { value: totalVolume ? moneyFlow / totalVolume : null };
   }
@@ -365,19 +378,20 @@ export class QuantitativeAnalysisService {
   }
 
   private emaSeries(values: number[], period: number): number[] {
-    if (!values.length) {
+    if (!values.length || values.length < period) {
       return [];
     }
     const multiplier = 2 / (period + 1);
-    const initialSma = values.slice(0, Math.min(period, values.length)).reduce((sum, value) => sum + value, 0) / Math.min(period, values.length);
-    const emaValues: number[] = [];
-    values.forEach((value, index) => {
-      if (index === 0) {
-        emaValues.push(initialSma);
-      } else {
-        emaValues.push(value * multiplier + emaValues[index - 1] * (1 - multiplier));
-      }
-    });
+    const initialSma = values.slice(0, period).reduce((sum, value) => sum + value, 0) / period;
+    const emaValues: number[] = [initialSma];
+    for (const value of values.slice(period)) {
+      emaValues.push(value * multiplier + emaValues.at(-1)! * (1 - multiplier));
+    }
     return emaValues;
+  }
+
+  private rsiValue(avgGain: number, avgLoss: number): number {
+    if (avgLoss === 0) return avgGain === 0 ? 50 : 100;
+    return 100 - 100 / (1 + avgGain / avgLoss);
   }
 }
