@@ -8,7 +8,7 @@ import { PaperTradingService } from './paper-trading.service';
 export class PaperForwardValidationService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(PaperForwardValidationService.name);
   private readonly onAnalysis = (payload: { decision?: TradingDecision }) => {
-    if (payload.decision?.finalStatus === 'AUTHORIZED_FOR_PAPER') {
+    if (payload.decision?.finalStatus === 'AUTHORIZED_FOR_PAPER' || payload.decision?.finalStatus === 'PAPER_COLD_START') {
       try {
         this.paper.authorize(payload.decision);
       } catch (error) {

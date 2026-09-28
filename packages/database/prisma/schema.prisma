@@ -705,6 +705,7 @@ model TradeOutcome {
   holdingTime    Int?
   exitReason     String?
   winLoss        String?
+  costModelVersion String?
   openedAt       DateTime?
   closedAt       DateTime?
   createdAt      DateTime @default(now())

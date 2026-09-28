@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "outDir": "dist-router",
+    "rootDir": "src",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "declaration": true,
+    "composite": false,
+    "types": ["node"]
+  },
+  "include": [
+    "src/ai.module.ts",
+    "src/router-production/**/*.ts",
+    "src/router/**/*.ts",
+    "src/core/ai.interface.ts",
+    "src/core/ai.types.ts",
+    "src/utils/**/*.ts"
+  ],
+  "exclude": ["src/**/*.spec.ts", "src/**/*.test.ts"]
+}

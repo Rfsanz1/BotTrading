@@ -18,6 +18,8 @@ describe('PaperOperationalService', () => {
       {} as never,
       {} as never,
       {} as never,
+      {} as never,
+      {} as never,
     );
 
     await expect(service.validateStartup()).rejects.toThrow(/unsafe paper mode configuration/);

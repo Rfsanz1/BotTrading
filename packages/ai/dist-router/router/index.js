@@ -1,0 +1,18 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.getModelMeta = exports.FAST_MODEL = exports.DEFAULT_MODEL = exports.ROUTER_MODELS = exports.RouterHealth = exports.RouterService = exports.RouterClient = exports.loadRouterConfig = exports.ROUTER_SERVICE = exports.ROUTER_CONFIG = void 0;
+var router_config_1 = require("./router.config");
+Object.defineProperty(exports, "ROUTER_CONFIG", { enumerable: true, get: function () { return router_config_1.ROUTER_CONFIG; } });
+Object.defineProperty(exports, "ROUTER_SERVICE", { enumerable: true, get: function () { return router_config_1.ROUTER_SERVICE; } });
+Object.defineProperty(exports, "loadRouterConfig", { enumerable: true, get: function () { return router_config_1.loadRouterConfig; } });
+var router_client_1 = require("./router.client");
+Object.defineProperty(exports, "RouterClient", { enumerable: true, get: function () { return router_client_1.RouterClient; } });
+var router_service_1 = require("./router.service");
+Object.defineProperty(exports, "RouterService", { enumerable: true, get: function () { return router_service_1.RouterService; } });
+var router_health_1 = require("./router.health");
+Object.defineProperty(exports, "RouterHealth", { enumerable: true, get: function () { return router_health_1.RouterHealth; } });
+var router_models_1 = require("./router.models");
+Object.defineProperty(exports, "ROUTER_MODELS", { enumerable: true, get: function () { return router_models_1.ROUTER_MODELS; } });
+Object.defineProperty(exports, "DEFAULT_MODEL", { enumerable: true, get: function () { return router_models_1.DEFAULT_MODEL; } });
+Object.defineProperty(exports, "FAST_MODEL", { enumerable: true, get: function () { return router_models_1.FAST_MODEL; } });
+Object.defineProperty(exports, "getModelMeta", { enumerable: true, get: function () { return router_models_1.getModelMeta; } });

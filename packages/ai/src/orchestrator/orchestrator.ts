@@ -91,8 +91,8 @@ export class AIOrchestrator {
     return this.supervisor.attemptRestarts();
   }
 
-  async switchProvider(from: OrchestratorProvider, to: OrchestratorProvider): Promise<boolean> {
-    return this.supervisor.switchProvider(from, to);
+  async switchProvider(_from: OrchestratorProvider, _to: OrchestratorProvider): Promise<boolean> {
+    return false;
   }
 
   getSupervisorReport() {

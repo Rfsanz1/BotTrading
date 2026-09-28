@@ -4,6 +4,7 @@ import { PrismaService } from '../../common/prisma.service';
 import { SystemReadinessService } from '@rfsanz/exchange';
 import {
   BinanceMarketClient,
+  CalibrationService,
   MarketObservabilityService,
   PaperTradingService,
 } from '../market-intelligence';
@@ -38,6 +39,7 @@ export class PaperOperationalService implements OnModuleInit {
     private readonly paper: PaperTradingService,
     private readonly observability: MarketObservabilityService,
     private readonly analysis: AnalysisService,
+    private readonly calibration: CalibrationService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -77,11 +79,12 @@ export class PaperOperationalService implements OnModuleInit {
     components.ORDERBOOK = components.MARKET_DATA === 'HEALTHY' ? 'HEALTHY' : 'DEGRADED';
     components.FUTURES = components.MARKET_DATA === 'HEALTHY' ? 'HEALTHY' : 'DEGRADED';
     components.SCANNER = 'HEALTHY';
-    const aiStatus = this.analysis.getRuntimeStatus();
-    components.AI = aiStatus.some((status) => status.endpointConfigured && status.credentialConfigured)
-      ? 'HEALTHY'
-      : 'DEGRADED';
-    components.RISK = 'HEALTHY';
+    const aiStatus = await this.analysis.getRuntimeStatus();
+    components.AI = aiStatus.providerConfigured && aiStatus.reachable && aiStatus.healthy ? 'HEALTHY' : 'DEGRADED';
+    const calibrationStatus = await this.calibration.calibrate(0.5, Date.now());
+    components.LEARNING = calibrationStatus.state === 'CALIBRATION_READY' ? 'HEALTHY' : 'DEGRADED';
+    const riskReady = hasValidRiskConfiguration(process.env);
+    components.RISK = riskReady ? 'HEALTHY' : 'DEGRADED';
     components.PAPER_EXECUTOR = this.paper ? 'HEALTHY' : 'FAILED';
 
     const failed = Object.values(components).filter((state) => state === 'FAILED').length;
@@ -92,13 +95,17 @@ export class PaperOperationalService implements OnModuleInit {
 
     readiness.setCheck('CONFIG_VALID', true, 'paper configuration validated');
     readiness.setCheck('DATABASE_READY', components.DATABASE === 'HEALTHY', 'database reachable');
-    readiness.setCheck('RISK_READY', true, 'risk engine available');
+    readiness.setCheck('RISK_READY', riskReady, riskReady ? 'risk configuration valid' : 'risk configuration invalid');
     readiness.setCheck('EXECUTION_READY', components.PAPER_EXECUTOR === 'HEALTHY', 'paper executor available');
     readiness.setCheck('PAPER_READY', components.PAPER_EXECUTOR === 'HEALTHY', 'paper executor available');
     readiness.setCheck('AI_READY', components.AI === 'HEALTHY', components.AI === 'HEALTHY'
-      ? 'configured provider available'
-      : 'no configured AI provider');
-    readiness.setCheck('LEARNING_READY', true, 'calibration layer available');
+      ? 'configured 9Router is reachable and healthy'
+      : `9Router unavailable: configured=${aiStatus.providerConfigured} reachable=${aiStatus.reachable} healthy=${aiStatus.healthy}`);
+    readiness.setCheck(
+      'LEARNING_READY',
+      calibrationStatus.state === 'CALIBRATION_READY',
+      `${calibrationStatus.state}: samples=${calibrationStatus.sampleSize}`,
+    );
     readiness.setCheck('EVENT_ROUTER_READY', true, 'event router available');
     readiness.setCheck('STARTUP_GATE_READY', state !== 'FAILED', reason);
     readiness.setCheck('EXCHANGE_READY', components.MARKET_DATA === 'HEALTHY', 'public market connectivity');
@@ -118,9 +125,10 @@ export class PaperOperationalService implements OnModuleInit {
     };
   }
 
-  metrics() {
+  async metrics() {
     const stream = this.observability.snapshot();
     const paper = this.paper.metrics();
+    const calibration = await this.calibration.calibrate(0.5, Date.now());
     return {
       scanCount: stream.scans,
       candidateCount: stream.candidates,
@@ -128,12 +136,11 @@ export class PaperOperationalService implements OnModuleInit {
       noTradeCount: stream.noTrades,
       ...paper,
       calibrationSamples: stream.calibrationSamples,
-      calibrationStatus: stream.calibrationSamples >= 30 ? 'CALIBRATED' : 'INSUFFICIENT_SAMPLE',
+      calibrationSampleSize: calibration.sampleSize,
+      calibrationStatus: calibration.state,
       authorizationByReason: stream.authorizationByReason,
-      ai: {
-        providers: this.analysis.getRuntimeStatus(),
-      },
-      calibrationState: stream.calibrationColdStart > 0 ? 'COLD_START' : 'NORMAL_OR_UNAVAILABLE',
+      ai: await this.analysis.getRuntimeStatus(),
+      calibrationState: calibration.state,
     };
   }
 
@@ -165,4 +172,17 @@ export class PaperOperationalService implements OnModuleInit {
       });
     });
   }
+}
+
+function hasValidRiskConfiguration(env: NodeJS.ProcessEnv): boolean {
+  return [
+    'TRADING_MIN_ACCOUNT_BALANCE_USD',
+    'TRADING_MAX_ORDER_VALUE_USD',
+    'TRADING_DAILY_LOSS_LIMIT_USD',
+    'TRADING_MAX_POSITION_SIZE_PERCENT',
+    'TRADING_MAX_CONCURRENT_POSITIONS',
+  ].every((name) => {
+    const value = Number(env[name]);
+    return Number.isFinite(value) && value > 0;
+  });
 }

@@ -9,6 +9,7 @@ export interface PaperPredictionInput {
   marketType: 'spot' | 'futures';
   provider: string;
   model: string;
+  gateway?: string;
   direction: 'LONG' | 'SHORT' | 'NEUTRAL';
   setupType: string;
   timeframe: string;
@@ -25,6 +26,11 @@ export interface PaperPredictionInput {
   dataQuality?: unknown;
   signalFactors?: unknown;
   strategyVersion?: string;
+  calibrationState?: string;
+  calibrationSampleSize?: number;
+  calibrationMethod?: string | null;
+  calibrationVersion?: string | null;
+  costModelVersion?: string;
 }
 
 export interface PaperOutcomeInput {
@@ -42,6 +48,7 @@ export interface PaperOutcomeInput {
   exitReason: string;
   winLoss: 'win' | 'loss' | 'neutral';
   closedAt?: number;
+  costModelVersion?: string;
 }
 
 export interface CalibrationBucket {
@@ -61,7 +68,7 @@ export class PaperOutcomePersistenceService {
       where: { decisionId: input.decisionId },
       create: {
         decisionId: input.decisionId,
-        timestamp: new Date(),
+        timestamp: new Date(input.decisionTimestamp ?? Date.now()),
         symbol: input.symbol,
         exchange: input.marketType,
         timeframe: input.timeframe,
@@ -74,7 +81,7 @@ export class PaperOutcomePersistenceService {
         expectedValueAfterCost: null,
         decision: input.direction,
         featureSnapshot: { marketType: input.marketType, opportunityScore: input.opportunityScore },
-        aiOutputs: { provider: input.provider, model: input.model },
+        aiOutputs: { provider: input.provider, model: input.model, gateway: input.gateway ?? null },
         entry: input.entryPrice,
         stopLoss: input.stopLoss,
         takeProfit: input.takeProfit,
@@ -87,7 +94,7 @@ export class PaperOutcomePersistenceService {
         calibratedProbability: input.calibratedProbability,
         calibrationStatus: input.calibratedProbability === null ? 'INSUFFICIENT_DATA' : 'CALIBRATED',
         featureSnapshot: { marketType: input.marketType, opportunityScore: input.opportunityScore },
-        aiOutputs: { provider: input.provider, model: input.model },
+        aiOutputs: { provider: input.provider, model: input.model, gateway: input.gateway ?? null },
         entry: input.entryPrice,
         stopLoss: input.stopLoss,
         takeProfit: input.takeProfit,
@@ -114,6 +121,7 @@ export class PaperOutcomePersistenceService {
         holdingTime: input.holdingTime,
         exitReason: input.exitReason,
         winLoss: input.winLoss,
+        costModelVersion: input.costModelVersion ?? null,
         closedAt: input.closedAt ? new Date(input.closedAt) : new Date(),
       },
       update: {
@@ -126,6 +134,7 @@ export class PaperOutcomePersistenceService {
         holdingTime: input.holdingTime,
         exitReason: input.exitReason,
         winLoss: input.winLoss,
+        costModelVersion: input.costModelVersion ?? null,
         closedAt: input.closedAt ? new Date(input.closedAt) : new Date(),
       },
     });
@@ -137,6 +146,11 @@ export class PaperOutcomePersistenceService {
       spread: input.spread ?? null,
       dataQuality: input.dataQuality ? JSON.parse(JSON.stringify(input.dataQuality)) : null,
       signalFactors: input.signalFactors ? JSON.parse(JSON.stringify(input.signalFactors)) : null,
+      calibrationState: input.calibrationState ?? 'CALIBRATION_UNAVAILABLE',
+      calibrationSampleSize: input.calibrationSampleSize ?? 0,
+      calibrationMethod: input.calibrationMethod ?? null,
+      calibrationVersion: input.calibrationVersion ?? null,
+      costModelVersion: input.costModelVersion ?? 'trading-cost-v1',
     } as Prisma.InputJsonValue;
   }
 
@@ -174,5 +188,31 @@ export class PaperOutcomePersistenceService {
     const calibrationError = buckets.filter((bucket) => bucket.empiricalWinRate !== null)
       .reduce((sum, bucket) => sum + Math.abs(bucket.empiricalWinRate! - probability), 0) / Math.max(1, buckets.filter((bucket) => bucket.empiricalWinRate !== null).length);
     return { sampleCount: completed.length, calibratedProbability: probability, brierScore, calibrationError, buckets };
+  }
+
+  async calibrateConfidenceBucket(
+    rawConfidence: number,
+    decisionTimestamp: number,
+    minimumSamples: number,
+  ): Promise<{ sampleSize: number; calibratedProbability: number | null }> {
+    const lower = Math.floor(rawConfidence * 20) / 20;
+    const upper = lower >= 0.95 ? 1.01 : lower + 0.05;
+    const rows = await prisma.tradeDecisionSnapshot.findMany({
+      where: {
+        timestamp: { lte: new Date(decisionTimestamp) },
+        rawConfidence: { gte: lower, lt: upper },
+        outcome: {
+          is: {
+            closedAt: { lte: new Date(decisionTimestamp) },
+            winLoss: { in: ['win', 'loss'] },
+          },
+        },
+      },
+      select: { outcome: { select: { winLoss: true } } },
+    });
+    const sampleSize = rows.filter((row) => row.outcome?.winLoss === 'win' || row.outcome?.winLoss === 'loss').length;
+    if (sampleSize < minimumSamples) return { sampleSize, calibratedProbability: null };
+    const wins = rows.filter((row) => row.outcome?.winLoss === 'win').length;
+    return { sampleSize, calibratedProbability: wins / sampleSize };
   }
 }

@@ -1,18 +1,18 @@
 import ProviderBase from '../ProviderBase';
-import fetch from 'node-fetch';
 
 export default class OllamaProvider extends ProviderBase {
   opts: any;
-  constructor(opts: any = {}) { super(); this.opts = opts; }
+  constructor(opts: any = {}) {
+    super();
+    this.opts = opts;
+  }
 
-  async generate(prompt: string, opts: any = {}) {
-    const host = this.opts.host || process.env.OLLAMA_HOST || 'http://localhost:11434';
-    const model = opts.model || this.opts.model || 'ollama';
-    const res = await fetch(`${host}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model, prompt }),
-    });
-    return res.json();
+  async generate(_prompt: string, _opts: any = {}) {
+    return { ok: false, error: 'Legacy Ollama provider is disabled in production. Use the canonical 9Router path.' };
+  }
+
+  get name(): string { return 'ollama'; }
+  async sendMessage(): Promise<any> {
+    return { role: 'assistant', content: '', timestamp: Date.now() };
   }
 }

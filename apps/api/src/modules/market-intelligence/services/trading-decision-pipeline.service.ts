@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Optional } from '@nestjs/common';
 import { RiskEngine, RiskDecision, RiskEvaluationInput } from '@rfsanz/exchange';
 import { CanonicalMarketState } from '../interfaces/canonical-market.interface';
 import { AiValidationService, StructuredAiValidation } from './ai-validation.service';
@@ -8,8 +8,9 @@ import { MarketStructureService, StructureState } from './market-structure.servi
 import { MultiTimeframeService, MultiTimeframeAlignment } from './multi-timeframe.service';
 import { OpportunityResult, OpportunityService } from './opportunity.service';
 import { RegimeResult, RegimeService } from './regime.service';
+import { TradingCostEstimate, TradingCostModel } from './trading-cost-model';
 
-export type FinalDecisionStatus = 'NO_TRADE' | 'WATCH' | 'AI_INVALID' | 'AI_UNAVAILABLE' | 'REJECTED_BY_RISK' | 'AUTHORIZED_FOR_PAPER';
+export type FinalDecisionStatus = 'NO_TRADE' | 'WATCH' | 'AI_INVALID' | 'AI_UNAVAILABLE' | 'AI_AUTH_ERROR' | 'AI_RATE_LIMITED' | 'AI_SERVER_ERROR' | 'REJECTED_BY_RISK' | 'AUTHORIZED_FOR_PAPER' | 'PAPER_COLD_START';
 
 export interface TradingDecision {
   decisionId: string;
@@ -29,13 +30,17 @@ export interface TradingDecision {
   confidenceRaw: number | null;
   calibratedProbability: number | null;
   expectedValue: ExpectedValueResult;
+  costEstimate: TradingCostEstimate | null;
   entry: EntryExitResult | null;
   riskAssessment: RiskDecision | null;
   executionQuality: OpportunityResult['executionQuality'];
   reasons: string[];
   warnings: string[];
   finalStatus: FinalDecisionStatus;
-  calibrationState: 'NORMAL' | 'COLD_START' | 'UNAVAILABLE';
+  calibrationState: 'CALIBRATION_READY' | 'CALIBRATION_COLD_START' | 'CALIBRATION_UNAVAILABLE';
+  calibrationSampleSize: number;
+  calibrationMethod: string | null;
+  calibrationVersion: string | null;
   authorizationReason: string | null;
 }
 
@@ -49,11 +54,17 @@ export interface FinalPipelineInput {
   correlatedExposureBefore?: number;
   equity?: number;
   riskPerTrade?: number;
+  decisionTimestamp?: number;
+  calibrationState?: TradingDecision['calibrationState'];
+  calibrationSampleSize?: number;
+  calibrationMethod?: string;
+  calibrationVersion?: string;
 }
 
 @Injectable()
 export class TradingDecisionPipelineService {
   private readonly riskEngine = new RiskEngine();
+  private readonly costModel: TradingCostModel;
 
   constructor(
     private readonly multiTimeframe: MultiTimeframeService,
@@ -63,7 +74,10 @@ export class TradingDecisionPipelineService {
     private readonly aiValidation: AiValidationService,
     private readonly evService: ExpectedValueService,
     private readonly entryExit: EntryExitService,
-  ) {}
+    @Optional() costModel?: TradingCostModel,
+  ) {
+    this.costModel = costModel ?? new TradingCostModel();
+  }
 
   evaluate(state: CanonicalMarketState, input: FinalPipelineInput = {}): TradingDecision {
     const alignment = this.multiTimeframe.align(state.timeframes);
@@ -75,7 +89,7 @@ export class TradingDecisionPipelineService {
       decisionId,
       symbol: state.symbol,
       marketType: state.marketType,
-      timestamp: Date.now(),
+      timestamp: input.decisionTimestamp ?? Date.now(),
       dataQuality: state.dataQuality,
       direction: opportunity.directionBias,
       decisionState: opportunity.decision,
@@ -87,15 +101,22 @@ export class TradingDecisionPipelineService {
       structure,
       aiValidation: null,
       confidenceRaw: null,
-      calibratedProbability: input.calibratedProbability ?? null,
+      calibratedProbability: input.calibrationState === 'CALIBRATION_READY'
+        && Number.isFinite(input.calibratedProbability)
+        && input.calibratedProbability! >= 0 && input.calibratedProbability! <= 1
+        ? input.calibratedProbability! : null,
       expectedValue: this.unavailableEv('DETERMINISTIC_GATE'),
+      costEstimate: null,
       entry: null,
       riskAssessment: null,
       executionQuality: opportunity.executionQuality,
       reasons: [...opportunity.noTradeReasons],
       warnings: [],
       finalStatus: 'NO_TRADE' as FinalDecisionStatus,
-      calibrationState: 'UNAVAILABLE',
+      calibrationState: input.calibrationState ?? 'CALIBRATION_UNAVAILABLE',
+      calibrationSampleSize: input.calibrationSampleSize ?? 0,
+      calibrationMethod: input.calibrationMethod ?? null,
+      calibrationVersion: input.calibrationVersion ?? null,
       authorizationReason: null,
     };
 
@@ -111,7 +132,7 @@ export class TradingDecisionPipelineService {
     const ai = this.aiValidation.validate(input.aiOutput);
     if (ai.state !== 'VALID') {
       base.finalStatus = ai.state;
-      base.authorizationReason = ai.state === 'AI_UNAVAILABLE' ? 'AI_UNAVAILABLE' : 'AI_INVALID';
+      base.authorizationReason = ai.state;
       base.reasons.push(base.authorizationReason);
       return base;
     }
@@ -123,16 +144,14 @@ export class TradingDecisionPipelineService {
     base.aiValidation = ai.value;
     base.confidenceRaw = ai.value.confidenceRaw;
     if (base.calibratedProbability === null) {
-      if (process.env.TRADING_MODE === 'PAPER' && process.env.PAPER_COLD_START_ENABLED === 'true') {
-        base.calibrationState = 'COLD_START';
+      if (base.calibrationState === 'CALIBRATION_COLD_START'
+        && process.env.TRADING_MODE === 'PAPER' && process.env.PAPER_COLD_START_ENABLED === 'true') {
       } else {
         base.finalStatus = 'NO_TRADE';
-        base.authorizationReason = 'CALIBRATION_UNAVAILABLE';
+        base.authorizationReason = base.calibrationState === 'CALIBRATION_COLD_START' ? 'CALIBRATION_COLD_START' : 'CALIBRATION_UNAVAILABLE';
         base.reasons.push(base.authorizationReason, 'CALIBRATED_PROBABILITY_UNAVAILABLE');
         return base;
       }
-    } else {
-      base.calibrationState = 'NORMAL';
     }
 
     const price = state.mid ?? state.lastPrice;
@@ -159,17 +178,37 @@ export class TradingDecisionPipelineService {
       base.reasons.push('STRUCTURE_INVALID');
       return base;
     }
-    const coldStartProbability = base.calibrationState === 'COLD_START'
-      ? Number(process.env.PAPER_COLD_START_PRIOR ?? 0.5) : base.calibratedProbability;
+    const coldStart = base.calibrationState === 'CALIBRATION_COLD_START'
+      && process.env.TRADING_MODE === 'PAPER' && process.env.PAPER_COLD_START_ENABLED === 'true';
+    const evProbability = coldStart ? ai.value.confidenceRaw : base.calibratedProbability;
+    const estimatedSlippage = state.orderBook
+      ? Math.max(state.orderBook.estimatedBuySlippage ?? Number.NaN, state.orderBook.estimatedSellSlippage ?? Number.NaN)
+      : Number.NaN;
+    const costEstimate = this.costModel.estimate({
+      marketType: state.marketType,
+      entryPrice: entry.preferredEntry,
+      stopLoss: entry.stopLoss,
+      spreadFraction: spread / price,
+      slippageFraction: estimatedSlippage,
+      fundingRate: state.marketType === 'futures' ? state.futures.fundingRate : null,
+      holdingTimeMs: Number(process.env.TRADING_EXPECTED_HOLDING_TIME_MS ?? 28_800_000),
+    });
+    base.costEstimate = costEstimate;
+    if (!costEstimate.available) {
+      base.authorizationReason = costEstimate.reason ?? 'COST_ASSUMPTIONS_UNAVAILABLE';
+      base.reasons.push(base.authorizationReason);
+      return base;
+    }
     base.expectedValue = this.evService.calculate({
-      calibratedProbability: coldStartProbability,
+      winProbability: evProbability,
+      probabilitySource: coldStart ? 'PAPER_COLD_START_AI' : 'CALIBRATED',
       expectedReward: target.expectedR,
       expectedLoss: 1,
-      fee: 0,
-      spread: spread / price,
-      slippage: Math.max(state.orderBook?.estimatedBuySlippage ?? 0, state.orderBook?.estimatedSellSlippage ?? 0),
-      funding: state.futures.fundingRate ?? 0,
-      holdingTimeMs: 0,
+      fee: costEstimate.feeCostR!,
+      spread: costEstimate.spreadCostR!,
+      slippage: costEstimate.slippageCostR!,
+      funding: costEstimate.fundingCostR!,
+      holdingTimeMs: Number(process.env.TRADING_EXPECTED_HOLDING_TIME_MS ?? 28_800_000),
       executionQuality: opportunity.executionQuality,
     });
     if (!base.expectedValue.available || base.expectedValue.netEV === null || base.expectedValue.netEV <= 0) {
@@ -185,6 +224,8 @@ export class TradingDecisionPipelineService {
     }
     const riskAmount = equity * (input.riskPerTrade ?? 0.01);
     const quantity = riskAmount / Math.abs(entry.preferredEntry - entry.stopLoss);
+    const estimatedFees = this.costModel.estimatedFees(entry.preferredEntry, quantity, costEstimate.feeRate!);
+    const estimatedSlippageUsd = this.costModel.estimatedSlippage(entry.preferredEntry, quantity, costEstimate.slippageFraction);
     const action = base.direction === 'LONG' ? 'BUY' : 'SELL';
     const account = input.account ?? this.defaultAccount(equity);
     const risk = this.riskEngine.evaluate({
@@ -202,8 +243,8 @@ export class TradingDecisionPipelineService {
         correlatedExposureBefore: input.correlatedExposureBefore ?? 0,
         leverage: 1,
         marginRequired: quantity * entry.preferredEntry,
-        estimatedFees: 0,
-        estimatedSlippage: Math.max(state.orderBook?.estimatedBuySlippage ?? 0, state.orderBook?.estimatedSellSlippage ?? 0),
+        estimatedFees,
+        estimatedSlippage: estimatedSlippageUsd,
         drawdown: account.currentDrawdown,
         dailyPnL: account.dailyPnL,
         dailyLossLimit: 0,
@@ -219,7 +260,8 @@ export class TradingDecisionPipelineService {
       },
     });
     base.riskAssessment = risk;
-    base.finalStatus = risk.approved ? 'AUTHORIZED_FOR_PAPER' : 'REJECTED_BY_RISK';
+    base.finalStatus = risk.approved ? (coldStart ? 'PAPER_COLD_START' : 'AUTHORIZED_FOR_PAPER') : 'REJECTED_BY_RISK';
+    if (coldStart && risk.approved) base.reasons.push('PAPER_COLD_START');
     base.authorizationReason = risk.approved ? null : 'RISK_REJECTED';
     if (!risk.approved) base.reasons.push(base.authorizationReason ?? 'RISK_REJECTED');
     return base;

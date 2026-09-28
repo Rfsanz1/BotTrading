@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { AnalysisModule } from '../analysis/analysis.module';
+import { MarketIntelligenceModule } from '../market-intelligence/market-intelligence.module';
 import { TradingService } from './trading.service';
 import { TradingLifecycleService } from './trading-lifecycle.service';
 import { TradingController } from './trading.controller';
@@ -15,7 +17,7 @@ import {
 } from '@rfsanz/exchange';
 
 @Module({
-  imports: [EventEmitterModule.forRoot()],
+  imports: [EventEmitterModule.forRoot(), AnalysisModule, MarketIntelligenceModule],
   providers: [
     TradingService,
     TradingLifecycleService,

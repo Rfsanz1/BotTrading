@@ -96,8 +96,13 @@ async function main(): Promise<void> {
     canonicalAccountValid,
     credentialValid,
     symbolMetadataValid,
-    reconciliationAvailable: Boolean(new ExchangeReconciliationService()),
+    reconciliationAvailable: false,
     killSwitchAvailable: env.KILL_SWITCH_STORAGE === 'postgres',
+    killSwitchActive: true,
+    marketDataReady: false,
+    aiReady: false,
+    calibrationReady: false,
+    executionReady: false,
     exchange,
   });
 

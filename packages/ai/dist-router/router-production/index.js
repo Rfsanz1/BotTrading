@@ -1,0 +1,13 @@
+"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.loadRouterConfig = exports.ROUTER_SERVICE = exports.ROUTER_CONFIG = exports.RouterHealth = exports.RouterService = exports.AIModule = void 0;
+var ai_module_1 = require("../ai.module");
+Object.defineProperty(exports, "AIModule", { enumerable: true, get: function () { return ai_module_1.AIModule; } });
+var router_service_1 = require("../router/router.service");
+Object.defineProperty(exports, "RouterService", { enumerable: true, get: function () { return router_service_1.RouterService; } });
+var router_health_1 = require("../router/router.health");
+Object.defineProperty(exports, "RouterHealth", { enumerable: true, get: function () { return router_health_1.RouterHealth; } });
+var router_config_1 = require("../router/router.config");
+Object.defineProperty(exports, "ROUTER_CONFIG", { enumerable: true, get: function () { return router_config_1.ROUTER_CONFIG; } });
+Object.defineProperty(exports, "ROUTER_SERVICE", { enumerable: true, get: function () { return router_config_1.ROUTER_SERVICE; } });
+Object.defineProperty(exports, "loadRouterConfig", { enumerable: true, get: function () { return router_config_1.loadRouterConfig; } });

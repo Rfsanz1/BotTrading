@@ -41,6 +41,9 @@ export interface MarketObservabilitySnapshot {
   aiSuccesses: number;
   aiInvalid: number;
   aiUnavailable: number;
+  aiAuthErrors: number;
+  aiRateLimited: number;
+  aiServerErrors: number;
   riskApproved: number;
   riskRejected: number;
   paperOrders: number;
@@ -75,6 +78,7 @@ export class MarketObservabilityService {
     scannerDataEligible: 0, scannerDataRejected: 0,
     candidates: 0, noTrades: 0,
     scannerDurationMs: 0, aiCalls: 0, aiSuccesses: 0, aiInvalid: 0, aiUnavailable: 0,
+    aiAuthErrors: 0, aiRateLimited: 0, aiServerErrors: 0,
     riskApproved: 0, riskRejected: 0, paperOrders: 0, paperFills: 0, paperRejects: 0,
     paperPnl: 0, paperFees: 0, paperSlippage: 0, calibrationPredictions: 0,
     calibrationOutcomes: 0, calibrationSamples: 0, brierScore: null,

@@ -10,9 +10,16 @@ import {
 } from '@rfsanz/exchange';
 import prisma from '@rfsanz/database';
 import { validateEnv } from '../../config/env.validation';
+import { RedisService } from '../../common/redis.service';
+import { AnalysisService } from '../analysis/services/analysis.service';
+import { BinanceMarketDataService } from '../market-intelligence/services/binance-market-data.service';
+import { CalibrationService } from '../market-intelligence/services/calibration.service';
+import { SymbolRegistryService } from '../market-intelligence/services/symbol-registry.service';
 import { TradingService } from './trading.service';
 import { resolveCanonicalTestnetAccount } from './canonical-testnet-account';
 import { resolveCanonicalLiveAccount } from './canonical-live-account';
+import { getKillSwitch } from './kill-switch';
+import { validateLiveSymbolMetadata } from './live-symbol-metadata';
 
 @Injectable()
 export class TradingLifecycleService implements OnModuleInit, OnApplicationShutdown {
@@ -26,10 +33,20 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
   private readonly adapterListeners: Array<() => void> = [];
   private keepaliveTimer: NodeJS.Timeout | null = null;
   private reconciliationTimer: NodeJS.Timeout | null = null;
+  private livePreflightTimer: NodeJS.Timeout | null = null;
   private initialized = false;
   private shuttingDown = false;
+  private runtimeCanonicalAccountValid = false;
+  private runtimeCredentialValid = false;
 
-  constructor(private readonly tradingService: TradingService) {}
+  constructor(
+    private readonly tradingService: TradingService,
+    private readonly redis: RedisService,
+    private readonly analysis: AnalysisService,
+    private readonly marketData: BinanceMarketDataService,
+    private readonly calibration: CalibrationService,
+    private readonly symbols: SymbolRegistryService,
+  ) {}
 
   async onModuleInit(): Promise<void> {
     await this.initialize();
@@ -70,6 +87,8 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
         accountId: account.accountId ?? '',
         userId: account.userId ?? '',
       };
+      this.runtimeCanonicalAccountValid = Boolean(account.id && account.accountId && account.isActive);
+      this.runtimeCredentialValid = Boolean(account.credentials?.apiKey && account.credentials?.apiSecret);
       if (mode !== 'PAPER' && (!account.credentials?.apiKey || !account.credentials?.apiSecret)) {
         this.readiness.halt('missing exchange credentials');
         return;
@@ -111,35 +130,40 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
       this.readiness.setCheck('ACCOUNT_SYNC_READY', true, 'account synchronized');
       this.readiness.setCheck('ORDER_SYNC_READY', true, 'orders synchronized');
       this.readiness.setCheck('POSITION_SYNC_READY', true, 'positions synchronized');
-      this.readiness.setCheck('AI_READY', true, 'AI dependency available');
-      this.readiness.setCheck('LEARNING_READY', true, 'learning dependency available');
-      this.readiness.setCheck('RISK_READY', true, 'risk gate available');
-      this.readiness.setCheck('EXECUTION_READY', true, 'execution engine available');
+      const aiStatus = await this.analysis.getRuntimeStatus();
+      this.readiness.setCheck(
+        'AI_READY',
+        aiStatus.initialized && aiStatus.providerConfigured && aiStatus.healthy,
+        aiStatus.healthy ? 'production AI provider healthy' : `production AI unavailable: ${aiStatus.lastFailure?.category ?? 'UNHEALTHY'}`,
+      );
+      const calibrationStatus = await this.calibration.calibrate(0.5, Date.now());
+      this.readiness.setCheck(
+        'LEARNING_READY',
+        calibrationStatus.state === 'CALIBRATION_READY',
+        `${calibrationStatus.state}: samples=${calibrationStatus.sampleSize}`,
+      );
+      const riskReady = isRiskConfigurationValid(process.env);
+      this.readiness.setCheck('RISK_READY', riskReady, riskReady ? 'risk configuration valid' : 'risk configuration invalid');
+      this.readiness.setCheck(
+        'EXECUTION_READY',
+        Boolean(this.adapter && typeof this.adapter.placeOrder === 'function' && this.adapter.connected === true),
+        this.adapter?.connected === true ? 'connected execution adapter available' : 'execution adapter is not connected',
+      );
       this.readiness.setCheck('STARTUP_GATE_READY', true, 'startup and event router ready');
       if (mode === 'PAPER') {
         this.readiness.setCheck('PAPER_READY', true, 'paper application initialized');
+        this.readiness.setCheck('LIVE_READY', false, 'LIVE preflight is blocked while TRADING_MODE is PAPER');
       } else if (mode === 'TESTNET') {
         this.readiness.setCheck('TESTNET_READY', true, 'testnet application initialized');
+        this.readiness.setCheck('LIVE_READY', false, 'LIVE preflight is blocked while TRADING_MODE is TESTNET');
       } else if (mode === 'LIVE') {
-        const livePreflight = validateLivePreflight({
-          tradingMode: process.env.TRADING_MODE,
-          liveTradingEnabled: process.env.LIVE_TRADING_ENABLED,
-          liveAccountId: process.env.LIVE_EXCHANGE_ACCOUNT_ID,
-          encryptionKey: process.env.EXCHANGE_CREDENTIAL_ENCRYPTION_KEY,
-          riskConfigVersion: process.env.RISK_CONFIG_VERSION,
-          risk: process.env,
-          databaseReachable: true,
-          redisReachable: Boolean(process.env.REDIS_URL),
-          canonicalAccountValid: Boolean(account.id && account.accountId),
-          credentialValid: Boolean(account.credentials?.apiKey && account.credentials?.apiSecret),
-          symbolMetadataValid: false,
-          reconciliationAvailable: result.status === 'HEALTHY',
-          killSwitchAvailable: process.env.KILL_SWITCH_STORAGE === 'postgres',
-          exchange: this.adapter,
-        });
-        this.readiness.setCheck('LIVE_READY', livePreflight.ok, livePreflight.ok
-          ? 'runtime LIVE preflight passed'
-          : `runtime LIVE preflight blocked: ${livePreflight.failures.join('; ')}`);
+        await this.refreshLivePreflight(result.status === 'HEALTHY');
+        this.livePreflightTimer = setInterval(() => {
+          void this.refreshLivePreflight().catch((error) => {
+            this.logger.warn(`LIVE preflight refresh failed: ${error instanceof Error ? error.name : 'UNKNOWN_ERROR'}`);
+            this.readiness.setCheck('LIVE_READY', false, 'runtime LIVE preflight refresh failed');
+          });
+        }, 30_000);
       }
       this.readiness.setPhase('SYSTEM_READY', 'runtime lifecycle initialized');
 
@@ -208,6 +232,10 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
     if (this.reconciliationTimer) {
       clearInterval(this.reconciliationTimer);
       this.reconciliationTimer = null;
+    }
+    if (this.livePreflightTimer) {
+      clearInterval(this.livePreflightTimer);
+      this.livePreflightTimer = null;
     }
     if (this.keepaliveTimer) {
       clearInterval(this.keepaliveTimer);
@@ -309,15 +337,15 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
       select: { id: true, userId: true, exchange: true, accountId: true },
     });
     if (
-      (runtimeExchangeAccounts.length !== 1
+      runtimeExchangeAccounts.length !== 1
       || runtimeExchangeAccounts[0].userId !== this.runtimeAccount.userId
       || runtimeExchangeAccounts[0].exchange !== this.runtimeAccount.exchange
-      || runtimeExchangeAccounts[0].accountId !== this.runtimeAccount.accountId)
+      || runtimeExchangeAccounts[0].accountId !== this.runtimeAccount.accountId
     ) {
       throw new Error('Canonical runtime exchange account is no longer available');
     }
-    const runtimeUserIds = [this.runtimeAccount.userId];
 
+    const runtimeUserIds = [this.runtimeAccount.userId];
     const [localOrdersRaw, localPositionsRaw, exchangeOrders, exchangePositions] = await Promise.all([
       prisma.order.findMany({
         where: {
@@ -371,8 +399,134 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
         `Runtime account reconciliation mismatch for ${this.runtimeAccount.exchange}/${this.runtimeAccount.accountId}: ${result.mismatches.join(', ')}`,
       );
     }
-    this.readiness.setCheck('RECONCILIATION_READY', result.status === 'HEALTHY', 'startup reconciliation executed');
+    this.readiness.setCheck('RECONCILIATION_READY', result.status === 'HEALTHY', 'runtime reconciliation executed');
     return result;
+  }
+
+  private async refreshLivePreflight(startupReconciliationHealthy = false): Promise<void> {
+    const diagnostics: string[] = [];
+    let databaseReachable = false;
+    let redisReachable = false;
+    let killSwitchAvailable = false;
+    let killSwitchActive = true;
+    let marketDataReady = false;
+    let aiReady = false;
+    let calibrationReady = false;
+    let symbolMetadataValid = false;
+    let reconciliationAvailable = false;
+
+    try {
+      await prisma.$queryRawUnsafe('SELECT 1');
+      databaseReachable = true;
+    } catch {
+      diagnostics.push('PostgreSQL health query failed');
+    }
+    try {
+      redisReachable = (await this.redis.ping()) === 'PONG';
+    } catch {
+      diagnostics.push('Redis PING failed');
+    }
+    try {
+      const state = await getKillSwitch();
+      killSwitchAvailable = true;
+      killSwitchActive = state.active;
+      if (state.reason === 'Kill switch state unavailable') diagnostics.push('Kill switch row is missing');
+    } catch {
+      diagnostics.push('Kill switch database query failed');
+    }
+    try {
+      const status = await this.analysis.getRuntimeStatus();
+      aiReady = status.initialized && status.providerConfigured && status.reachable && status.healthy;
+      if (!aiReady) diagnostics.push(`AI health failed: ${status.lastFailure?.category ?? 'provider not healthy'}`);
+    } catch {
+      diagnostics.push('AI runtime status unavailable');
+    }
+    try {
+      const status = await this.calibration.calibrate(0.5, Date.now());
+      calibrationReady = status.state === 'CALIBRATION_READY' && status.calibratedProbability !== null;
+      if (!calibrationReady) diagnostics.push(`Calibration unavailable: ${status.state}, samples=${status.sampleSize}`);
+    } catch {
+      diagnostics.push('Calibration query failed');
+    }
+    try {
+      const registry = await this.symbols.awaitReady();
+      const enabledSymbols = (await this.symbols.list()).filter((entry) =>
+        entry.enabled && entry.exchange === 'binance' && entry.marketType === 'spot' && entry.quoteAsset === 'USDT');
+      const exchangeSymbols = await this.adapter?.fetchAllSymbolInfo?.();
+      const metadata = validateLiveSymbolMetadata(enabledSymbols, exchangeSymbols ?? []);
+      symbolMetadataValid = registry.status === 'HEALTHY' && metadata.valid;
+      if (registry.status !== 'HEALTHY') diagnostics.push(`Symbol registry is ${registry.status}`);
+      if (!metadata.valid) diagnostics.push(metadata.reason);
+    } catch {
+      diagnostics.push('Binance exchangeInfo metadata request failed');
+    }
+    try {
+      const bootstrap = await this.marketData.awaitReady();
+      const streams = this.marketData.status().spot;
+      const maxEventAgeMs = positiveEnvNumber(process.env.LIVE_MARKET_MAX_EVENT_AGE_MS) ?? 120_000;
+      const eventAgeMs = streams.lastEventAt === null ? Number.POSITIVE_INFINITY : Date.now() - streams.lastEventAt;
+      marketDataReady = bootstrap.status === 'READY'
+        && bootstrap.requested > 0
+        && bootstrap.canonicalFresh >= bootstrap.requested
+        && streams.streamsRequested > 0
+        && streams.coveragePercent === 100
+        && streams.streamsActive === streams.streamsRequested
+        && streams.healthyShards === streams.shardCount
+        && streams.eventsReceived > 0
+        && eventAgeMs >= 0
+        && eventAgeMs <= maxEventAgeMs;
+      if (!marketDataReady) {
+        diagnostics.push(`Market data unhealthy: bootstrap=${bootstrap.status}, websocketCoverage=${streams.coveragePercent}%, events=${streams.eventsReceived}, eventAgeMs=${Number.isFinite(eventAgeMs) ? eventAgeMs : 'unknown'}`);
+      }
+    } catch {
+      diagnostics.push('Market data health unavailable');
+    }
+    try {
+      const reconciliation = startupReconciliationHealthy
+        ? { status: 'HEALTHY' as const }
+        : await this.reconcileAll();
+      reconciliationAvailable = reconciliation.status === 'HEALTHY'
+        && this.adapter?.supportsPositionReconciliation === true;
+      if (!reconciliationAvailable) diagnostics.push('Exchange reconciliation is not verified as supported and healthy');
+    } catch {
+      diagnostics.push('Exchange reconciliation query failed');
+    }
+
+    const executionReady = Boolean(
+      this.adapter
+      && this.adapter.connected === true
+      && typeof this.adapter.placeOrder === 'function'
+      && typeof this.adapter.fetchBalances === 'function',
+    );
+    if (!executionReady) diagnostics.push('Connected exchange execution capabilities are incomplete');
+
+    const preflight = validateLivePreflight({
+      tradingMode: process.env.TRADING_MODE,
+      liveTradingEnabled: process.env.LIVE_TRADING_ENABLED,
+      liveAccountId: process.env.LIVE_EXCHANGE_ACCOUNT_ID,
+      encryptionKey: process.env.EXCHANGE_CREDENTIAL_ENCRYPTION_KEY,
+      riskConfigVersion: process.env.RISK_CONFIG_VERSION,
+      risk: process.env,
+      databaseReachable,
+      redisReachable,
+      canonicalAccountValid: this.runtimeCanonicalAccountValid,
+      credentialValid: this.runtimeCredentialValid,
+      symbolMetadataValid,
+      reconciliationAvailable,
+      killSwitchAvailable,
+      killSwitchActive,
+      marketDataReady,
+      aiReady,
+      calibrationReady,
+      executionReady,
+      exchange: this.adapter,
+    });
+    const failures = [...preflight.failures, ...diagnostics];
+    this.readiness.setCheck(
+      'LIVE_READY',
+      preflight.ok,
+      preflight.ok ? 'runtime LIVE preflight passed' : `runtime LIVE preflight blocked: ${failures.join('; ')}`,
+    );
   }
 
   private startReconciliationWorker(): void {
@@ -397,3 +551,23 @@ export class TradingLifecycleService implements OnModuleInit, OnApplicationShutd
 }
 
 export default TradingLifecycleService;
+
+function positiveEnvNumber(raw: string | undefined): number | null {
+  if (raw === undefined || raw.trim() === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) && value > 0 ? value : null;
+}
+
+function isRiskConfigurationValid(env: NodeJS.ProcessEnv): boolean {
+  return [
+    'TRADING_MIN_ACCOUNT_BALANCE_USD',
+    'TRADING_MAX_ORDER_VALUE_USD',
+    'TRADING_DAILY_LOSS_LIMIT_USD',
+    'TRADING_MAX_POSITION_SIZE_PERCENT',
+    'TRADING_MAX_CONCURRENT_POSITIONS',
+  ].every((name) => {
+    const raw = env[name];
+    const value = raw === undefined ? NaN : Number(raw);
+    return Number.isFinite(value) && value > 0;
+  });
+}

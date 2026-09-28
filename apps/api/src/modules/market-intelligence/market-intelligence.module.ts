@@ -50,6 +50,8 @@ import { MarketObservabilityService } from './services/market-observability.serv
 import { RecoverySchedulerService } from './services/recovery-scheduler.service';
 import { BinanceShardManagerService } from './services/binance-shard-manager.service';
 import { PaperForwardValidationService } from './services/paper-forward-validation.service';
+import { CalibrationService } from './services/calibration.service';
+import { TradingCostModel } from './services/trading-cost-model';
 import { AnalysisModule } from '../analysis/analysis.module';
 
 @Module({
@@ -102,6 +104,8 @@ import { AnalysisModule } from '../analysis/analysis.module';
     PaperTradingService,
     PaperForwardValidationService,
     PaperOutcomePersistenceService,
+    CalibrationService,
+    TradingCostModel,
     UniverseScannerService,
     MarketObservabilityService,
     RecoverySchedulerService,
@@ -153,13 +157,16 @@ import { AnalysisModule } from '../analysis/analysis.module';
     MarketSyncService,
     MarketAggregatorService,
     SymbolRegistryService,
+    RedisService,
     TimeframeRegistryService,
     QuantitativeAnalysisService,
     PrismaService,
     BinanceMarketClient,
+    BinanceMarketDataService,
     PaperTradingService,
     UniverseScannerService,
     MarketObservabilityService,
+    CalibrationService,
   ],
 })
 export class MarketIntelligenceModule {}

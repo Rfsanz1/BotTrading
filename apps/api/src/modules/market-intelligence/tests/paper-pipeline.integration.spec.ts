@@ -59,6 +59,7 @@ function state(): CanonicalMarketState {
 }
 
 function pipeline(): TradingDecisionPipelineService {
+  process.env.TRADING_FUTURES_TAKER_FEE_RATE = '0.0004';
   return new TradingDecisionPipelineService(
     new MultiTimeframeService(),
     new RegimeService(),
@@ -81,6 +82,26 @@ const validAi = {
   rationale: 'structured test response',
 };
 
+function evaluateCalibrated(inputState = state()) {
+  const decisionTimestamp = Date.now();
+  return pipeline().evaluate(inputState, {
+    aiOutput: {
+      ...validAi,
+      provider: '9Router',
+      model: 'groq/test-model',
+      gateway: 'https://router.example/v1',
+      decisionTimestamp,
+    },
+    decisionTimestamp,
+    calibratedProbability: 0.8,
+    calibrationState: 'CALIBRATION_READY',
+    calibrationSampleSize: 30,
+    calibrationMethod: 'test-confidence-bucket',
+    calibrationVersion: 'test-1',
+    equity: 10_000,
+  });
+}
+
 describe('final paper pipeline', () => {
   it('stops safely when calibrated probability is unavailable', () => {
     const result = pipeline().evaluate(state(), { aiOutput: validAi, equity: 10_000 });
@@ -91,7 +112,7 @@ describe('final paper pipeline', () => {
   });
 
   it('authorizes only after AI, probability, EV, entry/SL/TP, and risk pass', () => {
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated();
     expect(result.finalStatus).toBe('AUTHORIZED_FOR_PAPER');
     expect(result.entry?.stopLoss).toBeLessThan(result.entry?.preferredEntry ?? 0);
     expect(result.expectedValue.netEV).toBeGreaterThan(0);
@@ -106,14 +127,14 @@ describe('final paper pipeline', () => {
     const invalid = state();
     invalid.dataQuality = { state: 'INVALID', reasons: ['STALE'], ageMs: 100_000 };
     invalid.orderBook!.sequenceHealthy = false;
-    const result = pipeline().evaluate(invalid, { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated(invalid);
     expect(result.finalStatus).toBe('NO_TRADE');
     expect(result.reasons[0]).toBe('DATA_INVALID');
     expect(result.aiValidation).toBeNull();
   });
 
   it('uses a conservative stop rule when TP and SL are both touched in one candle', () => {
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated();
     const paper = new PaperTradingService();
     const order = paper.authorize(result);
     const fillAt = order.decisionAt + 1;
@@ -130,7 +151,7 @@ describe('final paper pipeline', () => {
   });
 
   it('rejects decision-time fills and ignores replayed market timestamps', () => {
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated();
     const paper = new PaperTradingService();
     const order = paper.authorize(result);
     expect(() => paper.fill(order.id, { bid: 99.9, ask: 100.1, slippage: 0, timestamp: order.decisionAt })).toThrow('after decision timestamp');
@@ -142,7 +163,7 @@ describe('final paper pipeline', () => {
   });
 
   it('accounts for entry and exit fees and slippage as net, not gross, PnL', () => {
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated();
     const paper = new PaperTradingService();
     const order = paper.authorize(result);
     const fillAt = order.decisionAt + 1;
@@ -161,7 +182,7 @@ describe('final paper pipeline', () => {
   });
 
   it('resolves an open paper trade as TIMEOUT without using a future decision feature', () => {
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: 0.8, equity: 10_000 });
+    const result = evaluateCalibrated();
     const paper = new PaperTradingService();
     const order = paper.authorize(result);
     const fillAt = order.decisionAt + 1;
@@ -177,19 +198,23 @@ describe('final paper pipeline', () => {
 
   it('supports an explicit PAPER-only calibration cold start without claiming normal calibration', () => {
     const previousEnabled = process.env.PAPER_COLD_START_ENABLED;
-    const previousPrior = process.env.PAPER_COLD_START_PRIOR;
     const previousMode = process.env.TRADING_MODE;
     process.env.TRADING_MODE = 'PAPER';
     process.env.PAPER_COLD_START_ENABLED = 'true';
-    process.env.PAPER_COLD_START_PRIOR = '0.8';
-    const result = pipeline().evaluate(state(), { aiOutput: validAi, calibratedProbability: null, equity: 10_000 });
-    expect(result.calibrationState).toBe('COLD_START');
+    const decisionTimestamp = Date.now();
+    const result = pipeline().evaluate(state(), {
+      aiOutput: { ...validAi, provider: '9Router', model: 'groq/test-model', gateway: 'https://router.example/v1', decisionTimestamp },
+      decisionTimestamp,
+      calibratedProbability: null,
+      calibrationState: 'CALIBRATION_COLD_START',
+      equity: 10_000,
+    });
+    expect(result.calibrationState).toBe('CALIBRATION_COLD_START');
     expect(result.calibratedProbability).toBeNull();
-    expect(result.finalStatus).toBe('AUTHORIZED_FOR_PAPER');
+    expect(result.expectedValue.probabilitySource).toBe('PAPER_COLD_START_AI');
+    expect(result.finalStatus).toBe('PAPER_COLD_START');
     if (previousEnabled === undefined) delete process.env.PAPER_COLD_START_ENABLED;
     else process.env.PAPER_COLD_START_ENABLED = previousEnabled;
-    if (previousPrior === undefined) delete process.env.PAPER_COLD_START_PRIOR;
-    else process.env.PAPER_COLD_START_PRIOR = previousPrior;
     if (previousMode === undefined) delete process.env.TRADING_MODE;
     else process.env.TRADING_MODE = previousMode;
   });

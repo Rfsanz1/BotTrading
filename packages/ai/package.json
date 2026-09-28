@@ -4,8 +4,26 @@
   "private": true,
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "require": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./router-production": {
+      "types": "./dist-router/router-production/index.d.ts",
+      "require": "./dist-router/router-production/index.js",
+      "default": "./dist-router/router-production/index.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "router-production": ["dist-router/router-production/index.d.ts"]
+    }
+  },
   "scripts": {
     "build":     "tsc -p tsconfig.json",
+    "build:router": "tsc -p tsconfig.router.json",
     "typecheck": "tsc --noEmit",
     "test":      "jest --passWithNoTests",
     "example":             "node -r ts-node/register src/trading-brain/example.ts",

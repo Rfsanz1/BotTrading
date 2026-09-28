@@ -1,7 +1,10 @@
 jest.mock('@rfsanz/database', () => ({
   __esModule: true,
   default: {
-    tradeDecisionSnapshot: { upsert: jest.fn().mockResolvedValue(undefined) },
+    tradeDecisionSnapshot: {
+      upsert: jest.fn().mockResolvedValue(undefined),
+      findMany: jest.fn().mockResolvedValue([]),
+    },
     tradeOutcome: { upsert: jest.fn().mockResolvedValue(undefined) },
   },
 }));
@@ -41,5 +44,31 @@ describe('paper outcome persistence', () => {
       where: { decisionId: 'decision-replay' },
       update: expect.objectContaining({ exitReason: 'TAKE_PROFIT' }),
     }));
+  });
+
+  it('calibrates only from confidence-bucket outcomes closed by the decision timestamp', async () => {
+    const rows = Array.from({ length: 30 }, (_, index) => ({ outcome: { winLoss: index < 21 ? 'win' : 'loss' } }));
+    (prisma.tradeDecisionSnapshot.findMany as jest.Mock).mockResolvedValue(rows);
+    const service = new PaperOutcomePersistenceService();
+
+    await expect(service.calibrateConfidenceBucket(0.72, 10_000, 30))
+      .resolves.toEqual({ sampleSize: 30, calibratedProbability: 0.7 });
+    expect(prisma.tradeDecisionSnapshot.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: expect.objectContaining({
+        timestamp: { lte: new Date(10_000) },
+        rawConfidence: { gte: 0.7, lt: 0.75 },
+        outcome: { is: { closedAt: { lte: new Date(10_000) }, winLoss: { in: ['win', 'loss'] } } },
+      }),
+    }));
+  });
+
+  it('does not produce a probability below the configured outcome sample minimum', async () => {
+    (prisma.tradeDecisionSnapshot.findMany as jest.Mock).mockResolvedValue([
+      { outcome: { winLoss: 'win' } },
+      { outcome: { winLoss: 'loss' } },
+    ]);
+
+    await expect(new PaperOutcomePersistenceService().calibrateConfidenceBucket(0.72, 10_000, 30))
+      .resolves.toEqual({ sampleSize: 2, calibratedProbability: null });
   });
 });

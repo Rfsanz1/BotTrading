@@ -2,6 +2,7 @@ import { validateLivePreflight } from '../services/live-preflight.service';
 
 const exchange = {
   name: 'binance',
+  nativeProtectionVerified: true,
   createProtectionOco: jest.fn(),
   cancelProtectionOrder: jest.fn(),
   getProtectionOrder: jest.fn(),
@@ -27,6 +28,11 @@ const valid = {
   symbolMetadataValid: true,
   reconciliationAvailable: true,
   killSwitchAvailable: true,
+  killSwitchActive: false,
+  marketDataReady: true,
+  aiReady: true,
+  calibrationReady: true,
+  executionReady: true,
   exchange,
 };
 
@@ -49,6 +55,25 @@ describe('LIVE preflight validation', () => {
       'TRADING_MAX_ORDER_VALUE_USD must be a positive finite number',
       'PostgreSQL is unreachable',
       'canonical LIVE account is invalid',
+    ]));
+  });
+
+  it('blocks when runtime readiness or kill-switch safety is missing', () => {
+    const result = validateLivePreflight({
+      ...valid,
+      aiReady: false,
+      calibrationReady: false,
+      marketDataReady: false,
+      executionReady: false,
+      killSwitchActive: true,
+    });
+    expect(result.ok).toBe(false);
+    expect(result.failures).toEqual(expect.arrayContaining([
+      'production AI provider is not healthy',
+      'calibration is not ready',
+      'market data or websocket health is unavailable',
+      'execution path is unavailable',
+      'kill switch is active',
     ]));
   });
 });

@@ -64,6 +64,10 @@ export class RouterService implements IRouterService {
         retries,
         delayMs: this.config.retryDelayMs,
         factor:  2,
+        shouldAbort: (error) => {
+          const status = (error as { response?: { status?: number } })?.response?.status;
+          return status === 401 || status === 403;
+        },
         onRetry: (attempt, err) => {
           this.log.warn(
             { attempt, model, error: (err as Error).message },

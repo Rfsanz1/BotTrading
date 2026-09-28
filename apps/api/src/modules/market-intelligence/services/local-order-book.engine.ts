@@ -148,6 +148,8 @@ export class LocalOrderBookEngine {
       remaining -= amount;
       if (remaining <= 0) break;
     }
-    return filled === 0 ? null : notional / filled;
+    const topPrice = levels[0]?.[0];
+    if (filled === 0 || !topPrice || topPrice <= 0) return null;
+    return Math.abs(notional / filled - topPrice) / topPrice;
   }
 }

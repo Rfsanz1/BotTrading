@@ -38,6 +38,10 @@ export type ExchangeSymbolInfo = {
   symbol: string;
   status: string;
   filters: ExchangeSymbolFilter[];
+  baseAsset?: string;
+  quoteAsset?: string;
+  orderTypes?: string[];
+  isSpotTradingAllowed?: boolean;
 };
 
 export interface IExchange extends EventEmitter {
@@ -49,6 +53,7 @@ export interface IExchange extends EventEmitter {
   fetchOrderBook?(symbol: string, limit?: number): Promise<MarketOrderBook>;
   fetchRecentKlines?(symbol: string, interval?: string, limit?: number): Promise<MarketKline[]>;
   fetchSymbolInfo?(symbol: string): Promise<ExchangeSymbolInfo>;
+  fetchAllSymbolInfo?(): Promise<ExchangeSymbolInfo[]>;
   placeOrder(params: OrderParams): Promise<Order>;
   cancelOrder(orderId: string): Promise<void>;
   getOrder(orderId: string, symbol?: string): Promise<Order | null>;

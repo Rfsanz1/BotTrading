@@ -41,11 +41,11 @@ function env(key: string, fallback: string): string {
   return (process.env[key] ?? fallback).trim();
 }
 
-function envInt(key: string, fallback: number): number {
+function envInt(key: string, fallback: number, min: number, max: number): number {
   const v = process.env[key];
   if (!v) return fallback;
   const n = parseInt(v, 10);
-  return Number.isFinite(n) ? n : fallback;
+  return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : fallback;
 }
 
 /**
@@ -60,10 +60,10 @@ export function loadRouterConfig(): RouterConfig {
     baseUrl,
     apiKey:           env('AI_API_KEY', ''),
     defaultModel,
-    timeoutMs:        envInt('AI_TIMEOUT_MS', 30_000),
-    maxRetries:       envInt('AI_MAX_RETRIES', 3),
-    retryDelayMs:     envInt('AI_RETRY_DELAY_MS', 1_000),
+    timeoutMs:        envInt('AI_TIMEOUT_MS', 30_000, 1_000, 120_000),
+    maxRetries:       envInt('AI_MAX_RETRIES', 3, 0, 3),
+    retryDelayMs:     envInt('AI_RETRY_DELAY_MS', 1_000, 100, 30_000),
     healthModel:      env('AI_HEALTH_MODEL', defaultModel),
-    healthIntervalMs: envInt('AI_HEALTH_INTERVAL_MS', 60_000),
+    healthIntervalMs: envInt('AI_HEALTH_INTERVAL_MS', 60_000, 5_000, 86_400_000),
   };
 }

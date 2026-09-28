@@ -3,26 +3,13 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { AnalysisService } from './services/analysis.service';
 import { AnalysisController } from './analysis.controller';
 import { AnalysisRepository } from './repositories/analysis.repository';
-import {
-  OpenAIProvider,
-  ClaudeProvider,
-  GeminiProvider,
-  GroqProvider,
-  DeepSeekProvider,
-  OllamaProvider,
-} from './providers/ai-providers';
+import { AIModule } from '@rfsanz/ai/router-production';
 
 @Module({
-  imports: [EventEmitterModule.forRoot()],
+  imports: [EventEmitterModule.forRoot(), AIModule.register()],
   providers: [
     AnalysisService,
     AnalysisRepository,
-    OpenAIProvider,
-    ClaudeProvider,
-    GeminiProvider,
-    GroqProvider,
-    DeepSeekProvider,
-    OllamaProvider,
   ],
   controllers: [AnalysisController],
   exports: [AnalysisService],

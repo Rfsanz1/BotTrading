@@ -14,6 +14,11 @@ export type LivePreflightInput = {
   symbolMetadataValid: boolean;
   reconciliationAvailable: boolean;
   killSwitchAvailable: boolean;
+  killSwitchActive: boolean;
+  marketDataReady: boolean;
+  aiReady: boolean;
+  calibrationReady: boolean;
+  executionReady: boolean;
   exchange: IExchange;
 };
 
@@ -56,6 +61,11 @@ export function validateLivePreflight(input: LivePreflightInput): LivePreflightR
   if (!input.symbolMetadataValid) failures.push('symbol metadata/filter validation is unavailable');
   if (!input.reconciliationAvailable) failures.push('reconciliation service is unavailable');
   if (!input.killSwitchAvailable) failures.push('kill switch is unavailable');
+  if (input.killSwitchActive) failures.push('kill switch is active');
+  if (!input.marketDataReady) failures.push('market data or websocket health is unavailable');
+  if (!input.aiReady) failures.push('production AI provider is not healthy');
+  if (!input.calibrationReady) failures.push('calibration is not ready');
+  if (!input.executionReady) failures.push('execution path is unavailable');
   if (input.exchange.name !== 'binance') failures.push('LIVE preflight requires Binance adapter');
   if (!input.exchange.nativeProtectionVerified
     || !input.exchange.createProtectionOco

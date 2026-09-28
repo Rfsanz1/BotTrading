@@ -28,7 +28,7 @@ interface BinanceExchangeAccount extends ExchangeAccount {
 
 export class BinanceAdapter extends ExchangeBase {
   readonly supportsPositionReconciliation = false;
-  readonly nativeProtectionVerified = process.env.BINANCE_OCO_ENDPOINT_VERIFIED === 'true';
+  readonly nativeProtectionVerified = false;
 
   name = 'binance';
   private client: AxiosInstance | null = null;
@@ -576,8 +576,28 @@ export class BinanceAdapter extends ExchangeBase {
     return {
       symbol: info.symbol,
       status: info.status,
+      baseAsset: info.baseAsset,
+      quoteAsset: info.quoteAsset,
+      orderTypes: info.orderTypes,
+      isSpotTradingAllowed: info.isSpotTradingAllowed,
       filters: info.filters,
     };
+  }
+
+  async fetchAllSymbolInfo(): Promise<ExchangeSymbolInfo[]> {
+    if (!this.client) throw new Error('Not connected to Binance');
+    const response = await this.makeRequest('GET', '/v3/exchangeInfo', {});
+    const symbols = response.data?.symbols;
+    if (!Array.isArray(symbols)) throw new Error('Binance exchangeInfo returned no symbol list');
+    return symbols.map((info: any) => ({
+      symbol: info.symbol,
+      status: info.status,
+      baseAsset: info.baseAsset,
+      quoteAsset: info.quoteAsset,
+      orderTypes: info.orderTypes,
+      isSpotTradingAllowed: info.isSpotTradingAllowed,
+      filters: info.filters,
+    }));
   }
 
   async fetchApiRestrictions(): Promise<{ enableWithdrawals: boolean; ipRestrict: boolean }> {

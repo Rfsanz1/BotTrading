@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { TradingDecision } from './trading-decision-pipeline.service';
 import { Optional } from '@nestjs/common';
 import { PaperOutcomePersistenceService } from './paper-outcome-persistence.service';
@@ -28,8 +28,15 @@ export interface PaperOrder {
   decisionId: string;
   provider: string | null;
   model: string | null;
+  gateway: string | null;
   confidenceRaw: number | null;
   calibratedProbability: number | null;
+  calibrationState: TradingDecision['calibrationState'];
+  calibrationSampleSize: number;
+  calibrationMethod: string | null;
+  calibrationVersion: string | null;
+  costModelVersion: string;
+  strategyVersion: string;
   opportunityScore: number;
   regime: string;
   setupType: string;
@@ -38,6 +45,7 @@ export interface PaperOrder {
   expectedRiskReward: number;
   spread: number;
   feeRate: number;
+  slippageFraction: number;
   exitReason: string | null;
   grossPnL: number;
   lastMarketTimestamp: number | null;
@@ -47,13 +55,19 @@ export interface PaperOrder {
 
 @Injectable()
 export class PaperTradingService {
+  private readonly logger = new Logger(PaperTradingService.name);
   private readonly orders = new Map<string, PaperOrder>();
 
   constructor(@Optional() private readonly persistence?: PaperOutcomePersistenceService) {}
 
   authorize(decision: TradingDecision): PaperOrder {
-    if (decision.finalStatus !== 'AUTHORIZED_FOR_PAPER' || !decision.entry?.stopLoss || !decision.entry.tp1 || !decision.riskAssessment?.approved) {
+    if ((decision.finalStatus !== 'AUTHORIZED_FOR_PAPER' && decision.finalStatus !== 'PAPER_COLD_START')
+      || !decision.entry?.stopLoss || !decision.entry.tp1 || !decision.riskAssessment?.approved) {
       throw new Error('Paper authorization requires an approved final decision');
+    }
+    if (!decision.aiValidation?.provider || !decision.aiValidation.model || !decision.aiValidation.gateway
+      || decision.aiValidation.decisionTimestamp !== decision.timestamp) {
+      throw new Error('Paper authorization requires verified runtime AI identity and decision timestamp');
     }
     const id = `paper-${decision.decisionId}`;
     const order: PaperOrder = {
@@ -63,10 +77,17 @@ export class PaperTradingService {
       tp1: decision.entry.tp1.price, tp2: decision.entry.tp2?.price ?? null, tp3: decision.entry.tp3?.price ?? null,
       fees: 0, slippage: 0, openedAt: null, closedAt: null, realizedPnL: 0, mfe: 0, mae: 0,
       decisionId: decision.decisionId,
-      provider: decision.aiValidation ? 'existing-ai' : null,
-      model: decision.aiValidation ? 'existing-model' : null,
+      provider: decision.aiValidation.provider,
+      model: decision.aiValidation.model,
+      gateway: decision.aiValidation.gateway,
       confidenceRaw: decision.confidenceRaw,
       calibratedProbability: decision.calibratedProbability,
+      calibrationState: decision.calibrationState,
+      calibrationSampleSize: decision.calibrationSampleSize,
+      calibrationMethod: decision.calibrationMethod,
+      calibrationVersion: decision.calibrationVersion,
+      costModelVersion: 'trading-cost-v1',
+      strategyVersion: process.env.TRADING_STRATEGY_VERSION ?? 'deterministic-strategy-v1',
       opportunityScore: decision.opportunityScore,
       regime: decision.regime.regime,
       setupType: decision.setupType,
@@ -74,7 +95,8 @@ export class PaperTradingService {
       decisionAt: decision.timestamp,
       expectedRiskReward: decision.entry.tp1.expectedR,
       spread: decision.entry.entryZone.high - decision.entry.entryZone.low,
-      feeRate: 0.0004,
+      feeRate: decision.costEstimate?.feeRate ?? Number.NaN,
+      slippageFraction: decision.costEstimate?.slippageFraction ?? Number.NaN,
       exitReason: null,
       grossPnL: 0,
       lastMarketTimestamp: null,
@@ -89,6 +111,7 @@ export class PaperTradingService {
         marketType: decision.marketType,
         provider: order.provider!,
         model: order.model!,
+        gateway: order.gateway!,
         direction: decision.direction,
         setupType: decision.setupType,
         timeframe: decision.alignment.entryTimeframe,
@@ -104,8 +127,13 @@ export class PaperTradingService {
         spread: decision.entry.entryZone.high - decision.entry.entryZone.low,
         dataQuality: decision.dataQuality,
         signalFactors: { reasons: decision.opportunity.noTradeReasons, warnings: decision.warnings },
-        strategyVersion: 'paper-forward-v1',
-      });
+        strategyVersion: order.strategyVersion,
+        calibrationState: order.calibrationState,
+        calibrationSampleSize: order.calibrationSampleSize,
+        calibrationMethod: order.calibrationMethod,
+        calibrationVersion: order.calibrationVersion,
+        costModelVersion: order.costModelVersion,
+      }).catch((error) => this.logger.error(`Paper prediction persistence failed: ${error instanceof Error ? error.message : 'unknown error'}`));
     }
     return order;
   }
@@ -115,13 +143,16 @@ export class PaperTradingService {
     if (order.status !== 'AUTHORIZED' && order.status !== 'OPEN') throw new Error('Paper order is not fillable');
     const timestamp = market.timestamp ?? Date.now();
     if (timestamp <= order.decisionAt) throw new Error('Paper fill must occur after decision timestamp');
-    const fill = order.direction === 'LONG' ? market.ask + market.slippage : market.bid - market.slippage;
+    const slippageFraction = Math.abs(market.slippage);
+    const fill = order.direction === 'LONG'
+      ? market.ask * (1 + slippageFraction)
+      : market.bid * (1 - slippageFraction);
     const feeRate = market.feeRate ?? order.feeRate;
     const fee = Math.abs(fill * order.quantity * feeRate);
     order.averageFill = fill;
     order.filledQuantity = order.quantity;
     order.fees += fee;
-    order.slippage += Math.abs(market.slippage);
+    order.slippage += Math.abs(fill * order.quantity * slippageFraction);
     order.openedAt = timestamp;
     order.lastMarketTimestamp = timestamp;
     order.feeRate = feeRate;
@@ -147,7 +178,7 @@ export class PaperTradingService {
     const high = market.high ?? Math.max(market.bid, market.ask);
     const low = market.low ?? Math.min(market.bid, market.ask);
     const exitFeeRate = market.feeRate ?? order.feeRate;
-    const exitSlippage = Math.abs(market.slippage ?? 0);
+    const exitSlippage = Math.abs(market.slippage ?? order.slippageFraction);
     const signed = order.direction === 'LONG' ? price - order.averageFill : order.averageFill - price;
     order.mfe = Math.max(order.mfe, signed);
     order.mae = Math.min(order.mae, signed);
@@ -225,6 +256,7 @@ export class PaperTradingService {
       fees: order.fees,
       slippage: order.slippage,
       fundingCost: 0,
+      costModelVersion: order.costModelVersion,
       exitReason,
       winLoss: order.realizedPnL > 0 ? 'win' : order.realizedPnL < 0 ? 'loss' : 'neutral',
       closedAt: order.closedAt ?? Date.now(),
@@ -232,16 +264,17 @@ export class PaperTradingService {
   }
 
   private close(order: PaperOrder, exitPrice: number, timestamp: number, reason: string, feeRate: number, slippage: number): void {
-    const adjustedExit = order.direction === 'LONG' ? exitPrice - slippage : exitPrice + slippage;
+    const adjustedExit = order.direction === 'LONG' ? exitPrice * (1 - slippage) : exitPrice * (1 + slippage);
     const gross = (order.direction === 'LONG' ? adjustedExit - order.averageFill! : order.averageFill! - adjustedExit) * order.filledQuantity;
     const exitFee = Math.abs(adjustedExit * order.filledQuantity * feeRate);
     order.grossPnL = gross;
     order.fees += exitFee;
-    order.slippage += slippage;
+    order.slippage += Math.abs(exitPrice * order.filledQuantity * slippage);
     order.realizedPnL = gross - order.fees;
     order.exitReason = reason;
     order.status = 'CLOSED';
     order.closedAt = timestamp;
-    void this.persistOutcome(order, reason);
+    void this.persistOutcome(order, reason).catch((error) =>
+      this.logger.error(`Paper outcome persistence failed: ${error instanceof Error ? error.message : 'unknown error'}`));
   }
 }

@@ -48,10 +48,10 @@ export class HealthController {
 
   @Get('paper-metrics')
   @Public()
-  paperMetrics() {
+  async paperMetrics() {
     return {
       ok: true,
-      metrics: this.operational.metrics(),
+      metrics: await this.operational.metrics(),
       timestamp: Date.now(),
     };
   }

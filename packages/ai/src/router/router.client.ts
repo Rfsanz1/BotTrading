@@ -41,8 +41,7 @@ export class RouterClient {
       (res) => res,
       (err: AxiosError) => {
         const status = err.response?.status;
-        const body   = err.response?.data;
-        this.log.warn({ status, body, url: err.config?.url }, 'RouterClient HTTP error');
+        this.log.warn({ status, code: err.code }, 'RouterClient HTTP error');
         return Promise.reject(err);
       },
     );

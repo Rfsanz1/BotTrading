@@ -2,8 +2,31 @@ import { AiValidationService } from '../services/ai-validation.service';
 import { EntryExitService } from '../services/entry-exit.service';
 import { ExpectedValueService } from '../services/expected-value.service';
 import { MarketStructureService } from '../services/market-structure.service';
+import { TradingCostModel } from '../services/trading-cost-model';
 
 describe('deterministic decision layer', () => {
+  it('uses funding only for Futures cost calculations', () => {
+    const oldSpotFee = process.env.TRADING_SPOT_TAKER_FEE_RATE;
+    const oldFuturesFee = process.env.TRADING_FUTURES_TAKER_FEE_RATE;
+    process.env.TRADING_SPOT_TAKER_FEE_RATE = '0.001';
+    process.env.TRADING_FUTURES_TAKER_FEE_RATE = '0.001';
+    const costs = new TradingCostModel();
+    const spot = costs.estimate({
+      marketType: 'spot', entryPrice: 100, stopLoss: 98, spreadFraction: 0.001,
+      slippageFraction: 0.001, fundingRate: null, holdingTimeMs: 8 * 60 * 60 * 1000,
+    });
+    const futures = costs.estimate({
+      marketType: 'futures', entryPrice: 100, stopLoss: 98, spreadFraction: 0.001,
+      slippageFraction: 0.001, fundingRate: 0.0002, holdingTimeMs: 8 * 60 * 60 * 1000,
+    });
+    expect(spot.fundingFraction).toBe(0);
+    expect(futures.fundingFraction).toBe(0.0002);
+    if (oldSpotFee === undefined) delete process.env.TRADING_SPOT_TAKER_FEE_RATE;
+    else process.env.TRADING_SPOT_TAKER_FEE_RATE = oldSpotFee;
+    if (oldFuturesFee === undefined) delete process.env.TRADING_FUTURES_TAKER_FEE_RATE;
+    else process.env.TRADING_FUTURES_TAKER_FEE_RATE = oldFuturesFee;
+  });
+
   it('validates AI schema and rejects malformed output', () => {
     const service = new AiValidationService();
     expect(service.validate({ direction: 'LONG', setupType: 'BREAKOUT', confidenceRaw: 0.7, supportingFactors: [], conflictingFactors: [], riskWarnings: [], invalidation: 'below swing', rationale: 'structured' }).state).toBe('VALID');
@@ -12,8 +35,8 @@ describe('deterministic decision layer', () => {
 
   it('keeps EV unavailable until probability is calibrated', () => {
     const service = new ExpectedValueService();
-    expect(service.calculate({ calibratedProbability: null, expectedReward: 2, expectedLoss: 1, fee: 0.001, spread: 0.001, slippage: 0.001, funding: 0, holdingTimeMs: 1, executionQuality: 'GOOD' }).available).toBe(false);
-    expect(service.calculate({ calibratedProbability: 0.6, expectedReward: 2, expectedLoss: 1, fee: 0.01, spread: 0.01, slippage: 0.01, funding: 0, holdingTimeMs: 1, executionQuality: 'GOOD' }).netEV).toBeCloseTo(0.77);
+    expect(service.calculate({ winProbability: null, probabilitySource: 'CALIBRATED', expectedReward: 2, expectedLoss: 1, fee: 0.001, spread: 0.001, slippage: 0.001, funding: 0, holdingTimeMs: 1, executionQuality: 'GOOD' }).available).toBe(false);
+    expect(service.calculate({ winProbability: 0.6, probabilitySource: 'CALIBRATED', expectedReward: 2, expectedLoss: 1, fee: 0.01, spread: 0.01, slippage: 0.01, funding: 0, holdingTimeMs: 1, executionQuality: 'GOOD' }).netEV).toBeCloseTo(0.77);
   });
 
   it('builds structure invalidation and ordered targets', () => {

@@ -1,24 +1,17 @@
 import { Module, type DynamicModule } from '@nestjs/common';
 
 import { ROUTER_CONFIG, ROUTER_SERVICE, loadRouterConfig, type RouterConfig } from './router/router.config';
-import { RouterClient }  from './router/router.client';
+import { RouterClient } from './router/router.client';
 import { RouterService } from './router/router.service';
-import { RouterHealth }  from './router/router.health';
-import { AIManager }     from './core/ai.manager';
-import { AIService }     from './core/ai.service';
-import { ConversationMemoryStore } from './memory';
-import { AIResponseScorer }        from './scoring';
-import { EmbeddingsService }       from './embeddings';
+import { RouterHealth } from './router/router.health';
 
 export interface AIModuleOptions {
   /** Override any RouterConfig values at module registration time. */
   config?: Partial<RouterConfig>;
-  /** Max conversation history entries per conversation. Default: 50 */
-  maxMemoryEntries?: number;
 }
 
 /**
- * NestJS module that wires the entire AI Engine.
+ * NestJS module that wires the canonical 9Router transport.
  *
  * Usage in an AppModule:
  * ```ts
@@ -26,7 +19,7 @@ export interface AIModuleOptions {
  * export class AppModule {}
  * ```
  *
- * All exported providers can be injected with standard NestJS @Inject().
+ * All production model requests must flow through the exported RouterService.
  */
 @Module({})
 export class AIModule {
@@ -54,26 +47,10 @@ export class AIModule {
           useExisting: RouterService,
         },
 
-        // ── Core AI layer ──────────────────────────────────────────────────
-        AIManager,
-        AIService,
-
-        // ── Supporting services ────────────────────────────────────────────
-        {
-          provide:    ConversationMemoryStore,
-          useFactory: () => new ConversationMemoryStore(options.maxMemoryEntries ?? 50),
-        },
-        AIResponseScorer,
-        EmbeddingsService,
       ],
       exports: [
         RouterService,
         RouterHealth,
-        AIManager,
-        AIService,
-        ConversationMemoryStore,
-        AIResponseScorer,
-        EmbeddingsService,
         ROUTER_CONFIG,
       ],
     };

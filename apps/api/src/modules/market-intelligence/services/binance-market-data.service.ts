@@ -93,7 +93,8 @@ export class BinanceMarketDataService implements OnModuleInit, OnModuleDestroy {
   }
 
   async awaitReady(): Promise<SpotBootstrapHealth> {
-    if (this.bootstrapPromise) await this.bootstrapPromise;
+    if (!this.bootstrapPromise) this.bootstrapPromise = this.bootstrapSpot();
+    await this.bootstrapPromise;
     return { ...this.bootstrapHealth, failures: [...this.bootstrapHealth.failures] };
   }
 

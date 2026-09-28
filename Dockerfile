@@ -9,6 +9,8 @@ WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps/api/package.json apps/api/package.json
 COPY packages/database/package.json packages/database/package.json
+COPY packages/ai/package.json packages/ai/package.json
+COPY packages/logger/package.json packages/logger/package.json
 COPY packages/exchange/package.json packages/exchange/package.json
 COPY packages/tradingview/package.json packages/tradingview/package.json
 COPY scripts/package.json scripts/package.json
@@ -18,19 +20,25 @@ RUN npm install -g pnpm@12.4.2 \
 
 COPY apps/api apps/api
 COPY packages/database packages/database
+COPY packages/ai packages/ai
+COPY packages/logger packages/logger
 COPY packages/exchange packages/exchange
 COPY packages/tradingview packages/tradingview
 COPY scripts scripts
 
 RUN mkdir -p node_modules/@rfsanz \
   && ln -sfn ../../packages/database node_modules/@rfsanz/database \
+  && ln -sfn ../../packages/ai node_modules/@rfsanz/ai \
+  && ln -sfn ../../packages/logger node_modules/@rfsanz/logger \
   && ln -sfn ../../packages/exchange node_modules/@rfsanz/exchange \
   && ln -sfn ../../packages/tradingview node_modules/@rfsanz/tradingview
 
 RUN pnpm --dir packages/database prisma:generate \
   && pnpm --dir packages/database run build
 
-RUN pnpm --dir packages/exchange run build \
+RUN pnpm --dir packages/logger run build \
+  && pnpm --dir packages/ai run build:router \
+  && pnpm --dir packages/exchange run build \
   && pnpm --dir packages/tradingview run build \
   && pnpm --dir apps/api run build
 
